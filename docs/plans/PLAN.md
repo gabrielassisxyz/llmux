@@ -432,7 +432,9 @@ The aggregate budget and the concurrent-request ceiling stay constants for the s
 
 The two per-account ceilings are the exception, and the reason is worth stating because it changes what they are for. Neither 60 nor 12 is a published Ollama Cloud limit; no such limit is documented. They are self-imposed guards, and the earlier pair of 25 and 3 was a guess that had hardened into a specification. A guard set below the real ceiling is indistinguishable from the real ceiling, so it can never be measured, and the proxy spends capacity it has already paid for.
 
-Upstream 429 is the only authoritative statement of the real limit. The design therefore reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log. The ceilings above are set high enough to stop being the binding constraint, so that the log records upstream’s answer instead of the proxy’s assumption. They are expected to be re-derived from that log after real traffic, which is the one tuning this document invites.
+Upstream 429 is the only authoritative statement of the real limit, and the design reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log.
+
+What that log can settle runs in one direction only. Sustained 429s under the local ceiling prove the ceiling is set too high and by roughly how much. Silence proves nothing: a ceiling of 60 cannot discover whether upstream would have accepted 100, because it is the thing preventing the dispatches that would answer the question. The ceilings are therefore safety and resource policy, chosen high enough to stop being the binding constraint at the traffic these three consumers produce, and revised downward from evidence rather than upward from hope. They are expected to be re-derived from success, latency, 429 and saturation data after real traffic, which is the one tuning this document invites.
 
 The in-flight ceiling keeps a second job that survives the change: it bounds concurrent upstream work, since every live attempt holds its replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses. It does not bound memory on its own, because a request buffers its body long before it reaches an account; that is the aggregate gate’s job.
 
@@ -1429,9 +1431,9 @@ Cooldown duration:
 - Expire lazily.
 - Clear the recent-429 history on cooldown expiry.
 
-This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window.
+This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window, and it keeps a 429 from delaying a dispatch to an account that never sent one.
 
-With the local ceilings raised above any rate upstream is expected to accept, this path becomes the primary rate control rather than a fallback behind it. Upstream 429 responses are therefore expected in normal operation, not treated as anomalies, and the cooldown threshold and duration are the first constants to re-derive from the attempt log once real traffic exists.
+A 429 is account-specific backpressure and an operational signal, not traffic the design goes looking for. Since the local ceilings are not known to sit below upstream's, this path may turn out to be the binding rate control or may almost never fire, and which one it is will be visible in the log rather than decidable here. The cooldown threshold and duration are the first constants to re-derive from that log once real traffic exists.
 
 ### 20.3 Server and transport failures
 
@@ -2615,7 +2617,7 @@ The README must provide SQLite query recipes, described and tested against the a
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
-- Upstream 429 responses against dispatch volume per account, which is what reveals the real ceiling the local one is standing in for.
+- Upstream 429 responses against dispatch volume per account, which is the one measurement that can show the local ceiling sits above upstream's.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request.
@@ -2713,7 +2715,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account, which is the measurement the raised ceilings exist to obtain. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.

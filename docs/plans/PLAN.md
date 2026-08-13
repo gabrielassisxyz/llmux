@@ -428,6 +428,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Minimum deadline runway before a retry dispatch | 5 seconds |
 | Intermediate response drain cap | 64 KiB |
 | SSE observer line cap | 1 MiB |
+| Observer cumulative decoded-output cap | 64 MiB per response |
 | SQLite busy timeout | 5 seconds |
 | WAL size warning threshold | 64 MiB |
 | Server header-read timeout | 5 seconds |
@@ -860,7 +861,7 @@ A downstream write error means the client is already gone. In that case, cancel 
 
 ### 14.1 First-event definition
 
-For successful uncompressed SSE responses, `time_to_first_event` is operationally defined as:
+For successful SSE responses whose bytes the observer can read, directly or through the bounded decoder of §14.3, `time_to_first_event` is operationally defined as:
 
 - The invocation of `http.Client.Do`, through
 - Recognition of the first complete non-empty SSE `data:` event other than `[DONE]`.
@@ -878,7 +879,7 @@ The anchor is the `Do` invocation rather than the dispatch reservation, because 
 
 It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token’s name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
 
-For non-streaming responses, and for any response whose content encoding puts the stream out of semantic reach, `time_to_first_event` is `NULL`. Total attempt duration remains available.
+For non-streaming responses, and for any response whose content encoding the bounded observer cannot decode, `time_to_first_event` is `NULL`. Total attempt duration remains available.
 
 ### 14.2 Token counts
 
@@ -909,13 +910,17 @@ The observer must not retain unbounded response text.
 - A complete non-streaming body within the 8 MiB precommit bound is parsed from that already-required buffer using a narrow usage projection, then discarded.
 - A larger non-streaming body is observed incrementally after transition to progressive relay.
 - SSE frames are observed incrementally while the original bytes are relayed.
-- Semantic observation is disabled entirely for a non-identity content encoding, unless a separate bounded decoder is deliberately implemented. Automatic decompression is off so that bytes relay unchanged, which also means the observer would otherwise be parsing compressed bytes as if they were JSON. Exact relay continues either way, and both token counts and first-event timing are `NULL`.
+- The relayed bytes are never decompressed, re-encoded, or altered by observation, and automatic transport decompression stays off. Whatever encoding upstream chose reaches the client exactly as it arrived.
+- For a response whose `Content-Encoding` is exactly `gzip`, the observer feeds a copy of the relayed bytes through a bounded streaming decoder from the standard library and reads the decoded output exactly as it reads an identity body. Decoded output carries the same caps as identity observation plus a cumulative decoded-output cap, which is what bounds the work a degenerate or hostile response can demand. Exceeding any cap abandons observation for that response and never touches relay.
+- Any other content encoding, including a multi-valued one, and any decoder error, disables semantic observation for that response. Exact relay continues either way, and both token counts and first-event timing are `NULL`.
 - Under progressive relay, whether SSE or oversized non-streaming, the observer consumes chunks after or alongside successful downstream writes, so observation can never delay or reorder relay.
 - JSON strings and unrelated values are skipped rather than copied into a second response-sized structure.
 - SSE parsing keeps at most a 1 MiB line buffer.
 - If a line exceeds the cap, relay continues unchanged and semantic observation for that line is abandoned.
 - Observer failure never changes response bytes.
 - Parser panics are prohibited and fuzz-tested.
+
+The decoder exists because without it the evidence the whole of §30 rests on can quietly go to zero. `Accept-Encoding` crosses to upstream in the request allowlist, and mainstream HTTP stacks advertise compression by default, so if upstream honours what a consumer sends then token counts, usage and first-event timing are `NULL` for every request that consumer makes, and the weekly ceiling re-derivation loses its volume and latency signal without anything reporting a failure. Dropping `Accept-Encoding` from the allowlist is the cheaper fix and is rejected: it spends real bandwidth on every completion to solve a problem on the observer's side of the process, and it mutates upstream-visible negotiation on behalf of a client that asked for something else. Whether the decoder is needed at all is a question about upstream rather than a question of design, so the Phase 0 gate measures which encoding upstream actually selects for each consumer's real `Accept-Encoding`, and that measurement decides whether the decoder ships. Timing observed through the decoder inherits upstream's own flush boundaries, which are the boundaries the client sees too, so a first-event figure stays comparable across encodings.
 
 ## 15. Durable data model
 
@@ -2050,6 +2055,7 @@ They must not contain:
 - Two-minute request-body read timeout.
 - Per-write downstream deadline for a stalled consumer.
 - Bounded SSE observer.
+- Bounded observer decoding, capped on cumulative decoded output rather than on input size.
 - Bounded retry drain.
 - Maximum four dispatches.
 - Bounded deduplicated skip collection.
@@ -2376,7 +2382,9 @@ Test:
 - Malformed usage.
 - A nested value named `usage` that is not the top-level object.
 - A request marked `"stream": true` whose upstream content type says otherwise still relays progressively.
-- A compressed response relays byte-identically with observation disabled and null counts.
+- A gzip response relays byte-identically while usage and first-event timing are observed through the bounded decoder.
+- A response in an encoding the observer cannot decode, and one that trips the decoded-output cap, relay byte-identically with observation disabled and null counts.
+- A decompression bomb abandons observation at the output cap without slowing or altering relay.
 - No proxy-injected `stream_options`.
 - No retry after first committed byte.
 - Post-commit upstream read failure produces a raw-client transport error rather than a clean completed response.
@@ -2699,7 +2707,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Final-response token counts per logical request, taken from that terminal row. Summing token columns across attempt rows counts a retried request several times, which is the one arithmetic mistake this schema invites.
 - Attempt and logical-request latency distributions, the second being handler start through the terminal row rather than the sum of attempt durations.
 - First-data-event distributions for streaming calls.
-- Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began requesting a compressed response, which disables observation by design.
+- Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began advertising a response encoding the bounded observer cannot decode, which disables observation by design.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
@@ -2758,6 +2766,7 @@ That is a change in the callers, and it stays there. The proxy holds no model of
 Before cutover:
 
 - Confirm each caller retries a local 429 and honours `Retry-After`.
+- Confirm that a caller which wants durable token and first-event evidence advertises only response encodings the observer can decode, once Phase 0 has recorded which encodings upstream actually selects. A caller that asks for one the observer cannot decode receives its bytes exactly as ever and writes `NULL` observation columns forever, which is its choice to make and is recorded here rather than worked around inside the proxy.
 - The once-a-day `eod` summariser is the one to change first. It runs with no session file and no operator watching, so a lost result there is invisible until someone notices a missing day. It needs retry in its own codebase before cutover.
 - A caller that cannot be changed is recorded as accepting the loss, rather than answered by relaxing the ceiling here.
 
@@ -2813,6 +2822,7 @@ Deliver:
 - Real-upstream pass/fail evidence for every distinct model and preset, per account.
 - A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed.
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
+- Which `Content-Encoding` upstream selects when sent each consumer's real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
 
 Gate:
 
@@ -2931,6 +2941,7 @@ Deliver:
 - Committed-response abort handling.
 - First-data-event observation.
 - Selective token extraction.
+- Bounded observation-side gzip decoding, if Phase 0 recorded upstream selecting a compressed encoding.
 - Exact final response preservation.
 
 Gate:

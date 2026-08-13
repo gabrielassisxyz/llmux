@@ -1108,9 +1108,9 @@ The schema carries no field that exists only to explain the proxy to itself. A p
 
 - `rate_limited`
 - `upstream_authentication`
-- `malformed_request`
 - `upstream_client_error`
 - `upstream_server_error`
+- `invalid_upstream_response`
 - `transport_timeout`
 - `transport_transient`
 - `transport_permanent`
@@ -1120,6 +1120,8 @@ The schema carries no field that exists only to explain the proxy to itself. A p
 - `account_disabled`
 - `account_cooldown`
 - `local_capacity`
+
+`invalid_upstream_response` is the class for a dispatched attempt that ended in an upstream 3xx or 101. Such an attempt is neither a client error nor a server error, and filing it under a transport class would erase the one distinction that makes it findable later. There is deliberately no class for a locally malformed request: a pre-routing local failure produces no attempt row at all, and an upstream 400 is an upstream client error, so nothing could ever write one. A value nothing can write drifts from the code without anything failing, which is the same reason this schema declines a vocabulary with no reader.
 
 Raw Go error strings are never stored.
 

@@ -10,6 +10,8 @@ The exact upstream model strings and the route-owned presets are a prerequisite 
 
 When two sections appear to pull in different directions, the non-negotiable invariants take precedence, followed by the external HTTP contract, the routing and retry state machines, and finally implementation convenience. Tests must encode that same precedence.
 
+Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and introduce none of their own. When one of them disagrees with the section that defines what it describes, the restatement is the defect and the fix belongs there, not in the rule. Nearly every internal contradiction this document has had to correct came from that duplication rather than from a disputed rule, so the three state machines it duplicates most get one table-driven conformance matrix each: retry classification from §21.2, response commitment from §13.6, and account-health transitions from §20. Each matrix is the single source the unit tests and the full-handler tests both read, because two levels of test reading one table is what stops a restatement and its rule from drifting apart without anything failing.
+
 ## 2. Goals
 
 - Serve the three known local consumers at `http://localhost:4000`.
@@ -2147,6 +2149,8 @@ The scripted fake upstream must record the account by the bearer key it actually
 The coordinator additionally carries model-based tests that generate random sequences of reservation, admission success and failure, dispatch, release, cooldown, cancellation, crash and recovery events against a reference model of the same state. Example-based tests cover the interleavings someone thought of, and the failures worth fearing in a component like this one are the interleavings nobody did.
 
 Crash behavior is tested with real subprocesses killed at each boundary that the two commit points create: after coordinator reservation, after the admission commit, after `http.Client.Do` returns, after downstream commitment, and after the terminal insert. A restarted process reading that store must never admit more than the ceiling allows for the window the crash fell in.
+
+Retry classification, response commitment, and account-health transitions are each expressed once as a table-driven conformance matrix, as §1 requires. The unit tests and the full-handler tests read the same table rather than each encoding the rules again, so a row that changes changes both, and a case nobody wrote a handler test for still fails at the unit level instead of being absent from both.
 
 ### 28.1 Catalog tests
 

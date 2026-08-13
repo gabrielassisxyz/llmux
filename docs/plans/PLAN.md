@@ -1826,7 +1826,7 @@ Messages are stable and sanitized.
 | Upstream credential rejected with no eligible account left | 502 | `server_error` / `upstream_auth_failure` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
 | Unexpected upstream redirect or upgrade | 502 | `server_error` / `invalid_upstream_response` |
-| Overall timeout before commit | 504 | `server_error` / `upstream_timeout` |
+| Overall timeout before commit | 504 | `server_error` / `deadline_exceeded` |
 | Recovered panic before commit | 500 | `server_error` / `internal_error` |
 
 An upstream final response is never converted into one of these local errors. A 3xx, a 101 and a 401 are the carve-outs, and none of them is an exception to the rule, because none of them is a final result: each is an instruction to make a different request, addressed to a party that cannot act on it safely. For a 3xx or a 101 that party is the client. For a 401 it is the proxy itself, which is why a 401 surfaces as account disablement plus failover rather than as a relayed status, and why the local code names the credential failure instead of hiding it behind a generic upstream error.

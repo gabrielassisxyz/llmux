@@ -1383,9 +1383,9 @@ After a successful spill, the new account has processed the newest complete conv
 
 ## 20. Account health
 
-### 20.1 Upstream authentication failures
+### 20.1 Upstream credential failures
 
-Upstream 401 or 403 means `upstream_authentication`.
+Upstream 401 means `upstream_authentication`.
 
 Actions:
 
@@ -1393,11 +1393,15 @@ Actions:
 - Remove session pins that point to it.
 - Wake waiting requests.
 - Do not retry the current logical request.
-- Relay the upstream 401/403 unchanged as the final response.
+- Relay the upstream 401 unchanged as the final response.
 - Exclude the account from subsequent base-alias requests.
 - Explicit aliases targeting it return local 503 on later requests.
 
 The account remains disabled for the process lifetime. Correcting the key requires restart, which is also how a renewed subscription on an unchanged key is put back into rotation. Nothing inside the process re-tests a disabled account, on a timer or on a request.
+
+An upstream 403 is non-retryable and relayed unchanged, but it does not disable the account on status alone. 401 says the credential was not accepted; 403 says this request was not permitted, which may be about a model outside the plan, a policy decision, or anything else specific to what was asked rather than to who asked. Disabling on 403 destroys a third of the capacity for the process lifetime on evidence that does not support it, and does so at exactly the moment one model starts refusing requests on every account in turn.
+
+If the provider later documents a stable credential-specific error code carried under 403, a bounded projection of that code alone, retaining no body, may classify it as a credential failure. Until such a code exists and is documented, status is all there is, and status is not enough.
 
 ### 20.2 Rate-limit failures
 
@@ -1406,9 +1410,9 @@ On upstream 429:
 - Record the dispatched attempt.
 - Count it in local RPM.
 - Add its timestamp to that account’s recent-429 history.
-- Parse `Retry-After` when valid.
+- Parse `Retry-After` when valid, and advance that account’s cooldown deadline to it, clamped to ten minutes.
 - Permit rate-limit retries within budget.
-- Prefer a different account for an unpinned/base route’s next dispatch.
+- Prefer a different account immediately for an unpinned/base route’s next dispatch. A `Retry-After` from one account is a statement about that account and must never delay a dispatch to a different one.
 - Keep explicit aliases on their named account.
 
 Cooldown threshold:
@@ -1469,7 +1473,8 @@ Reason:
 | Dial or TLS-handshake timeout | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Precommit response-body read failure | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Upstream 504 | Yes | Up to 2 retries | Different eligible account first | No global disable |
-| Upstream 401/403 | No | 0 | None | Disable immediately |
+| Upstream 401 | No | 0 | None | Disable immediately |
+| Upstream 403 | No | 0 | None | No change |
 | Other upstream 4xx | No | 0 | None | No change |
 | Upstream 3xx or 101 | No | 0 | None | Local invalid-upstream response |
 | Invalid URL/protocol/TLS certificate | No | 0 | None | No account change |
@@ -1490,7 +1495,8 @@ Rate-limit retry:
 
 - Exponential base delays of 1, 2, and 4 seconds.
 - Equal jitter between one-half and the full base delay.
-- A valid `Retry-After` becomes the minimum delay.
+- A valid `Retry-After` becomes the minimum delay only when the next attempt targets the account that sent it.
+- When another eligible account exists, failover proceeds immediately with jitter, while the account that answered 429 stays blocked until its own deadline.
 - Delay is capped by the remaining logical deadline.
 
 Timeout/server retry:
@@ -1701,7 +1707,7 @@ Visible result: stable base and pinned aliases.
 
 ### 23.11 Upstream authentication failure
 
-1. Upstream returns 401/403.
+1. Upstream returns 401.
 2. Account is disabled immediately.
 3. Pins to that account are removed.
 4. Current request is not retried.
@@ -1821,7 +1827,8 @@ No startup failure triggers an upstream request.
 | Upstream 504 | Retry on another account |
 | 429 | Retry and update rate-limit health |
 | 5xx | Retry |
-| 401/403 | Disable account, no retry |
+| 401 | Disable account, no retry |
+| 403 | Relay unchanged, no retry, account untouched |
 | Other 4xx | No retry |
 | 3xx or 101 | No redirect or upgrade; local 502 before commitment |
 | Read error before commitment | Retry if budget permits |
@@ -2205,7 +2212,7 @@ Cover:
 Verify:
 
 - First upstream 401 disables immediately.
-- 403 follows the same rule.
+- 403 is relayed, is not retried, and leaves account health alone.
 - Pins to disabled account are removed.
 - Current auth failure is not retried.
 - Subsequent base requests skip disabled account.
@@ -2217,6 +2224,8 @@ Verify:
 - `Retry-After` seconds and HTTP dates are parsed.
 - Cooldown is clamped.
 - Cooldown wakes waiters.
+- A valid `Retry-After` blocks only the account that sent it.
+- Another account is selected without waiting out that `Retry-After`.
 - 5xx does not disable an account.
 - Request 4xx does not affect health.
 - Restart clears disabled state without probing.
@@ -2236,7 +2245,7 @@ Cover:
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
-- 401 with no retry.
+- 401 with no retry, and 403 with no retry and no disable.
 - TLS permanent error with no retry.
 - Client cancellation during backoff.
 - Deadline during backoff.
@@ -2634,7 +2643,7 @@ No built-in query, README recipe, or report computes currency cost.
 
 ### 30.5 Disabled-account recovery
 
-An upstream 401 or 403 disables an account for the rest of the process lifetime, and nothing inside the process puts it back:
+An upstream 401 disables an account for the rest of the process lifetime, and nothing inside the process puts it back:
 
 1. Confirm from the attempt log which account was disabled and when.
 2. If the credential itself changed, update the owner-only environment file.
@@ -2724,12 +2733,14 @@ Deliver:
 - Exact upstream model strings copied from the current deployment.
 - Real-upstream pass/fail evidence for every distinct model and preset, per account.
 - A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed.
+- The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
 
 Gate:
 
 - No provisional catalog value remains in this document.
 - Every route is reachable on all three accounts declared eligible for it.
 - An unsupported or indistinguishable preset is resolved here rather than in code.
+- If a revoked key answers 403 rather than 401, §20.1 needs its documented credential-specific code before Phase 5, or account disablement never fires.
 
 This phase writes no code and produces no binary. It exists because everything after it is built on strings that are currently guesses.
 
@@ -2940,7 +2951,9 @@ The project is complete only when all of the following are true:
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.
-- Upstream authentication disables an account on its first failure and nothing but restart re-enables it.
+- Upstream 401 disables an account on its first failure and nothing but restart re-enables it.
+- Upstream 403 alone never disables an account.
+- A `Retry-After` blocks only the account that sent it.
 - Repeated 429 responses cause bounded cooldown.
 - No background health or model probes exist.
 - Each dispatch has exactly one append-only terminal row when its transaction succeeds.

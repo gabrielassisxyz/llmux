@@ -2856,10 +2856,16 @@ Implementation is not complete without:
 - A placeholder-only environment-file template.
 - A reference user-service definition that runs the static binary as the current user, restarts only on process failure, and does not contain health probes.
 
-- A `llmux version` subcommand printing version, revision, schema version, and Go toolchain.
+- A `llmux version` subcommand printing release version, revision, the highest schema version the binary supports, and the Go toolchain, without opening configuration or a database.
+- A `llmux db check` subcommand that opens a named database read-only and reports its schema version, `quick_check`, `foreign_key_check`, WAL state, file size, and the free space on its filesystem.
+- A `llmux db backup` subcommand that writes an owner-only consistent backup, refuses to overwrite an existing file, and needs no account credential.
 - Release artifacts built with `-trimpath`, published with checksums.
 
-These are documentation and launch aids, not a UI or additional runtime service. The list still stops where a document would start describing the process rather than the system: a written checklist restating build identity would be a second copy free to be wrong, which is exactly why the subcommand reads `debug.ReadBuildInfo` and `PRAGMA user_version` at runtime instead of printing strings someone stamped in by hand. It derives the answer rather than repeating it, and during a cutover or a rollback "which binary is this" is a question worth being able to ask the binary.
+These are documentation and launch aids, not a UI or additional runtime service. The list still stops where a document would start describing the process rather than the system: a written checklist restating build identity would be a second copy free to be wrong, which is exactly why `llmux version` reads `debug.ReadBuildInfo` at runtime instead of printing strings someone stamped in by hand. It derives the answer rather than repeating it, and during a cutover or a rollback "which binary is this" is a question worth being able to ask the binary.
+
+Build information cannot answer which schema version a database is at, because that is a property of a file and not of a binary. `llmux version` therefore reports the highest version its embedded migration set defines, which needs no configuration and no store to be present, and `PRAGMA user_version` belongs to `llmux db check`, which is handed a path. Splitting them is what keeps `version` answerable during a rollback, when the store may be the thing in question.
+
+The two database subcommands exist so that §30.4 needs no second SQLite tool on the machine. Copying the main file while a WAL is active is not a backup, that section already says so, and the mechanism that is correct is the one this binary embeds. Neither subcommand opens a network connection, reads an account credential, or writes to the active store, and neither is an admin surface: they are offline commands an operator runs against a path they name.
 
 ### 30.2 Installation
 
@@ -2905,8 +2911,9 @@ No built-in query, README recipe, or report computes currency cost.
 ### 30.4 Database backup and archival
 
 - There is no automatic rotation or retention.
-- For a live backup, use SQLite’s own consistent backup mechanism rather than copying only the main file while WAL is active.
-- Monitor the size of both the main database and its WAL.
+- For a live backup, use `llmux db backup`, which drives SQLite’s own consistent backup mechanism rather than copying only the main file while WAL is active.
+- Monitor the size of both the main database and its WAL, and the free space on the filesystem holding them.
+- The runbook estimates monthly growth at the expected and at the maximum dispatch rate, so the size of this file is thought about before the day it fills a disk.
 - Close long-lived external read transactions promptly, since an open one is what stops a checkpoint from completing.
 - For a cold backup, stop the service cleanly, verify shutdown completed, then copy the database.
 - Preserve schema version with every archive.
@@ -2914,6 +2921,18 @@ No built-in query, README recipe, or report computes currency cost.
 - Treat an admission-store failure or disk exhaustion as dispatch-blocking rather than as optional telemetry loss, because that is what the process does with it.
 - Test restore by opening a copied database with a compatible binary and running read-only integrity/recovery queries.
 - A backup or archive operation must not make any upstream request.
+- Both reference commands are exercised by integration tests, because a restore procedure nobody has run is a hope.
+
+Retention is out of scope and unbounded growth is not a plan, so there is one manual escape hatch. Nothing deletes rows, and §24.5 makes a full filesystem a dispatch outage rather than a logging inconvenience, so a store left alone eventually stops the proxy. Cold archive rotation is how an operator gets ahead of that:
+
+1. Stop the service cleanly and confirm its stop row was written.
+2. Wait until a complete 60-second rolling window has passed since the last dispatch, so that the empty rate ledger the new store begins with is accurate rather than merely empty.
+3. Take an owner-only archive with `llmux db backup` and verify it with `llmux db check`.
+4. Preserve the archive and its checksum. Rotation never deletes one, which is what keeps the append-only rule true across the boundary.
+5. Move the old database aside and start the service, which migrates a fresh one.
+6. Accept that session affinity starts empty. At most the last hour of pins is lost, and rate safety is preserved by the wait in step 2.
+
+The procedure is manual and offline for the same reason retention is absent: anything that ran on its own would eventually run while the proxy was serving, and losing the evidence of a dispatch that happened is the one thing this store may not do.
 
 ### 30.5 Disabled-account recovery
 
@@ -3155,7 +3174,7 @@ Deliver:
 - Durable process start and stop rows.
 - Secure file checks.
 - Static build automation with `-trimpath` and published checksums.
-- `llmux version`, deriving its output rather than restating it.
+- `llmux version`, deriving its output rather than restating it, and the read-only `llmux db check` and `llmux db backup`.
 - Lint/security configuration.
 
 Gate:
@@ -3256,5 +3275,6 @@ The project is complete only when all of the following are true:
 - Graceful shutdown releases permits and closes SQLite last.
 - Request bodies, account acquisition, retries, downstream writes, and store cleanup each have an independently enforceable bound.
 - Installation, backup, recovery, cutover, and rollback runbooks are complete and tested.
+- Unbounded store growth has a tested offline archive procedure rather than an eventual dispatch outage, and it deletes nothing.
 - Real Ollama Cloud acceptance includes a multi-turn tool-call/tool-result loop.
 - Unit, integration, race, fuzz, model-based, crash-boundary, privacy, resource, failure-injection, restart, and static-build gates pass.

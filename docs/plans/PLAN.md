@@ -408,6 +408,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Concurrent admitted chat requests | 128 |
 | Global request-admission wait | 1 second |
 | Session affinity TTL | 1 hour |
+| Provisional pin maximum lifetime | Logical request deadline |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
 | Dispatches per window/account | 60 |
@@ -1171,12 +1172,16 @@ Each session key maps to:
 - Expiry.
 - Request-arrival sequence that last established the pin.
 - Provisional or confirmed state.
+- Provisional generation and the count of requests currently holding it.
 
 Rules:
 
 - The first dispatch for a new session atomically creates a provisional pin.
-- Concurrent first requests for that session see the same pin.
+- Concurrent first requests for that session see the same pin and attach as holders of the same provisional generation.
 - A fully successful response confirms and refreshes it.
+- A terminally failed request releases its holder.
+- When the last holder of an unconfirmed generation fails, the pin is removed immediately rather than left to expire.
+- A provisional pin's safety expiry is the logical request deadline, not one hour. Nothing that has never succeeded earns an hour of affinity.
 - TTL is one hour from successful completion.
 - A successful spill changes the pin.
 - A failed or partial spill does not.
@@ -1295,7 +1300,7 @@ Shuffle is for fairness, not security. Tests inject deterministic permutations.
 - Selection follows the unpinned base flow.
 - Account acquisition and provisional session pin installation occur atomically.
 - Concurrent new-session requests therefore cannot independently choose different initial accounts.
-- The provisional pin expires one hour after reservation unless a successful completion refreshes it.
+- The provisional pin lives only while a request holds it, and never past the logical request deadline. It becomes an hour-long pin only when a successful completion confirms it.
 
 ### 18.3 Existing session
 
@@ -1912,6 +1917,7 @@ The implementation must document and test these invariants:
 27. No `http.Client.Do` occurs without a committed admission row, and no admission row is committed without a held reservation.
 28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
 29. Aggregate request-owned memory never exceeds the configured budget, and every charge is released exactly once.
+30. An unconfirmed provisional pin with no remaining holders cannot stay live.
 
 ## 26. Security and privacy
 
@@ -2203,6 +2209,9 @@ Cover:
 - Upstream-error spill does not re-pin.
 - Partial stream spill does not re-pin.
 - Older concurrent completion cannot overwrite a newer pin.
+- A failed first request in a new session leaves no pin behind.
+- Concurrent first requests share one provisional pin, and it survives while any of them is still running.
+- The last concurrent first request to fail removes the provisional pin.
 - Deadline during grace.
 - Deadline after spill becomes allowed.
 - Sixty-second account-acquisition expiry returns 429.
@@ -2539,6 +2548,8 @@ Five seconds is the maximum wait for an unknowable in-flight release. RPM and co
 ### 29.11 Re-pin only on complete success
 
 The alternative account has the most recent complete prefix only after a successful response. Failed or partial output is not a safe continuation anchor.
+
+The same reasoning applies to the pin a first request creates. It has to exist before the response is known, because concurrent first requests must not each pick a different account, but it is held rather than owned: it survives while a request is still using it and disappears when the last one fails without confirming it. Leaving it to expire on the ordinary hour would take a session whose only request failed and make the account that failed it sticky for an hour, retrying the same failure on every turn.
 
 ### 29.12 Keyed session identifiers
 

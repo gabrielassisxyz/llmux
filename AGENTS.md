@@ -17,7 +17,7 @@
 - **All gates at once:** `bin/ci`, the exact thing CI runs, so green locally means green in CI.
 - **After clone, once:** `bin/install-hooks` (points git at `.githooks/`).
 - **Before your first write:** `bin/worktree new <type>/<kebab-desc>`.
-- **Planned work:** `br` beads, triaged with `bv`. `br ready` is what to pick up next. The tracker state is machine-local and not committed: it records what is being considered, reordered and abandoned, which is a different document from a statement of direction. `ROADMAP.md` is the part written for whoever arrives, and it is what gets updated when the direction actually changes.
+- **Planned work:** `br` beads, triaged with `bv`. `br ready` is what to pick up next. The tracker state is **not committed to this repo**: `.beads` is a symlink into `local/`, so the graph is versioned with the maintainer notes instead. It records what is being considered, reordered and abandoned, which is a different document from a statement of direction, and `ROADMAP.md` is the part written for whoever arrives. Versioned but unpublished, because once a plan has been decomposed the graph *is* the planning output, and a graph held on one disk with no history is one failure away from having to be rebuilt from scratch.
 
 ## Scope (current)
 

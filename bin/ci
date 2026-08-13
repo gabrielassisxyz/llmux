@@ -20,6 +20,24 @@ skip()    { printf '    \033[33mskip:\033[0m %s\n' "$1"; skipped+=("$1"); }
 ok()      { printf '    \033[32mok\033[0m\n'; }
 bad()     { printf '    \033[31mFAIL\033[0m\n'; fail=1; }
 
+# The module pin is authoritative. Explicitly selecting it prevents a newer local
+# installation from silently satisfying the minimum language version instead.
+pinned_toolchain="$(awk '$1 == "toolchain" { print $2 }' go.mod)"
+if [ -z "$pinned_toolchain" ]; then
+    printf '    missing toolchain directive in go.mod\n'
+    fail=1
+else
+    export GOTOOLCHAIN="${pinned_toolchain}+auto"
+    section "Go toolchain"
+    actual_toolchain="$(go env GOVERSION 2>/dev/null)"
+    if [ "$actual_toolchain" = "$pinned_toolchain" ]; then
+        ok
+    else
+        printf '    expected %s, got %s\n' "$pinned_toolchain" "${actual_toolchain:-unavailable}"
+        bad
+    fi
+fi
+
 # Build somewhere that is not RAM.
 #
 # WHY: Go leaves GOTMPDIR unset by default and falls back to TMPDIR, and /tmp on this

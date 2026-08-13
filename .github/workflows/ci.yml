@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.26.6'
           cache: true
       # bin/ci is the whole gate. Nothing is duplicated here on purpose: a check that
       # exists only in the workflow is a check nobody can run before pushing.

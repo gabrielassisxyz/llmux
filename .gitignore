@@ -46,3 +46,4 @@
 /.githooks/hooks.d
 /.githooks/pre-commit.cmd
 /.githooks/pre-commit.ps1
+/.githooks/pre-commit.orig

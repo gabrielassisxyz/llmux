@@ -6,7 +6,7 @@ This document is the implementation contract for `llmux`. Implementation work sh
 
 `llmux` is a single-user, single-machine OpenAI-compatible routing proxy. It exposes two HTTP resources, routes seven logical model aliases across three Ollama Cloud accounts, preserves conversation-to-account affinity, enforces account-wide ceilings, relays streaming and non-streaming responses, and writes a durable dispatch-admission ledger plus append-only attempt records to one embedded SQLite store.
 
-Where the existing deployment’s exact upstream model strings differ from the provisional mapping in this document, implementation must transcribe those fixed strings into the source catalog. This is deployment inventory, not runtime backend configurability.
+The exact upstream model strings and the route-owned presets are a prerequisite of implementation, not a placeholder to be resolved while coding. Phase 0 transcribes them from the current deployment, verifies them against the real upstream, and replaces every provisional value in this document before production code is accepted. This is deployment inventory, not runtime backend configurability.
 
 When two sections appear to pull in different directions, the non-negotiable invariants take precedence, followed by the external HTTP contract, the routing and retry state machines, and finally implementation convenience. Tests must encode that same precedence.
 
@@ -98,7 +98,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 | Upstream base | `https://ollama.com/v1` |
 | Static build | `CGO_ENABLED=0` release build |
 
-The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s official integration documentation](https://docs.ollama.com/integrations/droid).
+The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s official integration documentation](https://docs.ollama.com/integrations/droid). Which request fields and reasoning values that base accepts is documented separately, by [Ollama’s OpenAI compatibility documentation](https://docs.ollama.com/api/openai-compatibility).
 
 ## 6. External HTTP contract
 
@@ -298,6 +298,8 @@ The injection set is closed:
 - The proxy does not add `stream_options.include_usage`; clients that want streaming usage must request it themselves.
 - A missing usage object therefore produces nullable token fields rather than a mutated request or response.
 
+One of the two presets is not documented. Ollama’s public OpenAI compatibility page lists `reasoning_effort` values of `high`, `medium`, `low`, and `none`, and does not list `max`. The Phase 0 gate must establish against the real endpoint that `reasoning_effort="max"` is accepted and behaves differently from `high`. If it is rejected, the alias is a request that always fails; if it is silently coerced, the alias is a lie told to the client picker, which is worse because nothing reports it. Either way the entry needs a documented alternative mapping or removal before Phase 1, and it must not quietly become a second name for `high`.
+
 ## 8. Fixed route catalog
 
 ### 8.1 Base routes
@@ -312,7 +314,7 @@ The injection set is closed:
 | `deepseek-v4-pro-high` | `deepseek-v4-pro` | `k1`, `k2`, `k3` |
 | `deepseek-v4-flash-max` | `deepseek-v4-flash-max` | `k1`, `k2`, `k3` |
 
-During catalog implementation, compare the provisional upstream strings to the current replacement configuration and transcribe exact deployed IDs. Do not infer differences from alias spelling and do not make them environment-configurable.
+The upstream strings above are provisional and every one of them is resolved by the Phase 0 gate in §8.4 before implementation begins. Do not infer differences from alias spelling and do not make them environment-configurable.
 
 ### 8.2 Account-pinned variants
 
@@ -351,6 +353,19 @@ Startup must assert:
 - Generated pinned routes match their base route’s model and injection.
 
 A catalog validation failure is fatal.
+
+### 8.4 Deployment-inventory gate
+
+A document that calls itself an implementation contract cannot carry provisional values into the code it specifies. Before implementation:
+
+- Replace every provisional upstream model string with the exact value the current deployment sends.
+- Send one small bounded request per distinct upstream model and route-owned preset, per account, directly against the upstream base.
+- Record only pass/fail, model ID, preset, account label, timestamp, and status code. Never record request or response content.
+- Treat an unresolved mapping, an unsupported preset, or a model that one account cannot reach as a blocking specification defect rather than as something the implementation discovers later.
+
+These requests are made by the operator against the upstream, not by the proxy. Nothing here contradicts the invariant that the process makes no upstream request except while serving a chat completion, because at this point the process does not exist.
+
+The alternative is not free: a provisional string that survives into the catalog fails at the first real request, and a preset that upstream ignores fails at no point at all, which is the case this gate exists for.
 
 ## 9. Configuration
 
@@ -2583,15 +2598,16 @@ Restart is the whole procedure, for a rotated key and for a renewed subscription
 These checks are deliberately manual because they consume real account quota:
 
 1. Call `/v1/models` and confirm all 28 exact aliases.
-2. Make one small exact-account request through each of `k1`, `k2`, and `k3`.
-3. Run a multi-turn `pi` conversation containing at least one complete tool-call/tool-result loop.
-4. Confirm every turn’s raw `messages` value arrives upstream unchanged using the approved diagnostic fixture, not production prompt logging.
-5. Run one representative `kernl` non-streaming job.
-6. Run one `eod` dry run without a session file.
-7. Exercise one controlled spill scenario.
-8. Exercise one retryable error against a test upstream, not by intentionally wasting real upstream requests.
-9. Inspect SQLite for account, spill, retry, skip, latency, TTFT, and token facts.
-10. Run the privacy-marker inspection against the database, WAL, and process logs.
+2. Confirm that every provisional model ID was replaced and that every reasoning preset, `max` above all, passed the Phase 0 gate.
+3. Make one small exact-account request through each of `k1`, `k2`, and `k3`.
+4. Run a multi-turn `pi` conversation containing at least one complete tool-call/tool-result loop.
+5. Confirm every turn’s raw `messages` value arrives upstream unchanged using the approved diagnostic fixture, not production prompt logging.
+6. Run one representative `kernl` non-streaming job.
+7. Run one `eod` dry run without a session file.
+8. Exercise one controlled spill scenario.
+9. Exercise one retryable error against a test upstream, not by intentionally wasting real upstream requests.
+10. Inspect SQLite for account, spill, retry, skip, latency, TTFT, and token facts.
+11. Run the privacy-marker inspection against the database, WAL, and process logs.
 
 Record pass/fail and timestamps for each check without copying prompts, completions, keys, or raw upstream error bodies. The durable acceptance evidence is the attempt store itself, which holds one row per upstream attempt from the first real request onward; a parallel handwritten record competes with it and loses.
 
@@ -2650,6 +2666,22 @@ For the first week of real traffic, inspect the attempt store at least daily for
 This is human log review, not a background health checker. Any discovered defect becomes a reproducible automated test before correction.
 
 ## 31. Implementation sequence
+
+### Phase 0: Contract inventory
+
+Deliver:
+
+- Exact upstream model strings copied from the current deployment.
+- Real-upstream pass/fail evidence for every distinct model and preset, per account.
+- A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed.
+
+Gate:
+
+- No provisional catalog value remains in this document.
+- Every route is reachable on all three accounts declared eligible for it.
+- An unsupported or indistinguishable preset is resolved here rather than in code.
+
+This phase writes no code and produces no binary. It exists because everything after it is built on strings that are currently guesses.
 
 ### Phase 1: Project skeleton and fixed catalog
 

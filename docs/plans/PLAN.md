@@ -2214,7 +2214,7 @@ After requests:
 - Assert account keys and proxy key do not exist.
 - Assert token counts and allowed metadata do exist.
 - Assert stripped header markers never reach the upstream.
-- Assert a dropped header's name may appear in a debug event while its marker value appears in no log and no database file.
+- Assert a dropped header’s name may appear in a debug event while its marker value appears in no log and no database file.
 - Assert JSON parse errors and panic logs contain positions/classifiers but not nearby body excerpts.
 
 No test may create temporary prompt spool files.

@@ -426,6 +426,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Intermediate response drain cap | 64 KiB |
 | SSE observer line cap | 1 MiB |
 | SQLite busy timeout | 5 seconds |
+| WAL size warning threshold | 64 MiB |
 | Server header-read timeout | 5 seconds |
 | Server request-read timeout | 2 minutes |
 | Server idle timeout | 2 minutes |
@@ -635,7 +636,7 @@ There is no degraded startup mode.
 9. Return zero for orderly signal-driven shutdown.
 10. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
 
-No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added.
+No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 run in the foreground of a commit that is already happening, which is why they are not one.
 
 ## 12. Request data flow
 
@@ -936,7 +937,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 
 - Open exactly `LLMUX_LOG_PATH`.
 - Require an absolute path.
-- Require the parent directory to exist.
+- Require the parent directory to exist, to be owned by the service user, and to deny write access to group and others. Checking the file is not enough on its own: `Lstat` followed by open is a race, and a directory nobody else can write to is what makes the symlink and mode checks below mean something rather than merely narrow a window.
 - Do not silently fall back to another path or memory.
 - If the database is absent, pre-create it atomically with `O_CREATE|O_EXCL` and mode `0600`, close it, then let the SQLite driver open it.
 - Reject an existing symbolic link using `Lstat`.
@@ -945,12 +946,18 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
 - Use full synchronous durability.
+- Set `wal_autocheckpoint` explicitly rather than inheriting the default.
+- Attempt a passive checkpoint in the foreground after a bounded number of commits, and again when the WAL passes its warning threshold.
+- Never block request handling on a restart or truncate checkpoint.
+- Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
 - Use a five-second busy timeout.
 - Set maximum open and idle database connections to one.
 - Use parameterized SQL only.
 - Check every database error.
 
 SQLite-managed `-wal` and `-shm` files are part of the one embedded store, not separate services or application logs.
+
+A checkpoint cannot reset the WAL while a reader still holds an older snapshot, and this design explicitly invites a local analysis tool to read the store while the proxy serves. A long-running query therefore does not merely slow a checkpoint down, it prevents completion for as long as it runs, and every commit in the meantime extends a file that nothing is truncating. The proxy cannot fix that from its side, so it does the two things it can: it keeps trying passively, and it says so when the WAL grows anyway.
 
 If initial migration fails after a new file was created, preserve the file for diagnosis and fail startup. Do not delete or replace an existing store automatically.
 
@@ -1806,6 +1813,7 @@ Visible result: stable base and pinned aliases.
 | Invalid catalog | Fatal startup |
 | Relative log path | Fatal startup |
 | Missing log directory | Fatal startup |
+| Log directory writable by group or others | Fatal startup |
 | Insecure existing log permissions | Fatal startup |
 | SQLite open failure | Fatal startup |
 | Unsupported future schema | Fatal startup |
@@ -2048,6 +2056,7 @@ Events include:
 - Account cooldown entered/expired.
 - Request headers removed by the allowlist, at debug level, by name only.
 - Runtime attempt-log insert failure.
+- WAL growth past its threshold despite checkpoint attempts.
 - Recovered handler panic.
 - Forced shutdown.
 - Recovery clock skew.
@@ -2392,6 +2401,9 @@ Verify:
 - Unique ID handling.
 - Update/delete triggers.
 - Index presence.
+- `EXPLAIN QUERY PLAN` on both recovery queries, asserting the intended index and no full table scan.
+- Passive checkpoint behavior.
+- WAL growth and its warning under a deliberately held external reader.
 - Null token counts.
 - Full token counts.
 - Session digest stability across restart, and absence of the raw header.
@@ -2676,6 +2688,8 @@ No built-in query, README recipe, or report computes currency cost.
 
 - There is no automatic rotation or retention.
 - For a live backup, use SQLite’s own consistent backup mechanism rather than copying only the main file while WAL is active.
+- Monitor the size of both the main database and its WAL.
+- Close long-lived external read transactions promptly, since an open one is what stops a checkpoint from completing.
 - For a cold backup, stop the service cleanly, verify shutdown completed, then copy the database.
 - Preserve schema version with every archive.
 - Never delete or truncate the durable tables as part of normal service startup.

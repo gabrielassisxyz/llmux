@@ -2120,6 +2120,12 @@ There is no fallback JSONL file, alternate database, or memory log.
 - Session affinity expiry is therefore wall-clock too, by §16.2, so recovery converts nothing between clocks.
 - Future recovered timestamps are clamped to startup time and produce a warning.
 - Backward wall-clock changes cannot make monotonic durations negative.
+- No duration is computed by subtracting two persisted instants. Every duration this store holds was measured monotonically inside the process that wrote it, and every persisted instant exists to say when something happened rather than how long it took.
+- No live deadline is seeded from a persisted instant measured on a different clock than the deadline runs on.
+
+The last two are the general form of three separate defects this document has already had to correct, each of which read as an ordinary sentence until the sequence of events was written out: a first-event metric anchored in front of a durable write, a rolling window anchored in front of a commit that had been inserted before the boundary it was named for, and a monotonic window seeded at startup from a wall-clock column. Stating them as rules is what makes the next instance visible without reconstructing the failure, and §28 is where a violation fails rather than being noticed later by a reader.
+
+There is exactly one exception, and it is written down rather than left to be discovered. Pin recovery in §16.3 subtracts `logical_elapsed_us`, a monotonic duration, from `finished_at_us`, a wall instant, to order two completions of one session. It buys an ordering that matches the live sequence guard without a column, its exposure is a clock step landing between two completions of one session inside one hour, and its cost when that happens is which of two accounts a recovered conversation resumes on. It is stated there as an exposure rather than as a guarantee, and it is the only place in this document where the rule above is knowingly broken.
 
 ### 24.7 Internal panic
 

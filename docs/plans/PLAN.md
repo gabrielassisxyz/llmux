@@ -1276,7 +1276,7 @@ Rules:
 
 Before listening:
 
-- Recover the newest successful account for every `session_key` completed in the previous hour.
+- Recover, for every `session_key` with a successful completion in the previous hour, the account served by whichever of those requests arrived last.
 - Preserve the original completion-based expiry.
 - Recover dispatch admissions whose reservation instant, advanced by the store-operation ceiling, falls inside the previous 60 seconds, into account rolling windows.
 - Set in-flight counts to zero.
@@ -1284,6 +1284,8 @@ Before listening:
 - Do not call upstream to validate recovered state.
 
 Rate recovery reads `dispatch_admission` and never the terminal attempt rows. An attempt that was in flight when the process died left an admission and no result, and recovery counts it exactly like a completed one: the instant is what the ceiling is defined over, and the outcome is irrelevant to it. The ledger can therefore be wrong in one direction only, counting a slot that a crash between the commit and the send never actually spent.
+
+Pin recovery orders by arrival and not by completion, because the live coordinator does. §16.2 guards a pin update with the request-arrival sequence, so when a newer request finishes first and an older one finishes afterwards, the live pin belongs to the newer request and the older completion is refused. Recovering the account with the newest `finished_at_us` reverses precisely that case, and a restart inside the hour would then move a live conversation onto an account the running process had already decided against, which is the one thing affinity exists to avoid. Arrival order needs no column of its own: `logical_elapsed_us` is measured from handler start, so `finished_at_us` less `logical_elapsed_us` is the arrival instant of the request that wrote the row, both columns are non-null on every row, and the elapsed half is a monotonic duration, so the derived instant does not wobble with the wall clock inside a process the way a stored arrival timestamp would.
 
 Recovery cannot read the instant a dispatch actually left, because the admission row is committed before it. It advances `reserved_at_us` by the store-operation ceiling, which is the latest moment the corresponding `Do` could have happened, so a recovered slot stays in the window at least as long as the live process would have kept it. That is the conservative direction, and the wrong one is available too: dating a recovered slot from its reservation would expire it early and let a restarted process readmit capacity the previous one had already spent, which is the failure the admission ledger exists to prevent. The value is derived at recovery time rather than stored, because a column holding a number computable from one already present is a second copy free to disagree with the first.
 
@@ -2323,7 +2325,7 @@ Cover:
 - Successful spill re-pins.
 - Upstream-error spill does not re-pin.
 - Partial stream spill does not re-pin.
-- Older concurrent completion cannot overwrite a newer pin.
+- Older concurrent completion cannot overwrite a newer pin, and a restart after that ordering recovers the same pin the live coordinator held.
 - A failed first request in a new session leaves no pin behind.
 - Concurrent first requests share one provisional pin, and it survives while any of them is still running.
 - The last concurrent first request to fail removes the provisional pin.
@@ -2545,6 +2547,7 @@ Exercise:
 - Successful session recovery within one hour.
 - Expired session not recovered.
 - Newest successful account chosen after spill.
+- Two successful requests of one session that finish out of arrival order recover the account of the later arrival, matching what the live sequence guard chose.
 - Failed spill ignored for recovery.
 - Recent dispatch timestamps seed rate state.
 - Old attempts do not.

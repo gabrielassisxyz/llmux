@@ -1638,12 +1638,12 @@ If the provider later documents a stable credential-specific error code carried 
 On upstream 429, under the coordinator lock and before the response is drained or anything is written to SQLite:
 
 - Add its timestamp to that account’s recent-429 history, pruning entries older than 60 seconds.
-- Parse `Retry-After` when valid and advance that account’s gate deadline to it, clamped to ten minutes. When none is valid, advance the deadline to one second after receipt.
+- Parse `Retry-After` when valid and advance that account’s gate deadline by the delay it states, clamped to ten minutes. Delta-seconds states that delay directly. An HTTP-date states an instant on upstream’s clock, so the delay is that instant less the `Date` header of the same response, which is the only other instant this proxy holds that was read from the same clock. Valid therefore means parseable and, for the absolute form, derivable. A header that is absent, unparseable or underivable, and one whose derived delay is not positive, advances the deadline to one second after receipt.
 - On the third 429 for that account within 60 seconds, additionally move it to `cooling_down` and floor the gate deadline at 60 seconds out.
 
 Then, outside the lock:
 
-- Record the dispatched attempt, storing the parsed delay as `upstream_retry_after_s`, unclamped, because the log should hold what upstream said rather than what the proxy decided to do about it. A delta is stored as sent. An HTTP-date is stored as its distance from the moment the response was received, which is the only form comparable across rows and is the number the gate itself used, and a date already in the past stores zero.
+- Record the dispatched attempt, storing the parsed delay as `upstream_retry_after_s`, unclamped, because the log should hold what upstream said rather than what the proxy decided to do about it. A delta is stored as sent. An HTTP-date is stored as its derived distance from that response’s own `Date`, which is the only form comparable across rows and is the number the gate itself used, and a date at or before that `Date` stores zero. An HTTP-date the response gave no usable `Date` for stores nothing, because no delay was derived and the fallback the gate took was not upstream’s statement.
 - Count it in local RPM.
 - Permit rate-limit retries within budget.
 - Prefer a different account immediately for an unpinned/base route’s next dispatch. A `Retry-After` from one account is a statement about that account and must never delay a dispatch to a different one.
@@ -1653,6 +1653,8 @@ Gate expiry:
 
 - Expire lazily.
 - Clear the recent-429 history only when a gate the threshold opened expires.
+
+Deriving the absolute form against the local wall clock is the obvious reading and it subtracts two machines. Local time five minutes ahead of upstream turns a date one minute in upstream’s future into a negative delay, which floors at zero, stores zero, and lets the next dispatch walk straight back into the window upstream had just closed; local time behind upstream produces a delay upstream never asked for, long enough to suppress an otherwise viable retry through the runway rule of §21.1. The two operands of a duration have to come from one clock, and the `Date` header is the one instant that arrives on the same response from the same clock as the `Retry-After` beside it. An origin server is required to send it, so the derivable case is the ordinary one; where it is missing the honest answer is that the header stated nothing this proxy can act on, which is the case the one-second floor already covers. That floor is also what a non-positive derived delay takes, because a 429 whose stated delay has already elapsed is upstream declining to name one, and the reason the fallback exists is to stop a burst of concurrent requests from re-entering a window that just closed.
 
 One deadline carries both effects, and what distinguishes them is which rule advanced it. A single 429 gates its account for as long as upstream asked, or for one second when it asked for nothing, which is what stops a burst of concurrent requests from walking straight back into a window that just closed. The third 429 inside a minute opens the longer circuit: it moves the account to `cooling_down`, floors the deadline at 60 seconds, and is the only thing whose expiry clears the recent-429 history. That scoping is load-bearing rather than tidy, because a one-second gate treated as a cooldown expiry would clear the history on the first 429 and the threshold could never be reached at all.
 
@@ -1672,7 +1674,7 @@ Reason:
 - Disabling all accounts during a common provider outage would amplify failure.
 - The current logical request may prefer another account, but account health remains enabled.
 
-A retryable 5xx that carries a valid `Retry-After` is upstream saying when to come back, and scheduling a guessed 250 milliseconds in place of a stated delay is the wrong order. The value becomes the minimum delay for a retry that targets the account which sent it, exactly as §21.3 already treats it for 429, and it is persisted as `upstream_retry_after_s` under the same unclamped rules. It gates nothing else: it neither advances that account's gate deadline nor counts toward the cooldown circuit, because a 503 may describe the provider rather than the credential, which is the reason this whole section leaves health alone. A retry that moves to a different account ignores it entirely, for the reason §20.2 gives about a 429. A stated delay longer than the remaining runway suppresses the retry through the ordinary deadline rule and is recorded as exactly that.
+A retryable 5xx that carries a valid `Retry-After` is upstream saying when to come back, and scheduling a guessed 250 milliseconds in place of a stated delay is the wrong order. The value becomes the minimum delay for a retry that targets the account which sent it, exactly as §21.3 already treats it for 429, and it is persisted as `upstream_retry_after_s` under the same derivation and the same unclamped rules. It gates nothing else: it neither advances that account's gate deadline nor counts toward the cooldown circuit, because a 503 may describe the provider rather than the credential, which is the reason this whole section leaves health alone. A retry that moves to a different account ignores it entirely, for the reason §20.2 gives about a 429. A stated delay longer than the remaining runway suppresses the retry through the ordinary deadline rule and is recorded as exactly that.
 
 ### 20.4 Request failures
 
@@ -2493,7 +2495,8 @@ Verify:
 - One or two 429 responses gate their account for the advertised delay, or one second, without entering the cooldown circuit or clearing the recent-429 history.
 - Third 429 in 60 seconds enters cooldown.
 - Old 429 timestamps expire.
-- `Retry-After` seconds and HTTP dates are parsed.
+- Delta-seconds are honoured as sent, and an HTTP-date is derived against the `Date` header of the same response and is unmoved by stepping the local wall clock in either direction.
+- An HTTP-date on a response carrying no usable `Date`, and one whose derived delay is not positive, both gate the account for one second; the first stores no advertised delay and the second stores zero, because one of them is upstream saying nothing and the other is upstream saying now.
 - Cooldown is clamped.
 - Cooldown wakes waiters.
 - A 401 or 429 is applied to account health before the response is drained, so a concurrent selection cannot hand out a credential or a window the process has already seen refused.
@@ -2516,6 +2519,7 @@ Cover:
 - Same-account retry falls back to another when the preferred account lacks capacity.
 - Upstream 504 prefers another account.
 - A 503 carrying `Retry-After` delays a same-account retry by at least the stated value, stores it unclamped, leaves account health and the cooldown circuit untouched, and delays a retry that moves to another account not at all.
+- The independent-clock cases of §28.8 hold on a 5xx too, in the delay imposed on a same-account retry, in the value stored, and in whether the runway rule suppresses that retry.
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
@@ -2654,7 +2658,7 @@ Verify:
 - No `logical_request_id` present in both `unrouted_request` and `attempt_log`, across the full matrix of local rejections, selection failures, and dispatched requests.
 - Selection and attempt numbering.
 - Aggregate skip counts.
-- Upstream retry delay persisted on 429 and 5xx dispatch rows whose response carried the header, in both the delta and the HTTP-date form, and absent everywhere else.
+- Upstream retry delay persisted on 429 and 5xx dispatch rows whose response carried the header, in the delta form and in the HTTP-date form paired with a usable `Date`, unchanged by local wall-clock skew in either direction, and absent everywhere else, including on a row whose HTTP-date had no `Date` to be derived against.
 - Terminal capacity-failure rows.
 - One phase batch commits atomically.
 - A deliberate bad row rolls back its whole phase batch.
@@ -3089,6 +3093,7 @@ Deliver:
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
 - Which `Content-Encoding` upstream selects when sent each consumer’s real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
 - Whether upstream responses carry numeric rate-limit headers, recorded by exact header name and per account. This decides whether the bounded projection of §14.4 ships in Phase 5, and it costs one look at headers the inventory requests are already receiving.
+- From the same look: which form a real `Retry-After` takes, and whether a `Date` header accompanies it. This gates nothing, because §20.2 has to handle both forms whatever upstream prefers, and it is recorded here because it says in advance which path a production 429 will take and whether the absolute form is derivable at all on this provider.
 
 Gate:
 

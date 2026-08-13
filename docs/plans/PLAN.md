@@ -440,6 +440,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Observer cumulative decoded-output cap | 64 MiB per response |
 | SQLite busy timeout | 5 seconds |
 | Store-operation ceiling | 6 seconds |
+| Passive checkpoint interval | 256 terminal commits |
 | WAL size warning threshold | 64 MiB |
 | Server header-read timeout | 5 seconds |
 | Server request-read timeout | 2 minutes |
@@ -605,7 +606,8 @@ Properties:
 
 #### Durable store
 
-- One SQLite database connection.
+- One writer connection for admissions, phase batches, lifecycle rows, and local-rejection rows.
+- One maintenance connection used only for checkpoints and read-only checks, which writes nothing.
 - Parameterized handwritten SQL.
 - Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
@@ -623,7 +625,7 @@ Properties:
 2. Validate required values without logging secrets.
 3. Ensure account keys are distinct.
 4. Validate the fixed route catalog.
-5. Open SQLite at the exact configured path.
+5. Open SQLite at the exact configured path, and set and read back the required connection-local pragmas on every connection it opens.
 6. Apply embedded forward-only migrations.
 7. Verify append permissions using a transaction that is rolled back.
 8. Recover recent rate timestamps from `dispatch_admission`, never from terminal attempt rows.
@@ -661,7 +663,7 @@ There is no degraded startup mode.
 10. Return zero for orderly signal-driven shutdown.
 11. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
 
-No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 run in the foreground of a terminal commit that is already happening, which is why they are not one.
+No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 still run in the foreground of a terminal commit that is already happening, which is why they are not one; what changed is which connection they run on, not who drives them or when.
 
 ## 12. Request data flow
 
@@ -983,13 +985,17 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Reject group/other-readable existing files.
 - Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
+- Set `PRAGMA foreign_keys` on and verify it by reading it back, on every connection. SQLite defaults it off and scopes it per connection, so a schema declaring that a dispatch row references an existing admission enforces nothing until each connection turns it on. Declared and unenforced is worse than absent: §15.8 would describe a guarantee the store does not provide, and an orphan row would surface in a query months later instead of failing the insert that wrote it.
+- Set `PRAGMA trusted_schema` off, so no object in the schema can cause a function to run during an ordinary statement.
+- Run no whole-database integrity scan at startup. `PRAGMA quick_check` and `PRAGMA foreign_key_check` cost time proportional to a store this document forbids ever truncating, so on the startup path they buy a check that gets slower every week and delay the listener by an amount nobody chose. They belong to `llmux db check`, which an operator runs deliberately.
 - Use full synchronous durability, unless and until the measurement §28.18 owes shows its cost is material. The alternative and the condition that would settle it are stated below.
 - Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite’s automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
-- Attempt a passive checkpoint in the foreground after a bounded number of terminal commits, and again when a terminal commit finds the WAL past its warning threshold. A checkpoint never runs in the foreground of an admission commit: that commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw, while the same work behind a terminal commit runs after the response was relayed and is invisible to every client.
+- Attempt a passive checkpoint after each 256 terminal commits, and again when a terminal commit finds the WAL past its warning threshold. The attempt runs on the maintenance connection, in the foreground of the terminal path that triggered it, once that commit has returned.
+- A checkpoint never runs on the writer connection. The admission commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw. Placing the checkpoint behind a terminal commit is not sufficient on its own: with a single connection the next admission commit queues behind that checkpoint regardless of which commit it followed, and the rule protects nothing it names. The second connection is what makes the separation real, and it is also why the interval is a stated number rather than "a bounded number" of commits.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
 - Use a five-second busy timeout, and bound every store operation with a six-second context so SQLite’s own busy handling always finishes before the application deadline fires. An application deadline shorter than the busy timeout would cancel exactly the contended writes the busy timeout exists to let through, and an unbounded one would leave the pending-reservation window of §17.1 with no stated ceiling for recovery to be conservative against.
-- Set maximum open and idle database connections to one.
+- Cap the writer at one open and one idle connection, so every durable write serializes through it, and keep the maintenance connection separate from that pool.
 - Use parameterized SQL only.
 - Check every database error.
 
@@ -1184,6 +1190,7 @@ The schema enforces:
 - `attempt_id` required on dispatch rows, null on skip and selection-failure rows, and always referencing an existing admission.
 - Limiter snapshots present only on skip rows.
 - Fixed record kinds and enums.
+- Foreign-key enforcement enabled and verified at runtime on every connection, not merely declared in the schema text.
 - Positive `selection_no` for every row.
 - Account labels restricted to three values when present.
 - Account label required for dispatch and skip rows, and null for selection-failure rows.
@@ -2539,7 +2546,8 @@ Verify:
 - Update/delete triggers.
 - Index presence.
 - `EXPLAIN QUERY PLAN` on both recovery queries, asserting the intended index and no full table scan.
-- Passive checkpoint behavior, including that no checkpoint runs in the foreground of an admission commit.
+- `PRAGMA foreign_keys` is on for every connection the pool hands out, and an orphan dispatch row is refused by the live connection rather than only by the schema text.
+- Passive checkpoints run on the maintenance connection, and an admission commit issued while one is running does not queue behind it.
 - WAL growth and its warning under a deliberately held external reader.
 - Null token counts.
 - Full token counts.
@@ -2998,7 +3006,8 @@ Gate:
 
 - Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
 - An admission insert that fails is reported to its caller as a failure and never as a partial success.
-- The admission commit’s latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it.
+- The admission commit’s latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it, and the store-operation ceiling that §17.1 makes recovery conservative against is a number rather than a guess.
+- Connection-local pragmas are confirmed to hold on every connection the pool hands out, on the pinned driver, by reading them back after the pool has been forced to open a fresh one. A pragma is per connection and a pool may open another at any moment, so setting it once at open is an assumption about this driver and this pool rather than a property of SQLite.
 - Static cgo-free test build succeeds.
 
 ### Phase 3: Request scanner and rewriter

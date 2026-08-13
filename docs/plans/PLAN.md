@@ -489,13 +489,16 @@ Lower-level components do not import the application or command package.
 | `cmd/llmux` | Minimal entry point, `version` subcommand, configuration load, construction, run, exit status |
 | `internal/app` | Composition root, server lifecycle, startup recovery, signal handling |
 | `internal/catalog` | Fixed routes, generated pinned variants, model-list projection |
-| `internal/proxy` | Auth, handlers, body rewriting, retry loop, headers, relay, usage observation |
+| `internal/rewrite` | Top-level JSON scanner, rewrite plan, immutable replay segments |
+| `internal/proxy` | Auth, handlers, retry loop, headers, relay commitment, usage observation |
 | `internal/route` | Account limiter, health, session affinity, account selection, leases |
 | `internal/resource` | Global handler slots and the weighted aggregate-memory gate |
 | `internal/logstore` | SQLite configuration, migrations, inserts, startup recovery queries |
 | `internal/idgen` | Proxy-owned random identifiers |
 | `internal/testsupport` | Test-only clock/timer control, scripted upstream, deterministic shuffler, raw HTTP client helpers |
 | `deploy` | Reference user-service definition and placeholder-only environment template |
+
+The request scanner and rewriter sit apart from `internal/proxy` because they are the most heavily specified and most heavily tested component in this document and have no HTTP dependency whatsoever. Separating them makes the byte-preservation contract one package's public API, lets the fuzz targets of §28.3 build without server plumbing, and removes the seam along which relay code would otherwise start reaching into scanner internals. It is the cohesion argument already made for `internal/resource` and `internal/idgen`, applied to a larger unit. Response bodies remain in `internal/proxy`, which is why the package is named for the rewrite rather than for bodies in general.
 
 There is no `pkg`, `utils`, `helpers`, provider registry, plugin directory, generated router, or ORM model layer.
 

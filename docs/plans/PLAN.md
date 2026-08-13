@@ -79,6 +79,7 @@ Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and intro
 | Area | Decision |
 | --- | --- |
 | Language | Go 1.26 |
+| Release toolchain | An exact Go 1.26 patch release, pinned in the module and in CI |
 | HTTP server | `net/http.Server` and `http.ServeMux` |
 | Upstream client | `net/http.Client` with a shared configured transport |
 | Persistence | SQLite through `modernc.org/sqlite` |
@@ -103,6 +104,8 @@ Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and intro
 | Backend definition | Fixed source catalog |
 | Upstream base | `https://ollama.com/v1` |
 | Static build | `CGO_ENABLED=0` release build |
+
+The toolchain row names a patch release and not only a language version, because a language version in a module is a floor that the toolchain in front of it may sit above or below, and the patch releases are where the standard library’s own security fixes land. This document deliberately does not carry the number. The exact patch is chosen at Phase 1 from the then-current 1.26 release and advanced by reviewed updates afterwards, for the same reason §8.4 refuses to carry provisional model strings: a version written into prose rots between the writing and the building, and the one copy that is checkable is the module file the build actually reads.
 
 The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s official integration documentation](https://docs.ollama.com/integrations/droid). Which request fields and reasoning values that base accepts is documented separately, by [Ollama’s OpenAI compatibility documentation](https://docs.ollama.com/api/openai-compatibility).
 
@@ -2694,6 +2697,7 @@ Every release must pass:
 - Integration-tagged tests.
 - Fuzz smoke runs for body and usage parsers.
 - `govulncheck`.
+- Confirmation that the build used the pinned toolchain rather than whichever one happened to be installed.
 - Security static analysis.
 - `CGO_ENABLED=0` build.
 - Reproducible `-trimpath` release build with artifact checksums.
@@ -3047,7 +3051,7 @@ This phase writes no code and produces no binary. It exists because everything a
 
 Deliver:
 
-- Go module pinned to Go 1.26.
+- Go module carrying the Go 1.26 language version and a toolchain directive naming the exact current 1.26 patch release, with CI building on that toolchain and no other.
 - Minimal command and application composition.
 - Configuration loading/validation.
 - Fixed route catalog.

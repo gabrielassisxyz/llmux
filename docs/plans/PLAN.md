@@ -1099,6 +1099,8 @@ The schema contains no body, message, completion, raw session identifier, header
 
 The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_key`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
 
+A validated consumer label, supplied by the caller in a fixed header, was considered on the same rule and rejected by it. It would be evidence rather than tenancy, since nothing would authenticate, route, or throttle on it, and a closed lowercase vocabulary rejected on mismatch would not reopen the question §6.6 settles for session identifiers. What it lacks is a reader the existing columns cannot serve. With three consumers, one of which is the only sessionless caller, `session_key`, `requested_alias`, and `request_streaming` already separate them, and the header would have to be added to all three callers as one more cutover precondition to buy that. It earns its cost at a fourth consumer, or at a second sessionless one, which is the point at which the attribution in §30.3 stops working; adding the column then is a migration, and a migration is the direction this schema treats as cheap.
+
 ### 15.6 Outcome vocabulary
 
 - `succeeded`
@@ -2754,7 +2756,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Terminal capacity failures and their advertised retry time.
 - Process uptime spans and unclean stops, which is what turns a missing `eod` row into either a consumer failure or proxy downtime.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
-- Sessionless calls in the expected `eod` execution window.
+- Per-consumer traffic, attributed from the presence of a `session_key`, the requested alias, and the streaming flag, because the store holds no consumer identifier. `eod` is the one sessionless caller, which is what makes its rows findable without appealing to the hour it usually runs at. This is a heuristic, and §15.5 records what would replace it and when.
 
 No built-in query, README recipe, or report computes currency cost.
 

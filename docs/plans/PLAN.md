@@ -804,8 +804,11 @@ The observer must not retain unbounded response text.
 
 Use SQLite through the cgo-free `modernc.org/sqlite` driver.
 
+The decisive property is that the proxy reads its own log. Startup recovers session affinity and the rolling rate windows from recent history, so the store must answer a query with a predicate and an ordering before the listener binds, not merely accept an append.
+
 Rationale:
 
+- Recovery queries over recent history, which is what affinity and rate restoration are.
 - Typed nullable fields.
 - Transactional append.
 - Unique IDs and constraints.
@@ -2295,7 +2298,13 @@ No performance optimization is accepted if it weakens message preservation, rate
 
 ### 29.1 SQLite over JSONL
 
-Chosen because indexing, constraints, crash-safe commits, recovery queries, and concurrent local reading are central requirements. The additional driver dependency and binary size are acceptable.
+The argument that settles this is not durability, indexing, or the cost of the dependency. It is that this attempt log has a reader inside the proxy.
+
+Session affinity survives a restart only if startup can answer "which account most recently served this session id, within the last hour", and the rolling windows survive only if it can answer "which dispatches started in the last 60 seconds, per account". Both run before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
+
+The rest is real but follows from the choice rather than driving it: typed nullable columns that keep a missing token count distinct from a zero, constraints that fail a malformed row at the write instead of at a read months later, crash-safe transactional commits, and safe concurrent reading by a local analysis tool while the proxy is serving.
+
+The additional driver dependency and binary size are acceptable.
 
 ### 29.2 Manual dependency injection
 

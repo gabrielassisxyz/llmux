@@ -109,3 +109,42 @@ func TestParseRetryAfterIsImmuneToLocalWallClock(t *testing.T) {
 		t.Errorf("gate = %v, want 45s regardless of how far responseDate is from wall-clock now", got.gate)
 	}
 }
+
+func TestDeriveRetryAfterDeltaSeconds(t *testing.T) {
+	got := DeriveRetryAfter("30", time.Time{}, false)
+	if !got.Present || got.Delay != 30*time.Second {
+		t.Errorf("Delay = %v, Present = %v, want 30s, present", got.Delay, got.Present)
+	}
+}
+
+func TestDeriveRetryAfterAbsentReportsNothingToHonor(t *testing.T) {
+	got := DeriveRetryAfter("", time.Time{}, false)
+	if got.Present {
+		t.Errorf("Present = true for an absent header, want false: a 5xx has no fallback delay to impose")
+	}
+}
+
+func TestDeriveRetryAfterUnparseableReportsNothingToHonor(t *testing.T) {
+	got := DeriveRetryAfter("garbage", time.Time{}, false)
+	if got.Present {
+		t.Errorf("Present = true for an unparseable header, want false")
+	}
+}
+
+func TestDeriveRetryAfterZeroDeltaReportsPresentZero(t *testing.T) {
+	got := DeriveRetryAfter("0", time.Time{}, false)
+	if !got.Present || got.Delay != 0 {
+		t.Errorf("Delay = %v, Present = %v, want 0, present (upstream said retry now)", got.Delay, got.Present)
+	}
+}
+
+func TestDeriveRetryAfterAbsoluteFormDerivedAgainstDate(t *testing.T) {
+	responseDate := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	target := responseDate.Add(200 * time.Second)
+	header := target.Format(httpDateLayout)
+
+	got := DeriveRetryAfter(header, responseDate, true)
+	if !got.Present || got.Delay != 200*time.Second {
+		t.Errorf("Delay = %v, Present = %v, want 200s, present", got.Delay, got.Present)
+	}
+}

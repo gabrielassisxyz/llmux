@@ -70,3 +70,32 @@ func deriveDelay(delay time.Duration) retryAfterDelay {
 	}
 	return retryAfterDelay{gate: delay, stored: delay, storedPresent: true}
 }
+
+// RetryAfterDerivation is a Retry-After header parsed and, for the
+// absolute form, derived against the response's own Date. It carries no
+// account-gating decision: that exists only inside Apply429, which only an
+// upstream 429 may call.
+type RetryAfterDerivation struct {
+	// Delay is the minimum wait a retry to the same account should honor,
+	// meaningful only when Present is true.
+	Delay time.Duration
+
+	// Present is false when nothing could be derived: the header was
+	// absent, unparseable, or its absolute form had no usable Date to
+	// derive against. A caller must impose no minimum delay in that
+	// case, since there is no statement from upstream to honor.
+	Present bool
+}
+
+// DeriveRetryAfter parses a Retry-After header value under the same
+// derivation rules Apply429 uses for a 429, without touching any account
+// state: it takes no Coordinator receiver, so it cannot advance a gate
+// deadline or contribute to the cooldown circuit no matter how it is
+// called. This is what a retryable 5xx uses to compute the minimum delay
+// for a retry that targets the account which sent it; a 5xx carries no
+// one-second fallback the way a 429's account gate does, so an absent or
+// unparseable header simply reports nothing to honor.
+func DeriveRetryAfter(header string, responseDate time.Time, hasResponseDate bool) RetryAfterDerivation {
+	parsed := parseRetryAfter(header, responseDate, hasResponseDate)
+	return RetryAfterDerivation{Delay: parsed.stored, Present: parsed.storedPresent}
+}

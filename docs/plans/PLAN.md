@@ -3102,6 +3102,7 @@ For the first week of real traffic, inspect the attempt store at least daily for
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
+- Suppressed retries by `retry_disposition`, which separates a failure upstream declared final from one this proxy would have retried and could not, and says whether the ten-minute deadline or a dispatch budget is the binding constraint on retry.
 - Response truncations or client disconnects.
 - Attempt-log write failures.
 - Missing `eod` execution evidence in its expected window.

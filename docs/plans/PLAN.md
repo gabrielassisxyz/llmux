@@ -694,9 +694,9 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 19. Reacquire the coordinator mutex, convert the pending reservation into a dispatch timestamp at the current instant, unlock, and call `http.Client.Do` immediately. That second critical section touches memory only and has no failure branch: the admission is committed, so the attempt is going upstream whatever the mutex reveals. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its slot is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
 20. Classify transport errors and upstream status before writing any downstream status or headers.
 21. If retrying:
+    - Update account health from the classified status, under the coordinator lock, before anything else.
     - Drain and close the intermediate response within bounds.
     - Release the lease.
-    - Update account health.
     - Transactionally append the selection skips and attempt row.
     - Wait using context-aware backoff.
     - Begin the next selection phase with the next prospective attempt number.
@@ -1278,7 +1278,7 @@ Each contains:
 - Ordered deque of recent dispatch-start timestamps.
 - Current in-flight count.
 - Health state.
-- Cooldown deadline.
+- Rate gate deadline, advanced by any 429 and floored by the cooldown circuit.
 - Recent 429 timestamps.
 - Notification generation.
 
@@ -1347,8 +1347,8 @@ For an account candidate:
 
 1. Read the monotonic clock.
 2. Remove dispatch timestamps at or before `now - 60 seconds`.
-3. Expire a completed cooldown.
-4. Reject disabled or cooling accounts.
+3. Expire a gate deadline that has passed, leaving `cooling_down` for `enabled` when the circuit opened it.
+4. Reject a disabled account, or one whose gate deadline has not passed.
 5. Reject if in-flight is already 12.
 6. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
 7. Otherwise increment pending reservations.
@@ -1497,7 +1497,7 @@ Use a reopen-aware bounded stall followed by spill.
 3. If the pin is disabled, do not wait; proceed to alternatives immediately.
 4. For deterministic blockers:
    - RPM reopening is the oldest retained admission plus 60 seconds.
-   - Cooldown reopening is `cooldown_until`.
+   - Rate-gate reopening is the account’s gate deadline, whether a single 429 or the cooldown circuit set it.
    - If several deterministic blockers apply, use the latest reopening time because all must clear.
 5. If the deterministic reopening time is later than the pin deadline, do not burn the five-second grace pointlessly; proceed to alternatives immediately.
 6. If deterministic reopening falls within the grace, wait exactly until that time or an earlier coordinator notification, then retry the pin.
@@ -1536,7 +1536,7 @@ Upstream 401 means `upstream_authentication`.
 
 Actions:
 
-- Mark the account disabled immediately.
+- Mark the account disabled as soon as the status is classified, under the coordinator lock, before the body is drained and before anything is written to SQLite.
 - Remove session pins that point to it.
 - Wake waiting requests.
 - For a flexible route, retry the current logical request on another eligible account, within the global dispatch budget and with no backoff. The failure is deterministic for the account rather than for the request, and routing around a broken account is the one job this proxy exists to do. Disablement bounds the chain by itself: each 401 removes an account for the process lifetime, so it can never exceed the three accounts that exist.
@@ -1544,6 +1544,8 @@ Actions:
 - Never relay the upstream 401, its body, or its `WWW-Authenticate` header to the client.
 - Exclude the account from subsequent base-alias requests.
 - Explicit aliases targeting it return local 503 on later requests.
+
+Immediately means before the bounded drain and before the terminal transaction, not merely before the retry. Those two together are a window in which every concurrent selection can still hand out a credential this process has already watched upstream refuse, and each dispatch that leaves through it spends an RPM slot and a share of some request’s four-dispatch budget on a certain failure. The same ordering applies to a 429 for the same reason. The mutation is memory under a mutex this design already forbids holding across I/O, so moving it to the front of the failure path costs nothing at all.
 
 Relaying that 401 downstream is the obvious alternative and it is wrong twice. An upstream 401 judges the credential the proxy presented, not the one the client presented, so it is the same kind of response as the redirect of §13.2: an instruction addressed to a party that is not the client, which the client cannot act on. It also collides with the proxy’s own contract, where 401 means the proxy key was rejected, so an OpenAI-shaped SDK reports an invalid API key to a caller whose key is valid and abandons the conversation. And it throws the router away at the moment the router is most useful: with one credential revoked and two healthy, roughly a third of new unpinned sessions would fail on a fault the proxy had fully understood and could have hidden.
 
@@ -1555,29 +1557,28 @@ If the provider later documents a stable credential-specific error code carried 
 
 ### 20.2 Rate-limit failures
 
-On upstream 429:
+On upstream 429, under the coordinator lock and before the response is drained or anything is written to SQLite:
 
-- Record the dispatched attempt.
+- Add its timestamp to that account’s recent-429 history, pruning entries older than 60 seconds.
+- Parse `Retry-After` when valid and advance that account’s gate deadline to it, clamped to ten minutes. When none is valid, advance the deadline to one second after receipt.
+- On the third 429 for that account within 60 seconds, additionally move it to `cooling_down` and floor the gate deadline at 60 seconds out.
+
+Then, outside the lock:
+
+- Record the dispatched attempt, storing the parsed delay as `upstream_retry_after_s`, unclamped, because the log should hold what upstream said rather than what the proxy decided to do about it. A delta is stored as sent. An HTTP-date is stored as its distance from the moment the response was received, which is the only form comparable across rows and is the number the gate itself used, and a date already in the past stores zero.
 - Count it in local RPM.
-- Add its timestamp to that account’s recent-429 history.
-- Parse `Retry-After` when valid, and advance that account’s cooldown deadline to it, clamped to ten minutes. Record the parsed delay on the attempt row as `upstream_retry_after_s`, unclamped, because the log should hold what upstream said rather than what the proxy decided to do about it. A delta is stored as sent. An HTTP-date is stored as its distance from the moment the response was received, which is the only form comparable across rows and is the number the cooldown itself used, and a date already in the past stores zero.
 - Permit rate-limit retries within budget.
 - Prefer a different account immediately for an unpinned/base route’s next dispatch. A `Retry-After` from one account is a statement about that account and must never delay a dispatch to a different one.
 - Keep explicit aliases on their named account.
 
-Cooldown threshold:
+Gate expiry:
 
-- Three 429 responses for the same account within 60 seconds.
-- Earlier 429 timestamps are pruned under the coordinator lock.
-- On the third, enter cooldown.
-
-Cooldown duration:
-
-- At least 60 seconds.
-- Longer if a valid `Retry-After` requires it.
-- Clamp a remote cooldown to ten minutes.
 - Expire lazily.
-- Clear the recent-429 history on cooldown expiry.
+- Clear the recent-429 history only when a gate the threshold opened expires.
+
+One deadline carries both effects, and what distinguishes them is which rule advanced it. A single 429 gates its account for as long as upstream asked, or for one second when it asked for nothing, which is what stops a burst of concurrent requests from walking straight back into a window that just closed. The third 429 inside a minute opens the longer circuit: it moves the account to `cooling_down`, floors the deadline at 60 seconds, and is the only thing whose expiry clears the recent-429 history. That scoping is load-bearing rather than tidy, because a one-second gate treated as a cooldown expiry would clear the history on the first 429 and the threshold could never be reached at all.
+
+A second, shorter deadline alongside the cooldown was the alternative and is not taken. Selection treats the two identically: each is a deterministic blocker with a known reopening instant, which is exactly what §19.1 computes its stall against, so a second field would add a second expiry, a second skip reason, and a second place for that computation to be wrong, in order to express a distinction no code path acts on.
 
 This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window, and it keeps a 429 from delaying a dispatch to an account that never sent one.
 
@@ -1646,7 +1647,7 @@ Rate-limit retry:
 - Exponential base delays of 1, 2, and 4 seconds.
 - Equal jitter between one-half and the full base delay.
 - A valid `Retry-After` becomes the minimum delay only when the next attempt targets the account that sent it.
-- When another eligible account exists, failover proceeds immediately with jitter, while the account that answered 429 stays blocked until its own deadline.
+- When the next attempt targets a different account, no backoff derived from the failed one is applied at all. Atomic selection and its own capacity waits pace the retry, and the account that answered 429 stays blocked by its gate deadline. The exponential delays exist to space repeated attempts against one closed window, not to slow a move away from it.
 - Delay is capped by the remaining logical deadline.
 
 Timeout/server retry:
@@ -2401,12 +2402,13 @@ Verify:
 - Subsequent base requests skip disabled account.
 - Explicit route fails locally.
 - No code path re-enables a disabled account within one process lifetime.
-- One or two 429 responses do not enter cooldown.
+- One or two 429 responses gate their account for the advertised delay, or one second, without entering the cooldown circuit or clearing the recent-429 history.
 - Third 429 in 60 seconds enters cooldown.
 - Old 429 timestamps expire.
 - `Retry-After` seconds and HTTP dates are parsed.
 - Cooldown is clamped.
 - Cooldown wakes waiters.
+- A 401 or 429 is applied to account health before the response is drained, so a concurrent selection cannot hand out a credential or a window the process has already seen refused.
 - A valid `Retry-After` blocks only the account that sent it.
 - Another account is selected without waiting out that `Retry-After`.
 - 5xx does not disable an account.

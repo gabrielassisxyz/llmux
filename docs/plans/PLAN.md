@@ -926,7 +926,7 @@ This definition excludes:
 
 It does not retain the event’s content.
 
-The anchor is the `Do` invocation rather than the dispatch reservation, because §12 places the admission commit between the two. Measured from the reservation, every first event would carry the store’s commit latency inside a number named for upstream behavior, and the weekly ceiling re-derivation of §30.10 would be tuned partly against this machine’s filesystem. `attempt_duration_us` shares that anchor for the same reason. `started_at_us` keeps recording the reservation instant, which is where the phase’s own accounting begins and what the admission row is timed against. The window itself is measured at the `Do` boundary, by invariant 24, and no column holds that instant because the admission row is written before it exists.
+The anchor is the `Do` invocation rather than the dispatch reservation, because §12 places the admission commit between the two. Measured from the reservation, every first event would carry the store’s commit latency inside a number named for upstream behavior, and the weekly ceiling re-derivation of §30.10 would be tuned partly against this machine’s filesystem. `attempt_duration_us` shares that anchor for the same reason, and so does the terminal row’s own `event_at_us`. The reservation instant keeps a column of its own, `dispatch_admission.reserved_at_us`, on the row that is written at that boundary and can hold nothing else. The terminal row is written after the call returns, so it can and does record the instant the call was made, which is what §30.3 counts dispatches by and what §30.10 re-derives the ceilings from. The window itself is measured at the same boundary, by invariant 31.
 
 It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token’s name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
 
@@ -1065,7 +1065,7 @@ Four append-only tables exist, and the split is by commit point rather than by s
 
 An admission row carries only what identifies the attempt it authorized and the limiter state that authorized it. It is never updated, so an admission without a matching terminal attempt row is itself a fact: the process crashed, stopped between the commit and the send, or lost its store before the attempt finished. Which of the three it was is not recoverable and does not need to be, because nothing the next process decides is read out of these rows.
 
-`reserved_at_us` records the reservation and not the dispatch, because the row is committed before the dispatch it authorizes exists to be timed. The live window is measured at the dispatch boundary all the same, so the two differ by the commit's own duration, bounded by the store-operation ceiling, which is why no reader of this column may treat it as the instant a request left.
+`reserved_at_us` records the reservation and not the dispatch, because the row is committed before the dispatch it authorizes exists to be timed. The live window is measured at the dispatch boundary all the same, so the two differ by the commit's own duration, bounded by the store-operation ceiling, which is why no reader of this column may treat it as the instant a request left. The column that does hold that instant is `attempt_log.event_at_us` on the terminal row, which is written afterwards and can therefore carry it.
 
 `attempt_log` holds what became known after the fact.
 
@@ -1155,7 +1155,7 @@ The row stops at the outcome and holds no client string the proxy did not valida
 | `attempt_no` | Integer, nullable | 1-based dispatch count; null for skips |
 | `is_spill` | Boolean integer, non-null | Dispatch differs from valid initial pin |
 | `spill_from_account` | Text, nullable | Original pin for a spill |
-| `started_at_us` | Integer, non-null | UTC Unix microseconds at reservation/skip |
+| `event_at_us` | Integer, non-null | UTC Unix microseconds at the boundary this row records: the `Do` invocation for a dispatch, the observation for a skip, the terminal decision for a selection failure |
 | `finished_at_us` | Integer, non-null | UTC Unix microseconds at terminal record |
 | `selection_wait_us` | Integer, nullable | Phase start through lease acquisition/failure; null for individual skips |
 | `attempt_duration_us` | Integer, nullable | Monotonic duration of the upstream call, `Do` through response close |
@@ -1179,6 +1179,8 @@ The row stops at the outcome and holds no client string the proxy did not valida
 | `skip_reason` | Text, nullable | Local selection reason |
 | `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
 | `dropped_header_count` | Integer, nullable | Request headers removed by the allowlist; null for skips |
+
+`event_at_us` is named for the row rather than for a phase because the three record kinds have no common start, and it is anchored at `Do` on a dispatch row for the reason §14.1 gives about the metric next to it. A column called `started_at_us` and filled at reservation is the mislabel this document has now corrected twice: the name says one boundary, the value is taken at another, and everything downstream inherits the displacement. Here that displacement is the admission commit, up to the store-operation ceiling, so a dispatch reserved at 12:00:59 and sent at 12:01:05 would be counted in the wrong minute by the two recipes §30.3 owes and by the ceiling re-derivation those recipes feed, and the error would grow with whatever the filesystem was doing. Renaming a column costs nothing while no code exists, and §15.10 forbids the schema from updating itself afterwards.
 
 The schema contains no body, message, completion, raw session identifier, header value, credential, raw upstream error, upstream ID, cost, price, or currency column.
 
@@ -1288,13 +1290,13 @@ The schema enforces:
 Create indexes for:
 
 - `dispatch_admission(account_label, reserved_at_us)`, which is the offline admission-pressure query of §30.3.
-- `attempt_log(started_at_us)`.
-- `attempt_log(account_label, started_at_us)`.
+- `attempt_log(event_at_us)`.
+- `attempt_log(account_label, event_at_us)`.
 - `(logical_request_id, sequence_no)`.
 - A partial successful-completion index on `(session_key, finished_at_us DESC)`, which is the session recovery query. It restricts the query to successful completions inside the hour; the arrival order that query then ranks by is computed from the retrieved rows, because it is derived from two columns rather than stored in one.
-- `(requested_alias, started_at_us)`.
-- `(outcome, started_at_us)`.
-- `(error_class, started_at_us)`.
+- `(requested_alias, event_at_us)`.
+- `(outcome, event_at_us)`.
+- `(error_class, event_at_us)`.
 - `unrouted_request(finished_at_us)`.
 
 ### 15.10 Append-only enforcement
@@ -2674,6 +2676,7 @@ Verify:
 - Startup reads no rate state from `dispatch_admission`, so a store seeded with recent admissions changes nothing about when the first dispatch may leave.
 - Admission rows survive a subprocess killed immediately after their commit.
 - Every named query recipe of §30.3 parses and runs against a seeded store and returns the shape its name promises, so a schema change that invalidates one fails here rather than in front of an operator.
+- A dispatch whose admission commit runs long enough to place its reservation and its `Do` on opposite sides of a minute boundary is counted by the dispatch recipes in the interval the call fell in and by the admission recipe in the interval the reservation fell in, and a subprocess killed between the two contributes to the second and to the unmatched-admission figure but not to the first.
 - Busy timeout behavior.
 - Disk/permission failures where platform support permits.
 - Store close ordering.
@@ -2951,8 +2954,9 @@ Embedding them in the binary as a report subcommand was the alternative and is n
 
 The logical-request recipes carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
 
-- Dispatch count by account and time range.
-- Current/recent RPM pressure by account.
+- Dispatch count by account and `event_at_us` range, which is the interval each call fell in rather than the interval its reservation did.
+- Current/recent RPM pressure by account, read over that same column, so the operational number and the limiter’s own ceiling are measured at one boundary.
+- Admission pressure by account and `reserved_at_us` range, and the admissions no terminal row ever matched. That second figure is the upper bound the window between the commit and the call leaves behind, and it is the only thing that separates a dispatch this store never described from one it never authorized.
 - Upstream 429 responses against dispatch volume per account, together with the distribution of the retry delays advertised on those 429 rows, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered. The same column on a 5xx row is upstream describing an outage rather than a rate ceiling, so a recipe that does not filter by status mixes two different statements into one distribution.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.

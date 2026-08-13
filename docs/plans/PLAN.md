@@ -404,7 +404,7 @@ The three account keys must be non-empty and distinct. Duplicate credentials wou
 
 The proxy and affinity keys must be non-empty and distinct from each other and from every account key. The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
 
-The store's path variable names a database and not a log, because the distinction it sits on is the one this document works hardest to keep: process logs are ephemeral, go to stderr and may be rotated freely, while the durable store is append-only evidence that §15.10 forbids truncating and no retention tooling should ever be pointed at. A variable called a log path invites exactly that. `LLMUX_LOG_LEVEL` keeps its name because it genuinely is about process logs.
+The store’s path variable names a database and not a log, because the distinction it sits on is the one this document works hardest to keep: process logs are ephemeral, go to stderr and may be rotated freely, while the durable store is append-only evidence that §15.10 forbids truncating and no retention tooling should ever be pointed at. A variable called a log path invites exactly that. `LLMUX_LOG_LEVEL` keeps its name because it genuinely is about process logs.
 
 Key changes require restart. There is no reload endpoint, signal-based reload, watcher, or mutable configuration file.
 
@@ -500,7 +500,7 @@ Lower-level components do not import the application or command package.
 | `internal/testsupport` | Test-only clock/timer control, scripted upstream, deterministic shuffler, raw HTTP client helpers |
 | `deploy` | Reference user-service definition and placeholder-only environment template |
 
-The request scanner and rewriter sit apart from `internal/proxy` because they are the most heavily specified and most heavily tested component in this document and have no HTTP dependency whatsoever. Separating them makes the byte-preservation contract one package's public API, lets the fuzz targets of §28.3 build without server plumbing, and removes the seam along which relay code would otherwise start reaching into scanner internals. It is the cohesion argument already made for `internal/resource` and `internal/idgen`, applied to a larger unit. Response bodies remain in `internal/proxy`, which is why the package is named for the rewrite rather than for bodies in general.
+The request scanner and rewriter sit apart from `internal/proxy` because they are the most heavily specified and most heavily tested component in this document and have no HTTP dependency whatsoever. Separating them makes the byte-preservation contract one package’s public API, lets the fuzz targets of §28.3 build without server plumbing, and removes the seam along which relay code would otherwise start reaching into scanner internals. It is the cohesion argument already made for `internal/resource` and `internal/idgen`, applied to a larger unit. Response bodies remain in `internal/proxy`, which is why the package is named for the rewrite rather than for bodies in general.
 
 There is no `pkg`, `utils`, `helpers`, provider registry, plugin directory, generated router, or ORM model layer.
 
@@ -929,7 +929,7 @@ The observer must not retain unbounded response text.
 - Observer failure never changes response bytes.
 - Parser panics are prohibited and fuzz-tested.
 
-The decoder exists because without it the evidence the whole of §30 rests on can quietly go to zero. `Accept-Encoding` crosses to upstream in the request allowlist, and mainstream HTTP stacks advertise compression by default, so if upstream honours what a consumer sends then token counts, usage and first-event timing are `NULL` for every request that consumer makes, and the weekly ceiling re-derivation loses its volume and latency signal without anything reporting a failure. Dropping `Accept-Encoding` from the allowlist is the cheaper fix and is rejected: it spends real bandwidth on every completion to solve a problem on the observer's side of the process, and it mutates upstream-visible negotiation on behalf of a client that asked for something else. Whether the decoder is needed at all is a question about upstream rather than a question of design, so the Phase 0 gate measures which encoding upstream actually selects for each consumer's real `Accept-Encoding`, and that measurement decides whether the decoder ships. Timing observed through the decoder inherits upstream's own flush boundaries, which are the boundaries the client sees too, so a first-event figure stays comparable across encodings.
+The decoder exists because without it the evidence the whole of §30 rests on can quietly go to zero. `Accept-Encoding` crosses to upstream in the request allowlist, and mainstream HTTP stacks advertise compression by default, so if upstream honours what a consumer sends then token counts, usage and first-event timing are `NULL` for every request that consumer makes, and the weekly ceiling re-derivation loses its volume and latency signal without anything reporting a failure. Dropping `Accept-Encoding` from the allowlist is the cheaper fix and is rejected: it spends real bandwidth on every completion to solve a problem on the observer’s side of the process, and it mutates upstream-visible negotiation on behalf of a client that asked for something else. Whether the decoder is needed at all is a question about upstream rather than a question of design, so the Phase 0 gate measures which encoding upstream actually selects for each consumer’s real `Accept-Encoding`, and that measurement decides whether the decoder ships. Timing observed through the decoder inherits upstream’s own flush boundaries, which are the boundaries the client sees too, so a first-event figure stays comparable across encodings.
 
 ## 15. Durable data model
 
@@ -966,7 +966,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
 - Use full synchronous durability, unless and until the measurement §28.18 owes shows its cost is material. The alternative and the condition that would settle it are stated below.
-- Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite's automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
+- Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite’s automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
 - Attempt a passive checkpoint in the foreground after a bounded number of terminal commits, and again when a terminal commit finds the WAL past its warning threshold. A checkpoint never runs in the foreground of an admission commit: that commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw, while the same work behind a terminal commit runs after the response was relayed and is invisible to every client.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
@@ -1480,7 +1480,7 @@ Actions:
 - Exclude the account from subsequent base-alias requests.
 - Explicit aliases targeting it return local 503 on later requests.
 
-Relaying that 401 downstream is the obvious alternative and it is wrong twice. An upstream 401 judges the credential the proxy presented, not the one the client presented, so it is the same kind of response as the redirect of §13.2: an instruction addressed to a party that is not the client, which the client cannot act on. It also collides with the proxy's own contract, where 401 means the proxy key was rejected, so an OpenAI-shaped SDK reports an invalid API key to a caller whose key is valid and abandons the conversation. And it throws the router away at the moment the router is most useful: with one credential revoked and two healthy, roughly a third of new unpinned sessions would fail on a fault the proxy had fully understood and could have hidden.
+Relaying that 401 downstream is the obvious alternative and it is wrong twice. An upstream 401 judges the credential the proxy presented, not the one the client presented, so it is the same kind of response as the redirect of §13.2: an instruction addressed to a party that is not the client, which the client cannot act on. It also collides with the proxy’s own contract, where 401 means the proxy key was rejected, so an OpenAI-shaped SDK reports an invalid API key to a caller whose key is valid and abandons the conversation. And it throws the router away at the moment the router is most useful: with one credential revoked and two healthy, roughly a third of new unpinned sessions would fail on a fault the proxy had fully understood and could have hidden.
 
 The account remains disabled for the process lifetime. Correcting the key requires restart, which is also how a renewed subscription on an unchanged key is put back into rotation. Nothing inside the process re-tests a disabled account, on a timer or on a request.
 
@@ -2581,7 +2581,7 @@ Benchmarks and load checks must establish:
 - SSE relay does not accumulate total stream size.
 - Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
-- The admission commit's own latency, measured on the filesystem the store will live on and at the concurrency the in-flight ceilings permit, reported against total dispatch latency. It is the only durable write on a request's critical path, and the synchronous level chosen in §15.2 is answerable from this number rather than from argument.
+- The admission commit’s own latency, measured on the filesystem the store will live on and at the concurrency the in-flight ceilings permit, reported against total dispatch latency. It is the only durable write on a request’s critical path, and the synchronous level chosen in §15.2 is answerable from this number rather than from argument.
 - SQLite inserts do not hold coordinator state.
 - Selection rechecks produce bounded aggregated skip state.
 - 28 catalog entries and tens of thousands of rows do not materially affect startup.
@@ -2591,7 +2591,7 @@ Benchmarks and load checks must establish:
 - Concurrent admitted handlers never exceed the global ceiling.
 - Charged request, replay, and precommit memory never exceeds the aggregate budget.
 - Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
-- An unsized upload's gate charge stays ahead of its buffered bytes at every step and settles to the actual size at read completion.
+- An unsized upload’s gate charge stays ahead of its buffered bytes at every step and settles to the actual size at read completion.
 - Concurrent small unsized uploads cannot exhaust the aggregate budget, and a denied extension releases the whole charge and answers 429.
 - A slow upload terminates at the request-read deadline instead of holding its buffer.
 
@@ -2814,7 +2814,7 @@ Before cutover:
 - The once-a-day `eod` summariser is the one to change first. It runs with no session file and no operator watching, so a lost result there is invisible until someone notices a missing day. It needs retry in its own codebase before cutover.
 - A caller that cannot be changed is recorded as accepting the loss, rather than answered by relaxing the ceiling here.
 
-The token and latency evidence has preconditions of the same shape, and they exist for the same reason: the proxy will not alter a request or a response to improve its own observability, so what the callers send decides what the log can hold. Each of these is a caller that quietly writes null columns forever, and the absence is first noticed a month later in §30.3's token recipes rather than at cutover.
+The token and latency evidence has preconditions of the same shape, and they exist for the same reason: the proxy will not alter a request or a response to improve its own observability, so what the callers send decides what the log can hold. Each of these is a caller that quietly writes null columns forever, and the absence is first noticed a month later in §30.3’s token recipes rather than at cutover.
 
 - Confirm that each streaming caller which wants durable token evidence sends `stream_options.include_usage` itself. The proxy never injects it, by invariant 18, so a streaming consumer that omits it reports no usage object and every token column stays `NULL`. This one matters most for `pi`, the primary streaming consumer.
 - Confirm that a caller which wants durable token and first-event evidence advertises only response encodings the observer can decode, once Phase 0 has recorded which encodings upstream actually selects. A caller that asks for one the observer cannot decode receives its bytes exactly as ever and writes `NULL` observation columns, which is its choice to make and is recorded here rather than worked around inside the proxy.
@@ -2850,7 +2850,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on those rows are upstream's own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on those rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
@@ -2871,7 +2871,7 @@ Deliver:
 - Real-upstream pass/fail evidence for every distinct model and preset, per account.
 - A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed.
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
-- Which `Content-Encoding` upstream selects when sent each consumer's real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
+- Which `Content-Encoding` upstream selects when sent each consumer’s real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
 
 Gate:
 
@@ -2917,7 +2917,7 @@ Gate:
 
 - Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
 - An admission insert that fails is reported to its caller as a failure and never as a partial success.
-- The admission commit's latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it.
+- The admission commit’s latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it.
 - Static cgo-free test build succeeds.
 
 ### Phase 3: Request scanner and rewriter

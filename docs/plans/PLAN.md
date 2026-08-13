@@ -1186,6 +1186,30 @@ A validated consumer label, supplied by the caller in a fixed header, was consid
 
 Raw Go error strings are never stored.
 
+### 15.7.1 Selection and retry vocabularies
+
+`skip_reason`, on selection-skip rows only:
+
+- `rpm_limit`
+- `in_flight_limit`
+- `rate_gated`
+- `disabled`
+
+`rate_gated` covers both a single 429 and the cooldown circuit, because §20.2 keeps them on one deadline and selection acts on neither differently.
+
+`retry_disposition`, on every row:
+
+- `final`
+- `retry_same_account`
+- `retry_other_account`
+- `retry_named_account`
+- `suppressed_class_budget`
+- `suppressed_global_budget`
+- `suppressed_deadline`
+- `not_applicable`
+
+The three suppressed values separate a failure upstream declared final from one this proxy would have retried and could not, which is the difference §30.10 looks for when it asks whether the deadline or the dispatch budget is the binding constraint. `not_applicable` belongs to selection-skip rows, which record no attempt and therefore no retry decision. Both lists are stated because §15.8 requires fixed enums and these two were the ones it never wrote down, and an enum nobody enumerated is a free-text column that the code fills consistently right up until it does not.
+
 ### 15.8 Constraints
 
 The schema enforces:
@@ -1201,7 +1225,8 @@ The schema enforces:
 - Account labels restricted to three values when present.
 - Account label required for dispatch and skip rows, and null for selection-failure rows.
 - `attempt_no` required only for dispatch records.
-- `skip_reason` required only for skip records.
+- `skip_reason` required only for skip records, restricted to its fixed vocabulary.
+- `retry_disposition` restricted to its fixed vocabulary, and `not_applicable` only on skip records.
 - `skip_observation_count >= 1` only for skip records.
 - `dropped_header_count` non-negative, and present only for dispatch records.
 - `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.

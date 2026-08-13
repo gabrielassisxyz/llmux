@@ -88,7 +88,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 | Pinned saturation | Reopen-aware wait of at most five seconds, then spill |
 | Session TTL | Sliding one hour, refreshed on successful completion |
 | Retry limit | At most four dispatched attempts per logical request |
-| Retry placement | 429 and processing timeouts prefer another account; an initial 5xx/408/transient-network retry prefers the same account to retain cache |
+| Retry placement | 429 and upstream 504 prefer another account; an initial 5xx/408/transient-network retry prefers the same account to retain cache |
 | Request headers | Fixed end-to-end allowlist; all proxy-internal and hop-by-hop headers are removed |
 | Dispatch evidence | One synchronous append-only admission row committed before every `http.Client.Do` |
 | Terminal logging | One synchronous SQLite transaction per terminal routing phase; pending skips and its dispatch/failure are committed together |
@@ -411,6 +411,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Server idle timeout | 2 minutes |
 | Downstream write deadline, armed per write | 30 seconds |
 | Maximum request headers | 64 KiB |
+| Maximum upstream response headers | 128 KiB |
 | Upstream dial timeout | 10 seconds |
 | Upstream TLS handshake timeout | 10 seconds |
 | Upstream idle-connection timeout | 90 seconds |
@@ -548,6 +549,12 @@ Properties:
 
 - Automatic response decompression disabled.
 - Redirect following disabled.
+- Environment proxy discovery disabled by setting `Proxy` to nil. Go's default transport reads `HTTPS_PROXY` and `ALL_PROXY`, which would route three account credentials through whatever host an environment variable named, for a destination this document fixes in source.
+- Certificate verification enabled, minimum TLS 1.2.
+- HTTP/1.1 and HTTP/2 enabled explicitly over TLS rather than left to defaults.
+- `MaxConnsPerHost`, `MaxIdleConns`, and `MaxIdleConnsPerHost` set at or above the 36 concurrent attempts three accounts of twelve permit. Go defaults to two idle connections per host, which would make most dispatches pay a fresh TLS handshake.
+- `MaxResponseHeaderBytes` bounded to 128 KiB rather than the ten-megabyte default.
+- `ResponseHeaderTimeout` deliberately zero. A queued or slow-starting generation is not a failure, and the logical deadline is the only bound this design wants on the wait for headers.
 - Bounded dialing and TLS setup.
 - Overall lifetime controlled by request context.
 - Idle connections closed at shutdown.
@@ -1442,12 +1449,12 @@ Reason:
 | Failure | Retry | Per-class budget | Next-account preference | Account health |
 | --- | --- | ---: | --- | --- |
 | Upstream 429 | Yes | Up to 3 retries | Different eligible account first | Count toward cooldown |
-| Upstream 5xx | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Upstream 5xx other than 504 | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Upstream 408 | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Temporary DNS/dial/reset before response | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Dial or TLS-handshake timeout | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Precommit response-body read failure | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
-| Processing/response-header timeout before logical deadline | Yes | Up to 2 retries | Different eligible account first | No global disable |
+| Upstream 504 | Yes | Up to 2 retries | Different eligible account first | No global disable |
 | Upstream 401/403 | No | 0 | None | Disable immediately |
 | Other upstream 4xx | No | 0 | None | No change |
 | Invalid URL/protocol/TLS certificate | No | 0 | None | No account change |
@@ -1459,6 +1466,8 @@ Reason:
 Mixed failures remain subject to both their class counters and the global maximum of four dispatches.
 
 The same-account first retry for an isolated 5xx/408/transient connection failure preserves account-local prefix cache when the failure is a short blip. It is a preference, not a forced route: if that account is cooling or lacks capacity, another eligible account may proceed. A 429 explicitly says the account is saturated, so it prefers another account immediately.
+
+A processing timeout is a status from upstream, not a clock in the proxy. There is no client-side response-header timeout, deliberately, so the only thing that can report one is upstream itself, and a 504 says the work queued behind this account is not moving. That is account-specific in the way a plain 500 is not, which is why it moves away immediately while the rest of the 5xx class tries the same account once.
 
 ### 21.3 Backoff
 
@@ -1668,7 +1677,7 @@ Visible result: stable base and pinned aliases.
 3. Attempt row records the failure and retry decision.
 4. Lease is released.
 5. An initial 5xx/408/transient-network retry prefers the same account to retain cache.
-6. A processing timeout prefers a different account.
+6. An upstream 504 prefers a different account.
 7. Retry occurs within class/global budgets and the original logical deadline.
 8. Exhausted HTTP response is relayed unchanged.
 9. Exhausted transport failure becomes local 502 or 504.
@@ -1788,7 +1797,7 @@ No startup failure triggers an upstream request.
 | TLS timeout | Retry |
 | Invalid certificate/protocol | Do not retry |
 | Connection reset before response | Retry |
-| Upstream response-header timeout | Retry |
+| Upstream 504 | Retry on another account |
 | 429 | Retry and update rate-limit health |
 | 5xx | Retry |
 | 401/403 | Disable account, no retry |
@@ -1896,12 +1905,14 @@ The implementation must document and test these invariants:
 - Never serialize configuration structs containing secrets.
 - Do not expose environment diagnostics through HTTP.
 - Do not pass secrets as command-line arguments.
+- Disable environment proxy discovery on the upstream transport, so no environment variable can choose who receives an account credential.
 - Require owner-only permissions on the service environment file and SQLite store.
 
 ### 26.3 Fixed upstream and SSRF prevention
 
 - Upstream scheme and host are source constants.
 - The client cannot supply an upstream URL.
+- No environment variable can interpose a proxy between the process and that host.
 - Raw incoming query parameters may be forwarded only to the fixed endpoint.
 - Redirect following is disabled.
 - No proxy or arbitrary URL endpoint exists.
@@ -2200,7 +2211,7 @@ Cover:
 - 500 then same-account success.
 - Two 5xx failures move from same-account preference to another account.
 - Same-account retry falls back to another when the preferred account lacks capacity.
-- Processing timeout prefers another account.
+- Upstream 504 prefers another account.
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
@@ -2235,6 +2246,8 @@ Verify:
 - A stripped header is counted on its attempt row and named in a debug event, and its value appears nowhere.
 - Hop-by-hop headers are stripped.
 - Raw query string is preserved.
+- Environment `HTTPS_PROXY` and `ALL_PROXY` do not affect upstream routing.
+- Upstream response headers past the configured bound fail the attempt before commitment.
 - Redirects are not followed.
 - Upstream status and body are byte-identical.
 - Compression is not transparently changed.
@@ -2531,7 +2544,7 @@ Retrying a connection that failed after send may duplicate upstream generation. 
 
 ### 29.21 Same-account first retry for isolated server failures
 
-An isolated 5xx/408/transient connection failure does not prove the account is unusable. Preferring it once preserves prompt cache; a repeated failure then prefers another account. Rate limits and processing timeouts still move away immediately because they are stronger account-specific signals.
+An isolated 5xx/408/transient connection failure does not prove the account is unusable. Preferring it once preserves prompt cache; a repeated failure then prefers another account. Rate limits and upstream 504 responses still move away immediately because they are stronger account-specific signals.
 
 ## 30. Operations, cutover, and rollback
 
@@ -2773,7 +2786,7 @@ Gate:
 
 Deliver:
 
-- Shared HTTP transport.
+- Shared HTTP transport with explicit proxy, TLS, protocol, connection-pool, and response-header limits.
 - Fixed request-header allowlist and response hop-by-hop filtering.
 - Attempt classification.
 - Retry budgets/backoff.

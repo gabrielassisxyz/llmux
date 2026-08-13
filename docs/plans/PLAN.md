@@ -415,7 +415,7 @@ The alternative is not free: a provisional string that survives into the catalog
 
 The three account keys must be non-empty and distinct. Duplicate credentials would create separate limiter buckets for one real account and are therefore a fatal configuration error.
 
-The proxy and affinity keys must be non-empty and distinct from each other and from every account key. The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
+The affinity key must be at least 32 bytes, the same floor the proxy key carries and for a related reason: a key shorter than the digest it feeds weakens the one property that digest exists for, which is that a stored `session_key` says nothing about the header that produced it. The proxy and affinity keys must be distinct from each other and from every account key. The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
 
 The store’s path variable names a database and not a log, because the distinction it sits on is the one this document works hardest to keep: process logs are ephemeral, go to stderr and may be rotated freely, while the durable store is append-only evidence that §15.10 forbids truncating and no retention tooling should ever be pointed at. A variable called a log path invites exactly that. `LLMUX_LOG_LEVEL` keeps its name because it genuinely is about process logs.
 
@@ -1973,6 +1973,7 @@ Visible result: stable base and pinned aliases.
 | Proxy key shorter than 32 bytes | Fatal startup |
 | Proxy key equal to an account key | Fatal startup |
 | Missing affinity key | Fatal startup |
+| Affinity key shorter than 32 bytes | Fatal startup |
 | Missing account key | Fatal startup |
 | Duplicate account keys | Fatal startup |
 | Invalid listen address | Fatal startup |

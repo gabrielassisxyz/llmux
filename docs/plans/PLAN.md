@@ -136,8 +136,10 @@ Both endpoints require:
 Rules:
 
 - The bearer scheme is case-insensitive.
-- Exactly one non-empty bearer credential is accepted.
-- Comparison uses constant-time comparison after an exact length check.
+- Exactly one `Authorization` header field, carrying exactly one non-empty bearer credential, is accepted. Several fields is a rejection, not a search for one that matches.
+- The configured proxy key must be at least 32 bytes, checked at startup.
+- The proxy key must differ from every upstream account key, so that a copy-paste cannot hand a local client a credential that upstream also honours.
+- Startup keeps a SHA-256 digest of the proxy key. Authentication hashes the presented value and compares two fixed-size digests in constant time. Comparing the raw values, even in constant time, still branches on length and so leaks the key length to anyone who can time it; hashing first removes that channel and makes the comparison genuinely uniform.
 - Missing or invalid credentials return 401 and `WWW-Authenticate: Bearer`.
 - Authentication is performed before reading a potentially large request body.
 - Bad authentication does not create an attempt row because no account was considered.
@@ -389,7 +391,7 @@ The alternative is not free: a provisional string that survives into the catalog
 
 The three account keys must be non-empty and distinct. Duplicate credentials would create separate limiter buckets for one real account and are therefore a fatal configuration error.
 
-The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
+The proxy and affinity keys must be non-empty and distinct from each other and from every account key. The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
 
 Key changes require restart. There is no reload endpoint, signal-based reload, watcher, or mutable configuration file.
 
@@ -1758,6 +1760,9 @@ Visible result: stable base and pinned aliases.
 | Failure | Behavior |
 | --- | --- |
 | Missing proxy key | Fatal startup |
+| Proxy key shorter than 32 bytes | Fatal startup |
+| Proxy key equal to an account key | Fatal startup |
+| Missing affinity key | Fatal startup |
 | Missing account key | Fatal startup |
 | Duplicate account keys | Fatal startup |
 | Invalid listen address | Fatal startup |
@@ -2115,7 +2120,8 @@ Cover:
 - Missing header.
 - Wrong scheme.
 - Empty bearer value.
-- Multiple credentials.
+- Several credentials in one header field.
+- Several `Authorization` header fields, one of them correct.
 - Case-insensitive bearer scheme.
 - Wrong key of equal length.
 - Wrong key of different length.
@@ -2907,7 +2913,7 @@ The project is complete only when all of the following are true:
 
 - One static cgo-free binary starts with the required five secrets and the SQLite path.
 - It listens on the configured loopback address and refuses any other.
-- Both endpoints enforce the shared bearer key.
+- Both endpoints enforce the shared bearer key by digest comparison, and startup rejects a key that is too short or shared with an account.
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
 - Every alias resolves to its fixed upstream model and eligible account set.
 - The raw `messages` value is byte-identical at upstream.

@@ -669,11 +669,12 @@ There is no degraded startup mode.
 6. Handler cleanup appends terminal rows where possible.
 7. Close idle upstream connections.
 8. Append a `process_stop` row.
-9. Close SQLite last.
-10. Return zero for orderly signal-driven shutdown.
-11. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
+9. Attempt one final passive checkpoint on the maintenance connection.
+10. Close SQLite last.
+11. Return zero for orderly signal-driven shutdown.
+12. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
 
-No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 still run in the foreground of a terminal commit that is already happening, which is why they are not one; what changed is which connection they run on, not who drives them or when.
+No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 still run in the foreground of a terminal commit that is already happening, which is why they are not one; what changed is which connection they run on, not who drives them or when. Step 9 above is the same attempt driven by the last event of the lifecycle rather than by a commit, and it is what stops a WAL left short of the commit interval from being inherited across every restart, now that nothing checkpoints automatically.
 
 ## 12. Request data flow
 
@@ -1009,6 +1010,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite’s automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
 - Attempt a passive checkpoint after each 256 terminal commits, and again when a terminal commit finds the WAL past its warning threshold. The attempt runs on the maintenance connection, in the foreground of the terminal path that triggered it, once that commit has returned.
 - A checkpoint never runs on the writer connection. The admission commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw. Placing the checkpoint behind a terminal commit is not sufficient on its own: with a single connection the next admission commit queues behind that checkpoint regardless of which commit it followed, and the rule protects nothing it names. The second connection is what makes the separation real, and it is also why the interval is a stated number rather than "a bounded number" of commits.
+- Attempt one last passive checkpoint at shutdown, after the stop row and before the store closes.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
 - Use a five-second busy timeout, and bound every store operation with a six-second context so SQLite’s own busy handling always finishes before the application deadline fires. An application deadline shorter than the busy timeout would cancel exactly the contended writes the busy timeout exists to let through, and an unbounded one would leave the pending-reservation window of §17.1 with no stated ceiling for recovery to be conservative against.

@@ -236,7 +236,7 @@ The fixed session header is `X-Session-ID`.
 - Affinity is keyed only by `session_key`, not by alias or model.
 - A value over 256 bytes returns local 400.
 
-Affinity needs stable equality, not the caller's string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess.
+Affinity needs stable equality, not the caller’s string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess.
 
 ### 6.7 Request content encoding and content type
 
@@ -249,7 +249,7 @@ Affinity needs stable equality, not the caller's string. The header is client-ch
 
 - Every authenticated chat request is assigned its proxy logical request ID before any body processing.
 - Every authenticated chat response carries it as `X-LLMux-Request-ID`, whether the response came from upstream or was generated locally.
-- An upstream header of that name is removed before the proxy-owned value is set, so the value a client reads is always the proxy's.
+- An upstream header of that name is removed before the proxy-owned value is set, so the value a client reads is always the proxy’s.
 
 Without it, a consumer that saw a failure has a timestamp and nothing else to find the row with, and the one identifier both sides already share is the upstream response ID, which invariant 3 forbids using as a key and §13.3 forbids storing. A proxy-generated random ID gives the operator a direct key into SQLite while exposing nothing about upstream.
 
@@ -575,7 +575,7 @@ Properties:
 
 - Automatic response decompression disabled.
 - Redirect following disabled.
-- Environment proxy discovery disabled by setting `Proxy` to nil. Go's default transport reads `HTTPS_PROXY` and `ALL_PROXY`, which would route three account credentials through whatever host an environment variable named, for a destination this document fixes in source.
+- Environment proxy discovery disabled by setting `Proxy` to nil. Go’s default transport reads `HTTPS_PROXY` and `ALL_PROXY`, which would route three account credentials through whatever host an environment variable named, for a destination this document fixes in source.
 - Certificate verification enabled, minimum TLS 1.2.
 - HTTP/1.1 and HTTP/2 enabled explicitly over TLS rather than left to defaults.
 - `MaxConnsPerHost`, `MaxIdleConns`, and `MaxIdleConnsPerHost` set at or above the 36 concurrent attempts three accounts of twelve permit. Go defaults to two idle connections per host, which would make most dispatches pay a fresh TLS handshake.
@@ -662,7 +662,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Transactionally append the deduplicated skip rows and one `selection_failure` row.
     - Return local 429 for temporary capacity exhaustion or local 503 when no flexible account is usable.
 16. If selection succeeds, install release cleanup immediately. The lease is provisional until its admission row commits.
-17. Generate the attempt's `attempt_id` and synchronously commit its `dispatch_admission` row.
+17. Generate the attempt’s `attempt_id` and synchronously commit its `dispatch_admission` row.
 18. If the admission commit fails:
     - Cancel the provisional lease, which removes its uncommitted RPM timestamp and releases its in-flight slot.
     - Append no dispatch row, because no dispatch occurred.
@@ -772,7 +772,7 @@ Streaming relay is selected when either of these holds:
 - The unique raw top-level request `stream` value is exactly `true`.
 - The upstream media type parses as `text/event-stream`.
 
-Recognizing it from the upstream content type alone was one signal short. A request that asked for a stream and came back labelled something else would be buffered toward the 8 MiB precommit bound, so the client's first token would arrive when the generation finished rather than when it started, and nothing would report why. The request's own `stream` value is still never validated and never altered; it selects relay behavior and nothing more.
+Recognizing it from the upstream content type alone was one signal short. A request that asked for a stream and came back labelled something else would be buffered toward the 8 MiB precommit bound, so the client’s first token would arrive when the generation finished rather than when it started, and nothing would report why. The request’s own `stream` value is still never validated and never altered; it selects relay behavior and nothing more.
 
 A disagreement between the two signals is emitted as a debug-level process event, by classification only and with no content, in the same shape as the dropped-header event. It never changes a single response byte.
 
@@ -873,7 +873,7 @@ This definition excludes:
 
 It does not retain the event’s content.
 
-It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token's name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
+It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token’s name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
 
 For non-streaming responses, and for any response whose content encoding puts the stream out of semantic reach, `time_to_first_event` is `NULL`. Total attempt duration remains available.
 
@@ -973,7 +973,7 @@ Two append-only tables exist, and the split is by commit point rather than by su
 | Field | Type/nullability | Meaning |
 | --- | --- | --- |
 | `attempt_id` | Text, primary key | Proxy-generated dispatch identity |
-| `logical_request_id` | Text, non-null | Groups one client request's attempts |
+| `logical_request_id` | Text, non-null | Groups one client request’s attempts |
 | `attempt_no` | Integer, non-null | 1-based dispatch count within the logical request |
 | `account_label` | Text, non-null | `k1`, `k2`, or `k3` |
 | `requested_alias` | Text, non-null | Exact client alias |
@@ -992,7 +992,7 @@ Record kinds:
 - `selection_skip`: one distinct local candidate rejection due to rate or account health.
 - `selection_failure`: one account-acquisition phase that ended without any dispatch.
 
-There is still no separate logical-request summary table. Client-visible outcome, final token counts, retry amplification, and end-to-end latency are all reconstructable from the attempt rows of one `logical_request_id`: the highest `sequence_no` row is what the client saw, its token counts are the final response's, and counting `dispatch` rows is the amplification. A summary table would store no fact that is not already there, and would introduce the one failure the derived query cannot have, which is the two copies disagreeing. §30.3 therefore owes a tested recipe for each of those questions instead. The rule is the one applied to the omitted columns in §15.5: a table is cheaper to add in a later migration than two writers of one fact are to keep in agreement.
+There is still no separate logical-request summary table. Client-visible outcome, final token counts, retry amplification, and end-to-end latency are all reconstructable from the attempt rows of one `logical_request_id`: the highest `sequence_no` row is what the client saw, its token counts are the final response’s, and counting `dispatch` rows is the amplification. A summary table would store no fact that is not already there, and would introduce the one failure the derived query cannot have, which is the two copies disagreeing. §30.3 therefore owes a tested recipe for each of those questions instead. The rule is the one applied to the omitted columns in §15.5: a table is cheaper to add in a later migration than two writers of one fact are to keep in agreement.
 
 A logical request may therefore contain:
 
@@ -1008,6 +1008,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 ### 15.4 IDs
 
 - Each admitted chat request gets a proxy-generated `logical_request_id`.
+- Each dispatch gets a proxy-generated `attempt_id`, created with its admission row and carried onto the terminal attempt row that reports it.
 - Every persisted row gets a proxy-generated `record_id`.
 - IDs are 128 random bits from `crypto/rand`.
 - They are encoded as 32 lowercase hexadecimal characters.
@@ -1145,7 +1146,7 @@ Create indexes for:
 Correctness evidence and analytics have different commit points, because they answer to different failures.
 
 1. `dispatch_admission` commits synchronously after the in-memory reservation and before `http.Client.Do`.
-2. Each selection phase accumulates a bounded set of skip facts in memory. When that phase's dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
+2. Each selection phase accumulates a bounded set of skip facts in memory. When that phase’s dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
 
 This means:
 
@@ -1154,7 +1155,7 @@ This means:
 - A terminal capacity failure is explicit rather than inferable from the last skip.
 - A phase normally incurs one terminal commit rather than one commit per account recheck, on top of one admission commit per dispatch.
 - Status, token counts, retry decision, and durations coexist in that terminal row.
-- A process crash during an active attempt can lose that attempt's result metadata and its pending skip rows, but not its rate admission.
+- A process crash during an active attempt can lose that attempt’s result metadata and its pending skip rows, but not its rate admission.
 - A separate start row followed by an update is deliberately not used; the admission row is a distinct immutable fact, not a mutable draft of the terminal one.
 - A streaming success may reach the client before its final log insert fails.
 - A logging failure cannot retroactively replace an upstream success.
@@ -1212,7 +1213,7 @@ Rules:
 - A fully successful response confirms and refreshes it.
 - A terminally failed request releases its holder.
 - When the last holder of an unconfirmed generation fails, the pin is removed immediately rather than left to expire.
-- A provisional pin's safety expiry is the logical request deadline, not one hour. Nothing that has never succeeded earns an hour of affinity.
+- A provisional pin’s safety expiry is the logical request deadline, not one hour. Nothing that has never succeeded earns an hour of affinity.
 - TTL is one hour from successful completion.
 - A successful spill changes the pin.
 - A failed or partial spill does not.
@@ -1469,7 +1470,7 @@ Cooldown duration:
 
 This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window, and it keeps a 429 from delaying a dispatch to an account that never sent one.
 
-A 429 is account-specific backpressure and an operational signal, not traffic the design goes looking for. Since the local ceilings are not known to sit below upstream's, this path may turn out to be the binding rate control or may almost never fire, and which one it is will be visible in the log rather than decidable here. The cooldown threshold and duration are the first constants to re-derive from that log once real traffic exists.
+A 429 is account-specific backpressure and an operational signal, not traffic the design goes looking for. Since the local ceilings are not known to sit below upstream’s, this path may turn out to be the binding rate control or may almost never fire, and which one it is will be visible in the log rather than decidable here. The cooldown threshold and duration are the first constants to re-derive from that log once real traffic exists.
 
 ### 20.3 Server and transport failures
 
@@ -2561,7 +2562,7 @@ Consequences:
 - A request larger than 64 MiB may be accepted by upstream but is rejected by this transport envelope.
 - The body exists once. Route-owned replacements are small immutable segments over it, so replay costs metadata rather than a second copy, and the untouched bytes are never copied at all, which is the byte-preservation contract expressed as an allocation.
 - References to the buffered body should be dropped once no retry is possible.
-- A per-request ceiling bounds one request only. Concurrency is what turns it into a process-wide number, so the aggregate gate is what actually bounds the resource, and the per-request limit is what makes each request's share explicit.
+- A per-request ceiling bounds one request only. Concurrency is what turns it into a process-wide number, so the aggregate gate is what actually bounds the resource, and the per-request limit is what makes each request’s share explicit.
 
 ### 29.5 Synchronous admission and terminal inserts
 
@@ -2599,7 +2600,7 @@ The same reasoning applies to the pin a first request creates. It has to exist b
 
 ### 29.12 Keyed session identifiers
 
-Affinity is an equality test, so it needs a stable key and nothing else. A keyed digest keeps every routing decision and every restart recovery exactly as it was, bounds a column whose input is arbitrary client text, and removes the one place where content the proxy does not understand entered a durable store. The key is separate from the proxy bearer key because the two rotate for different reasons, and tying them would make a routine credential rotation drop every live conversation's affinity.
+Affinity is an equality test, so it needs a stable key and nothing else. A keyed digest keeps every routing decision and every restart recovery exactly as it was, bounds a column whose input is arbitrary client text, and removes the one place where content the proxy does not understand entered a durable store. The key is separate from the proxy bearer key because the two rotate for different reasons, and tying them would make a routine credential rotation drop every live conversation’s affinity.
 
 ### 29.13 Stop retries after commitment
 
@@ -2677,7 +2678,7 @@ The README must provide SQLite query recipes, described and tested against the a
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
-- Upstream 429 responses against dispatch volume per account, which is the one measurement that can show the local ceiling sits above upstream's.
+- Upstream 429 responses against dispatch volume per account, which is the one measurement that can show the local ceiling sits above upstream’s.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request, and the dispatch amplification they represent.

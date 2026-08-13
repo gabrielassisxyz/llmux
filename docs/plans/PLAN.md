@@ -638,22 +638,25 @@ Properties:
 2. Validate required values without logging secrets.
 3. Ensure account keys are distinct.
 4. Validate the fixed route catalog.
-5. Open SQLite at the exact configured path, and set and read back the required connection-local pragmas on every connection it opens.
-6. Apply embedded forward-only migrations.
-7. Verify append permissions using a transaction that is rolled back.
-8. Arm the post-start dispatch blackout from the process's monotonic origin. No rate state is read from the store.
-9. Recover unexpired successful session pins.
-10. Append a `process_start` row.
-11. Construct the route coordinator.
-12. Construct the upstream transport and HTTP handlers.
-13. Bind the configured socket through the connection-limiting listener.
-14. Announce readiness only after the socket is bound.
-15. Serve until termination or fatal server failure.
+5. Validate the database path, its parent directory, and any existing file's type and permissions, as §15.2 requires.
+6. Acquire an exclusive advisory lock on `<LLMUX_DB_PATH>.lock`, creating it inside that validated directory with mode `0600` if absent, and hold it for the process lifetime. Failing to acquire it is fatal. The read-only `db` subcommands never take it, so inspection and backup stay possible while the proxy serves.
+7. Open SQLite at the exact configured path, and set and read back the required connection-local pragmas on every connection it opens.
+8. Apply embedded forward-only migrations.
+9. Verify append permissions using a transaction that is rolled back.
+10. Arm the post-start dispatch blackout from the process's monotonic origin. No rate state is read from the store.
+11. Recover unexpired successful session pins.
+12. Append a `process_start` row.
+13. Construct the route coordinator.
+14. Construct the upstream transport and HTTP handlers.
+15. Bind the configured socket through the connection-limiting listener.
+16. Announce readiness only after the socket is bound.
+17. Serve until termination or fatal server failure.
 
 Startup fails if:
 
 - Configuration is invalid.
 - Catalog validation fails.
+- The store lock is held by another live process.
 - The database cannot be opened.
 - Schema version is unsupported.
 - Migration fails.
@@ -1385,7 +1388,7 @@ Before listening:
 - Do not restore disabled state, because restart is how corrected credentials are installed.
 - Do not call upstream to validate recovered state.
 
-The blackout is measured on the monotonic clock of the new process, and that is what makes it immune to the failure a recovery query cannot escape. Recovered instants are UTC wall time while the live window is monotonic, so a wall clock corrected forward across the restart, which is the ordinary step at boot and therefore exactly when recovery would run, makes recovered admissions look older than they are, expires them early, and readmits capacity the previous process had already spent. §24.6 clamps a recovered timestamp that lands in the future, and an error in the other direction has no clamp available at all, because nothing in a row says it is older than it looks. Sixty monotonic seconds of refusal need no timestamps: every dispatch of the previous process precedes that process's death, every dispatch of this one follows this one's start by a full window, and no 60-second interval can contain both. What the proof rests on is that the two processes did not overlap, which is the single-instance property §17.5 requires.
+The blackout is measured on the monotonic clock of the new process, and that is what makes it immune to the failure a recovery query cannot escape. Recovered instants are UTC wall time while the live window is monotonic, so a wall clock corrected forward across the restart, which is the ordinary step at boot and therefore exactly when recovery would run, makes recovered admissions look older than they are, expires them early, and readmits capacity the previous process had already spent. §24.6 clamps a recovered timestamp that lands in the future, and an error in the other direction has no clamp available at all, because nothing in a row says it is older than it looks. Sixty monotonic seconds of refusal need no timestamps: every dispatch of the previous process precedes that process's death, every dispatch of this one follows this one's start by a full window, and no 60-second interval can contain both. What the proof rests on is that the two processes did not overlap, which is the single-instance property §17.5 makes a checked condition of startup.
 
 The blackout is unconditional, and the tempting exception is the one that would break it. A store holding no admission rows looks like a fresh install with nothing to be conservative about, but it is also what §30.4 hands a restarted process after an archive rotation, whose real dispatches are minutes old in a database that was moved aside. Skipping the wait on an empty store would reopen exactly the hole that procedure used to close by waiting.
 
@@ -1468,9 +1471,11 @@ Each account retains at most 60 rate timestamps, so the memory cost is trivial.
 Correctness is process-local.
 
 - One process owns the listener and all keys.
-- Starting another proxy with the same account keys would create independent counters.
-- Multi-process coordination is outside scope.
-- The operational deployment must run one instance.
+- Starting another proxy against the same store would create independent counters, which is why startup takes an exclusive advisory lock beside the database and holds it for the process lifetime.
+- Multi-process coordination is outside scope. The lock coordinates nothing; it refuses.
+- The operational deployment must run one instance, and the lock makes that a checked condition of startup rather than a sentence in a runbook.
+
+The bind was an accidental mutex and stopped being one the moment a second environment file could carry a different `LLMUX_LISTEN_ADDR`. Two processes on one store double every ceiling and interleave their writes, which is the operator error this document already converts into a fatal check everywhere else it appears: duplicate account keys are fatal precisely because they would create two limiters for one real account, and two processes are that same failure at process granularity. It is also what the blackout of §16.3 rests on. That proof holds because every dispatch of the previous process precedes the start of the next one, and only a single-instance guarantee makes that ordering true. An advisory lock dies with the process holding it, including one killed with no chance to clean up, so there is no stale lock to recover and no state to reconcile. The read-only `db` subcommands never take it, because a live proxy must remain inspectable and backable-up.
 
 ## 18. Account selection
 
@@ -1992,6 +1997,7 @@ Visible result: stable base and pinned aliases.
 | Non-loopback listen address | Fatal startup |
 | Invalid catalog | Fatal startup |
 | Relative database path | Fatal startup |
+| Store lock held by another live process | Fatal startup |
 | Missing database directory | Fatal startup |
 | Database directory writable by group or others | Fatal startup |
 | Insecure existing database permissions | Fatal startup |
@@ -2682,6 +2688,7 @@ Exercise:
 - Disabled health resets.
 - No startup upstream requests.
 - Clock-skew clamping.
+- A second process pointed at the same database fails startup while the first lives, and succeeds once the first has exited, including after a SIGKILL that gave it no chance to release anything.
 
 ### 28.16 Shutdown tests
 
@@ -3191,7 +3198,7 @@ Deliver:
 - Panic recovery.
 - Structured lifecycle logging.
 - Durable process start and stop rows.
-- Secure file checks.
+- Secure file checks and the single-instance store lock.
 - Static build automation with `-trimpath` and published checksums.
 - `llmux version`, deriving its output rather than restating it, and the read-only `llmux db check` and `llmux db backup`.
 - Lint/security configuration.

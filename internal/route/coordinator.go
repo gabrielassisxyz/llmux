@@ -31,6 +31,14 @@ type accountState struct {
 	// still inside the rolling rate window, ascending.
 	dispatchTimestamps []time.Duration
 
+	// pendingReservations counts rate-window slots granted by
+	// ReserveRateSlot but not yet moved into dispatchTimestamps by
+	// FinalizeDispatch or freed by ReleasePendingRateSlot. Counting it
+	// against the ceiling alongside dispatchTimestamps is what stops a
+	// concurrent caller from being admitted into a slot the window has
+	// already granted but not yet recorded.
+	pendingReservations int
+
 	inFlight int
 	health   HealthState
 

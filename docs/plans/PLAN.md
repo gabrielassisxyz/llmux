@@ -640,7 +640,7 @@ There is no degraded startup mode.
 9. Return zero for orderly signal-driven shutdown.
 10. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
 
-No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 run in the foreground of a commit that is already happening, which is why they are not one.
+No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 run in the foreground of a terminal commit that is already happening, which is why they are not one.
 
 ## 12. Request data flow
 
@@ -862,7 +862,7 @@ A downstream write error means the client is already gone. In that case, cancel 
 
 For successful uncompressed SSE responses, `time_to_first_event` is operationally defined as:
 
-- Dispatch reservation immediately before `http.Client.Do`, through
+- The invocation of `http.Client.Do`, through
 - Recognition of the first complete non-empty SSE `data:` event other than `[DONE]`.
 
 This definition excludes:
@@ -873,6 +873,8 @@ This definition excludes:
 - `[DONE]`.
 
 It does not retain the event’s content.
+
+The anchor is the `Do` invocation rather than the dispatch reservation, because §12 places the admission commit between the two. Measured from the reservation, every first event would carry the store’s commit latency inside a number named for upstream behavior, and the weekly ceiling re-derivation of §30.10 would be tuned partly against this machine’s filesystem. `attempt_duration_us` shares that anchor for the same reason. `started_at_us` keeps recording the reservation instant, because that is the moment the rolling window is defined over.
 
 It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token’s name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
 
@@ -950,8 +952,8 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
 - Use full synchronous durability.
-- Set `wal_autocheckpoint` explicitly rather than inheriting the default.
-- Attempt a passive checkpoint in the foreground after a bounded number of commits, and again when the WAL passes its warning threshold.
+- Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite's automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
+- Attempt a passive checkpoint in the foreground after a bounded number of terminal commits, and again when a terminal commit finds the WAL past its warning threshold. A checkpoint never runs in the foreground of an admission commit: that commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw, while the same work behind a terminal commit runs after the response was relayed and is invisible to every client.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
 - Use a five-second busy timeout.
@@ -1039,7 +1041,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `started_at_us` | Integer, non-null | UTC Unix microseconds at reservation/skip |
 | `finished_at_us` | Integer, non-null | UTC Unix microseconds at terminal record |
 | `selection_wait_us` | Integer, nullable | Phase start through lease acquisition/failure; null for individual skips |
-| `attempt_duration_us` | Integer, nullable | Monotonic dispatch duration |
+| `attempt_duration_us` | Integer, nullable | Monotonic duration of the upstream call, `Do` through response close |
 | `logical_elapsed_us` | Integer, non-null | Handler start through this row |
 | `time_to_first_event_us` | Integer, nullable | Time to the first complete non-empty SSE data event |
 | `outcome` | Text, non-null | Stable terminal outcome |
@@ -1263,7 +1265,7 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | Event | RPM slot | In-flight slot |
 | --- | --- | --- |
 | Candidate inspected and skipped | No | No |
-| Dispatch reservation immediately preceding `Do` | Yes, never refunded | Held immediately |
+| Dispatch reservation | Yes, never refunded | Held immediately |
 | Successful `Do` invocation | Already consumed | Until body closes |
 | `Do` transport failure | Yes | Until `Do` returns |
 | Upstream 4xx/5xx | Yes | Until body closes |
@@ -2418,7 +2420,7 @@ Verify:
 - Update/delete triggers.
 - Index presence.
 - `EXPLAIN QUERY PLAN` on both recovery queries, asserting the intended index and no full table scan.
-- Passive checkpoint behavior.
+- Passive checkpoint behavior, including that no checkpoint runs in the foreground of an admission commit.
 - WAL growth and its warning under a deliberately held external reader.
 - Null token counts.
 - Full token counts.

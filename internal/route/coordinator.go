@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 )
 
 // HealthState is an account's current admission eligibility.
@@ -64,14 +65,20 @@ type AccountKeys struct {
 type Coordinator struct {
 	mu       sync.Mutex
 	accounts [3]accountState
+	clk      clock.Clock
+
+	// notify is closed and replaced under mu by every mutation a waiter
+	// might care about. See notifyLocked and WaitToken in wait.go.
+	notify chan struct{}
 }
 
 // NewCoordinator constructs a Coordinator holding exactly three account
 // records, all initially enabled. keys is assumed already validated
 // (non-empty, mutually distinct): that is the configuration loader's
-// responsibility, not this constructor's.
-func NewCoordinator(keys AccountKeys) *Coordinator {
-	c := &Coordinator{}
+// responsibility, not this constructor's. clk is the injected clock
+// boundary Wait uses for its account-acquisition ceiling.
+func NewCoordinator(keys AccountKeys, clk clock.Clock) *Coordinator {
+	c := &Coordinator{clk: clk, notify: make(chan struct{})}
 	c.accounts[accountIndex(catalog.AccountK1)] = accountState{label: catalog.AccountK1, key: keys.K1, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK2)] = accountState{label: catalog.AccountK2, key: keys.K2, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK3)] = accountState{label: catalog.AccountK3, key: keys.K3, health: HealthEnabled}
@@ -112,12 +119,14 @@ func (c *Coordinator) IncrementInFlight(account catalog.Account) int {
 }
 
 // DecrementInFlight decrements account's in-flight count and returns the
-// new value.
+// new value. Releasing a slot is exactly the event a waiter blocked on
+// capacity cares about, so this wakes them.
 func (c *Coordinator) DecrementInFlight(account catalog.Account) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	state := &c.accounts[accountIndex(account)]
 	state.inFlight--
+	c.notifyLocked()
 	return state.inFlight
 }
 

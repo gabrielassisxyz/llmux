@@ -5,14 +5,19 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
 func testKeys() AccountKeys {
 	return AccountKeys{K1: "k1-secret", K2: "k2-secret", K3: "k3-secret"}
 }
 
+func testCoordinator() *Coordinator {
+	return NewCoordinator(testKeys(), testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)))
+}
+
 func TestNewCoordinatorCreatesExactlyThreeAccounts(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 
 	if len(c.accounts) != 3 {
 		t.Fatalf("len(accounts) = %d, want 3", len(c.accounts))
@@ -54,7 +59,7 @@ func TestNewCoordinatorCreatesExactlyThreeAccounts(t *testing.T) {
 // directly as same-package code, so their zero-value contract is this
 // bead's responsibility to prove.
 func TestNewCoordinatorInitializesAllAccountFields(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 
 	for _, state := range c.accounts {
 		if len(state.dispatchTimestamps) != 0 {
@@ -80,7 +85,7 @@ func TestNewCoordinatorInitializesAllAccountFields(t *testing.T) {
 // rate bucket. Two different pinned aliases that resolve to the same
 // account must move the same coordinator-internal counter.
 func TestSeparateAliasesShareTheSameAccountCount(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 
 	first, ok := catalog.Resolve("kimi-k2.7-k1")
 	if !ok {
@@ -107,7 +112,7 @@ func TestSeparateAliasesShareTheSameAccountCount(t *testing.T) {
 // of its own pinned variants (eligible for exactly one): both name the same
 // account identity, so both must move the same counter.
 func TestBaseAndPinnedAliasesShareTheSameAccountCount(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 
 	base, ok := catalog.Resolve("kimi-k2.7")
 	if !ok {
@@ -139,7 +144,7 @@ func TestBaseAndPinnedAliasesShareTheSameAccountCount(t *testing.T) {
 }
 
 func TestDifferentAccountsRemainIndependent(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 
 	c.IncrementInFlight(catalog.AccountK1)
 	c.IncrementInFlight(catalog.AccountK1)
@@ -158,7 +163,7 @@ func TestDifferentAccountsRemainIndependent(t *testing.T) {
 }
 
 func TestHealthDefaultsToEnabled(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 	for _, account := range []catalog.Account{catalog.AccountK1, catalog.AccountK2, catalog.AccountK3} {
 		if got := c.Health(account); got != HealthEnabled {
 			t.Errorf("Health(%s) = %v, want HealthEnabled", account, got)
@@ -172,7 +177,7 @@ func TestHealthDefaultsToEnabled(t *testing.T) {
 // of increments and decrements this test issued, which only holds if the
 // mutex actually serializes every access.
 func TestCoordinatorConcurrentAccessIsRaceFree(t *testing.T) {
-	c := NewCoordinator(testKeys())
+	c := testCoordinator()
 	const goroutines = 50
 	const opsPerGoroutine = 200
 

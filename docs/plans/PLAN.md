@@ -1257,7 +1257,7 @@ The schema enforces:
 - `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
-- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429.
+- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column already says it was not.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -1656,6 +1656,8 @@ Reason:
 - Disabling all accounts during a common provider outage would amplify failure.
 - The current logical request may prefer another account, but account health remains enabled.
 
+A retryable 5xx that carries a valid `Retry-After` is upstream saying when to come back, and scheduling a guessed 250 milliseconds in place of a stated delay is the wrong order. The value becomes the minimum delay for a retry that targets the account which sent it, exactly as §21.3 already treats it for 429, and it is persisted as `upstream_retry_after_s` under the same unclamped rules. It gates nothing else: it neither advances that account's gate deadline nor counts toward the cooldown circuit, because a 503 may describe the provider rather than the credential, which is the reason this whole section leaves health alone. A retry that moves to a different account ignores it entirely, for the reason §20.2 gives about a 429. A stated delay longer than the remaining runway suppresses the retry through the ordinary deadline rule and is recorded as exactly that.
+
 ### 20.4 Request failures
 
 400, 404, 409, 422, and other non-authentication 4xx responses:
@@ -1716,6 +1718,7 @@ Timeout/server retry:
 
 - First retry: approximately 250 milliseconds with equal jitter.
 - Second retry: approximately 1 second with equal jitter.
+- A valid `Retry-After` on the failed 5xx becomes the minimum delay, and only when the next attempt targets the account that sent it.
 - Delay is capped by the remaining deadline.
 
 Credential failover:
@@ -2495,6 +2498,7 @@ Cover:
 - Two 5xx failures move from same-account preference to another account.
 - Same-account retry falls back to another when the preferred account lacks capacity.
 - Upstream 504 prefers another account.
+- A 503 carrying `Retry-After` delays a same-account retry by at least the stated value, stores it unclamped, leaves account health and the cooldown circuit untouched, and delays a retry that moves to another account not at all.
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
@@ -2633,7 +2637,7 @@ Verify:
 - No `logical_request_id` present in both `unrouted_request` and `attempt_log`, across the full matrix of local rejections, selection failures, and dispatched requests.
 - Selection and attempt numbering.
 - Aggregate skip counts.
-- Upstream retry delay persisted on 429 dispatch rows, in both the delta and the HTTP-date form, and absent everywhere else.
+- Upstream retry delay persisted on 429 and 5xx dispatch rows whose response carried the header, in both the delta and the HTTP-date form, and absent everywhere else.
 - Terminal capacity-failure rows.
 - One phase batch commits atomically.
 - A deliberate bad row rolls back its whole phase batch.
@@ -2914,7 +2918,7 @@ The README must provide SQLite query recipes, described and tested against the a
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
-- Upstream 429 responses against dispatch volume per account, together with the distribution of upstream-advertised retry delays, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered.
+- Upstream 429 responses against dispatch volume per account, together with the distribution of the retry delays advertised on those 429 rows, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered. The same column on a 5xx row is upstream describing an outage rather than a rate ceiling, so a recipe that does not filter by status mixes two different statements into one distribution.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request, and the dispatch amplification they represent.
@@ -3036,7 +3040,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on those rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on the 429 rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants; the same column on a 5xx row belongs to a different question and is filtered out here.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.

@@ -355,17 +355,17 @@ One of the two presets rests on something this document cannot check. What Ollam
 
 ### 8.1 Base routes
 
-| Client base alias | Provisional upstream model | Eligible accounts |
+| Client base alias | Upstream model | Eligible accounts |
 | --- | --- | --- |
-| `kimi-k2.7` | `kimi-k2.7` | `k1`, `k2`, `k3` |
-| `kimi-k2.6` | `kimi-k2.6` | `k1`, `k2`, `k3` |
-| `glm-5.2` | `glm-5.2` | `k1`, `k2`, `k3` |
-| `glm-5.1` | `glm-5.1` | `k1`, `k2`, `k3` |
-| `deepseek-v4-pro-max` | `deepseek-v4-pro` | `k1`, `k2`, `k3` |
-| `deepseek-v4-pro-high` | `deepseek-v4-pro` | `k1`, `k2`, `k3` |
-| `deepseek-v4-flash-max` | `deepseek-v4-flash-max` | `k1`, `k2`, `k3` |
+| `kimi-k2.7` | `kimi-k2.7-code:cloud` | `k1`, `k2`, `k3` |
+| `kimi-k2.6` | `kimi-k2.6:cloud` | `k1`, `k2`, `k3` |
+| `glm-5.2` | `glm-5.2:cloud` | `k1`, `k2`, `k3` |
+| `glm-5.1` | `glm-5.1:cloud` | `k1`, `k2`, `k3` |
+| `deepseek-v4-pro-max` | `deepseek-v4-pro:cloud` | `k1`, `k2`, `k3` |
+| `deepseek-v4-pro-high` | `deepseek-v4-pro:cloud` | `k1`, `k2`, `k3` |
+| `deepseek-v4-flash-max` | `deepseek-v4-flash:cloud` | `k1`, `k2`, `k3` |
 
-The upstream strings above are provisional and every one of them is resolved by the Phase 0 gate in §8.4 before implementation begins. Do not infer differences from alias spelling and do not make them environment-configurable.
+These upstream strings are transcribed from the deployed route catalog. Do not infer differences from alias spelling and do not make them environment-configurable.
 
 ### 8.2 Account-pinned variants
 

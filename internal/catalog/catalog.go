@@ -1,0 +1,48 @@
+package catalog
+
+// Account identifies an upstream account in the fixed catalog.
+type Account string
+
+const (
+	AccountK1 Account = "k1"
+	AccountK2 Account = "k2"
+	AccountK3 Account = "k3"
+)
+
+// Injection is a route-owned top-level request field.
+type Injection struct {
+	Field string
+	Value string
+}
+
+// Route describes one client-visible base alias.
+type Route struct {
+	Alias            string
+	UpstreamModel    string
+	EligibleAccounts [3]Account
+	Injection        *Injection
+}
+
+var baseRoutes = [...]Route{
+	{Alias: "kimi-k2.7", UpstreamModel: "kimi-k2.7-code:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}},
+	{Alias: "kimi-k2.6", UpstreamModel: "kimi-k2.6:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}},
+	{Alias: "glm-5.2", UpstreamModel: "glm-5.2:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}},
+	{Alias: "glm-5.1", UpstreamModel: "glm-5.1:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}},
+	{Alias: "deepseek-v4-pro-max", UpstreamModel: "deepseek-v4-pro:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}, Injection: &Injection{Field: "reasoning_effort", Value: "max"}},
+	{Alias: "deepseek-v4-pro-high", UpstreamModel: "deepseek-v4-pro:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}, Injection: &Injection{Field: "reasoning_effort", Value: "high"}},
+	{Alias: "deepseek-v4-flash-max", UpstreamModel: "deepseek-v4-flash:cloud", EligibleAccounts: [3]Account{AccountK1, AccountK2, AccountK3}},
+}
+
+// BaseRoutes returns the closed, fixed set of base aliases.
+func BaseRoutes() []Route {
+	routes := make([]Route, len(baseRoutes))
+	copy(routes, baseRoutes[:])
+	for index := range routes {
+		if routes[index].Injection != nil {
+			injection := *routes[index].Injection
+			routes[index].Injection = &injection
+		}
+	}
+	return routes
+}
+

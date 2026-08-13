@@ -102,7 +102,7 @@ func TestLoadConfig_NoSecretLeakInError(t *testing.T) {
 		"LLMUX_ACCOUNT_K3_KEY",
 		"LLMUX_AFFINITY_HMAC_KEY",
 	}
-	
+
 	// Test relative path error doesn't leak secrets
 	for _, k := range required {
 		t.Setenv(k, marker)
@@ -115,5 +115,47 @@ func TestLoadConfig_NoSecretLeakInError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), marker) {
 		t.Errorf("secret marker leaked in error message: %v", err)
+	}
+}
+
+func TestLoadConfig_ListenAddr(t *testing.T) {
+	required := []string{
+		"LLMUX_PROXY_KEY",
+		"LLMUX_ACCOUNT_K1_KEY",
+		"LLMUX_ACCOUNT_K2_KEY",
+		"LLMUX_ACCOUNT_K3_KEY",
+		"LLMUX_AFFINITY_HMAC_KEY",
+	}
+
+	tests := []struct {
+		addr  string
+		valid bool
+	}{
+		{"127.0.0.1:4000", true},
+		{"[::1]:4000", true},
+		{"127.0.0.2:4000", true},
+		{"localhost:4000", false},
+		{"0.0.0.0:4000", false},
+		{"[::]:4000", false},
+		{"8.8.8.8:4000", false},
+		{":4000", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			for _, k := range required {
+				t.Setenv(k, "secret")
+			}
+			t.Setenv("LLMUX_DB_PATH", "/tmp/db.sqlite")
+			t.Setenv("LLMUX_LISTEN_ADDR", tt.addr)
+
+			_, err := LoadConfig()
+			if tt.valid && err != nil {
+				t.Errorf("expected %q to be valid, got error: %v", tt.addr, err)
+			}
+			if !tt.valid && err == nil {
+				t.Errorf("expected %q to be invalid, got nil error", tt.addr)
+			}
+		})
 	}
 }

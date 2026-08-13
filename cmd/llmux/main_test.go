@@ -24,17 +24,17 @@ func TestMainStartup(t *testing.T) {
 
 	// Test relative path error doesn't leak secrets in main's stderr
 	cmd := exec.Command(os.Args[0], "-test.run=TestMainStartup")
-	
+
 	env := os.Environ()
 	env = append(env, "BE_CRASHER=1")
 	for _, k := range required {
 		env = append(env, k+"="+marker)
 	}
 	env = append(env, "LLMUX_DB_PATH=relative/path/db.sqlite")
-	
+
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
-	
+
 	if err == nil {
 		t.Fatal("expected main to crash with error, but it exited 0")
 	}

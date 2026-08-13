@@ -3,19 +3,46 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 )
 
+func validateListenAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid LLMUX_LISTEN_ADDR %q: %v", addr, err)
+	}
+
+	if host == "::1" || host == "[::1]" {
+		return nil
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("LLMUX_LISTEN_ADDR host %q must be an IP literal, not a hostname", host)
+	}
+
+	if ip.To4() == nil {
+		return fmt.Errorf("LLMUX_LISTEN_ADDR host %q must be IPv4 or ::1", host)
+	}
+
+	if !ip.IsLoopback() {
+		return fmt.Errorf("LLMUX_LISTEN_ADDR host %q must be a loopback address", host)
+	}
+
+	return nil
+}
+
 type Config struct {
-	ProxyKey       string
-	AccountK1Key   string
-	AccountK2Key   string
-	AccountK3Key   string
-	AffinityHMAC   string
-	DBPath         string
-	ListenAddr     string
-	LogLevel       string
+	ProxyKey     string
+	AccountK1Key string
+	AccountK2Key string
+	AccountK3Key string
+	AffinityHMAC string
+	DBPath       string
+	ListenAddr   string
+	LogLevel     string
 }
 
 func LoadConfig() (*Config, error) {
@@ -43,6 +70,9 @@ func LoadConfig() (*Config, error) {
 
 	if val := os.Getenv("LLMUX_LISTEN_ADDR"); val != "" {
 		c.ListenAddr = val
+	}
+	if err := validateListenAddr(c.ListenAddr); err != nil {
+		return nil, err
 	}
 	if val := os.Getenv("LLMUX_LOG_LEVEL"); val != "" {
 		c.LogLevel = val

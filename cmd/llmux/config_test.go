@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -24,10 +25,15 @@ func TestLoadConfig_MissingRequired(t *testing.T) {
 			// Set all except the one we're testing
 			for _, k := range required {
 				if k != req {
-					if k == "LLMUX_DB_PATH" {
+					switch k {
+					case "LLMUX_DB_PATH":
 						t.Setenv(k, "/tmp/db.sqlite")
-					} else {
-						t.Setenv(k, "secret")
+					case "LLMUX_PROXY_KEY":
+						t.Setenv(k, "12345678901234567890123456789012")
+					case "LLMUX_AFFINITY_HMAC_KEY":
+						t.Setenv(k, "22345678901234567890123456789012")
+					default:
+						t.Setenv(k, k+"_secret")
 					}
 				}
 			}
@@ -52,7 +58,14 @@ func TestLoadConfig_Defaults(t *testing.T) {
 		"LLMUX_AFFINITY_HMAC_KEY",
 	}
 	for _, k := range required {
-		t.Setenv(k, "secret")
+		switch k {
+		case "LLMUX_PROXY_KEY":
+			t.Setenv(k, "12345678901234567890123456789012")
+		case "LLMUX_AFFINITY_HMAC_KEY":
+			t.Setenv(k, "22345678901234567890123456789012")
+		default:
+			t.Setenv(k, k+"_secret")
+		}
 	}
 	t.Setenv("LLMUX_DB_PATH", "/tmp/db.sqlite")
 	t.Setenv("LLMUX_LISTEN_ADDR", "")
@@ -80,7 +93,14 @@ func TestLoadConfig_RelativeDBPath(t *testing.T) {
 		"LLMUX_AFFINITY_HMAC_KEY",
 	}
 	for _, k := range required {
-		t.Setenv(k, "secret")
+		switch k {
+		case "LLMUX_PROXY_KEY":
+			t.Setenv(k, "12345678901234567890123456789012")
+		case "LLMUX_AFFINITY_HMAC_KEY":
+			t.Setenv(k, "22345678901234567890123456789012")
+		default:
+			t.Setenv(k, k+"_secret")
+		}
 	}
 	t.Setenv("LLMUX_DB_PATH", "relative/path/db.sqlite")
 
@@ -94,7 +114,7 @@ func TestLoadConfig_RelativeDBPath(t *testing.T) {
 }
 
 func TestLoadConfig_NoSecretLeakInError(t *testing.T) {
-	marker := "MARKER_SECRET_VALUE_MARKER"
+	marker := "MARKER_SECRET_VALUE_MARKER_PAD32"
 	required := []string{
 		"LLMUX_PROXY_KEY",
 		"LLMUX_ACCOUNT_K1_KEY",
@@ -104,8 +124,8 @@ func TestLoadConfig_NoSecretLeakInError(t *testing.T) {
 	}
 
 	// Test relative path error doesn't leak secrets
-	for _, k := range required {
-		t.Setenv(k, marker)
+	for i, k := range required {
+		t.Setenv(k, fmt.Sprintf("%d_%s", i, marker))
 	}
 	t.Setenv("LLMUX_DB_PATH", "relative/path/db.sqlite")
 
@@ -144,7 +164,14 @@ func TestLoadConfig_ListenAddr(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.addr, func(t *testing.T) {
 			for _, k := range required {
-				t.Setenv(k, "secret")
+				switch k {
+				case "LLMUX_PROXY_KEY":
+					t.Setenv(k, "12345678901234567890123456789012")
+				case "LLMUX_AFFINITY_HMAC_KEY":
+					t.Setenv(k, "22345678901234567890123456789012")
+				default:
+					t.Setenv(k, k+"_secret")
+				}
 			}
 			t.Setenv("LLMUX_DB_PATH", "/tmp/db.sqlite")
 			t.Setenv("LLMUX_LISTEN_ADDR", tt.addr)
@@ -158,4 +185,63 @@ func TestLoadConfig_ListenAddr(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadConfig_Credentials(t *testing.T) {
+	setupValid := func() {
+		t.Setenv("LLMUX_DB_PATH", "/tmp/db.sqlite")
+		t.Setenv("LLMUX_PROXY_KEY", "12345678901234567890123456789012") // 32 chars
+		t.Setenv("LLMUX_AFFINITY_HMAC_KEY", "22345678901234567890123456789012")
+		t.Setenv("LLMUX_ACCOUNT_K1_KEY", "k1-secret")
+		t.Setenv("LLMUX_ACCOUNT_K2_KEY", "k2-secret")
+		t.Setenv("LLMUX_ACCOUNT_K3_KEY", "k3-secret")
+	}
+
+	t.Run("Valid", func(t *testing.T) {
+		setupValid()
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("expected valid config, got error: %v", err)
+		}
+		if cfg.ProxyKeyDigest == [32]byte{} {
+			t.Error("expected proxy key digest to be populated")
+		}
+	})
+
+	t.Run("ShortProxyKey", func(t *testing.T) {
+		setupValid()
+		t.Setenv("LLMUX_PROXY_KEY", "short")
+		_, err := LoadConfig()
+		if err == nil || !strings.Contains(err.Error(), "LLMUX_PROXY_KEY must be at least 32 bytes") {
+			t.Errorf("expected length error, got: %v", err)
+		}
+	})
+
+	t.Run("ShortAffinityKey", func(t *testing.T) {
+		setupValid()
+		t.Setenv("LLMUX_AFFINITY_HMAC_KEY", "short")
+		_, err := LoadConfig()
+		if err == nil || !strings.Contains(err.Error(), "LLMUX_AFFINITY_HMAC_KEY must be at least 32 bytes") {
+			t.Errorf("expected length error, got: %v", err)
+		}
+	})
+
+	t.Run("DuplicateKeys", func(t *testing.T) {
+		setupValid()
+		t.Setenv("LLMUX_ACCOUNT_K1_KEY", "same-secret")
+		t.Setenv("LLMUX_ACCOUNT_K2_KEY", "same-secret")
+		_, err := LoadConfig()
+		if err == nil || !strings.Contains(err.Error(), "must not be equal") {
+			t.Errorf("expected duplicate key error, got: %v", err)
+		}
+	})
+
+	t.Run("EmptyKey", func(t *testing.T) {
+		setupValid()
+		t.Setenv("LLMUX_ACCOUNT_K3_KEY", "")
+		_, err := LoadConfig()
+		if err == nil || (!strings.Contains(err.Error(), "must not be empty") && !strings.Contains(err.Error(), "missing required")) {
+			t.Errorf("expected empty key error, got: %v", err)
+		}
+	})
 }

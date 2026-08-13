@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,7 +14,7 @@ func TestMainStartup(t *testing.T) {
 		return
 	}
 
-	marker := "MARKER_SECRET_VALUE_MARKER"
+	marker := "MARKER_SECRET_VALUE_MARKER_PAD32"
 	required := []string{
 		"LLMUX_PROXY_KEY",
 		"LLMUX_ACCOUNT_K1_KEY",
@@ -27,8 +28,8 @@ func TestMainStartup(t *testing.T) {
 
 	env := os.Environ()
 	env = append(env, "BE_CRASHER=1")
-	for _, k := range required {
-		env = append(env, k+"="+marker)
+	for i, k := range required {
+		env = append(env, fmt.Sprintf("%s=%d_%s", k, i, marker))
 	}
 	env = append(env, "LLMUX_DB_PATH=relative/path/db.sqlite")
 

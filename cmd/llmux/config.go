@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -35,14 +36,15 @@ func validateListenAddr(addr string) error {
 }
 
 type Config struct {
-	ProxyKey     string
-	AccountK1Key string
-	AccountK2Key string
-	AccountK3Key string
-	AffinityHMAC string
-	DBPath       string
-	ListenAddr   string
-	LogLevel     string
+	ProxyKey       string
+	ProxyKeyDigest [32]byte
+	AccountK1Key   string
+	AccountK2Key   string
+	AccountK3Key   string
+	AffinityHMAC   string
+	DBPath         string
+	ListenAddr     string
+	LogLevel       string
 }
 
 func LoadConfig() (*Config, error) {
@@ -74,6 +76,9 @@ func LoadConfig() (*Config, error) {
 	if err := validateListenAddr(c.ListenAddr); err != nil {
 		return nil, err
 	}
+	if err := validateCredentials(c); err != nil {
+		return nil, err
+	}
 	if val := os.Getenv("LLMUX_LOG_LEVEL"); val != "" {
 		c.LogLevel = val
 	}
@@ -83,4 +88,35 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return c, nil
+}
+
+func validateCredentials(c *Config) error {
+	if len(c.ProxyKey) < 32 {
+		return errors.New("LLMUX_PROXY_KEY must be at least 32 bytes")
+	}
+	if len(c.AffinityHMAC) < 32 {
+		return errors.New("LLMUX_AFFINITY_HMAC_KEY must be at least 32 bytes")
+	}
+
+	keys := map[string]string{
+		"LLMUX_PROXY_KEY":         c.ProxyKey,
+		"LLMUX_ACCOUNT_K1_KEY":    c.AccountK1Key,
+		"LLMUX_ACCOUNT_K2_KEY":    c.AccountK2Key,
+		"LLMUX_ACCOUNT_K3_KEY":    c.AccountK3Key,
+		"LLMUX_AFFINITY_HMAC_KEY": c.AffinityHMAC,
+	}
+
+	seen := make(map[string]string)
+	for name, val := range keys {
+		if val == "" {
+			return fmt.Errorf("%s must not be empty", name)
+		}
+		if other, ok := seen[val]; ok {
+			return fmt.Errorf("%s must not be equal to %s", name, other)
+		}
+		seen[val] = name
+	}
+
+	c.ProxyKeyDigest = sha256.Sum256([]byte(c.ProxyKey))
+	return nil
 }

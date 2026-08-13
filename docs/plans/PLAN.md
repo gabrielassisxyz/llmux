@@ -1074,6 +1074,7 @@ This table passes the test the summary table failed, and the difference is worth
 | `retry_disposition` | Text, non-null | Retry/finality decision |
 | `retry_delay_ms` | Integer, nullable | Selected next delay |
 | `retry_after_s` | Integer, nullable | Local capacity response’s advertised retry delay |
+| `upstream_retry_after_s` | Integer, nullable | Upstream’s advertised retry delay in whole seconds, unclamped |
 | `response_committed` | Boolean integer, non-null | Downstream response had begun |
 | `request_streaming` | Boolean integer, nullable | Raw top-level stream was exactly true |
 | `prompt_tokens` | Integer, nullable | Upstream-reported count |
@@ -1141,6 +1142,7 @@ The schema enforces:
 - `dropped_header_count` non-negative, and present only for dispatch records.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
+- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -1480,7 +1482,7 @@ On upstream 429:
 - Record the dispatched attempt.
 - Count it in local RPM.
 - Add its timestamp to that account’s recent-429 history.
-- Parse `Retry-After` when valid, and advance that account’s cooldown deadline to it, clamped to ten minutes.
+- Parse `Retry-After` when valid, and advance that account’s cooldown deadline to it, clamped to ten minutes. Record the parsed delay on the attempt row as `upstream_retry_after_s`, unclamped, because the log should hold what upstream said rather than what the proxy decided to do about it. A delta is stored as sent. An HTTP-date is stored as its distance from the moment the response was received, which is the only form comparable across rows and is the number the cooldown itself used, and a date already in the past stores zero.
 - Permit rate-limit retries within budget.
 - Prefer a different account immediately for an unpinned/base route’s next dispatch. A `Retry-After` from one account is a statement about that account and must never delay a dispatch to a different one.
 - Keep explicit aliases on their named account.
@@ -2458,6 +2460,7 @@ Verify:
 - All three record kinds.
 - Selection and attempt numbering.
 - Aggregate skip counts.
+- Upstream retry delay persisted on 429 dispatch rows, in both the delta and the HTTP-date form, and absent everywhere else.
 - Terminal capacity-failure rows.
 - One phase batch commits atomically.
 - A deliberate bad row rolls back its whole phase batch.
@@ -2723,7 +2726,7 @@ The README must provide SQLite query recipes, described and tested against the a
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
-- Upstream 429 responses against dispatch volume per account, which is the one measurement that can show the local ceiling sits above upstream’s.
+- Upstream 429 responses against dispatch volume per account, together with the distribution of upstream-advertised retry delays, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request, and the dispatch amplification they represent.
@@ -2827,7 +2830,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on those rows are upstream's own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.

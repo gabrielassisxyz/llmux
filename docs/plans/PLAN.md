@@ -2460,7 +2460,19 @@ These checks are deliberately manual because they consume real account quota:
 
 Record pass/fail and timestamps for each check without copying prompts, completions, keys, or raw upstream error bodies. The durable acceptance evidence is the attempt store itself, which holds one row per upstream attempt from the first real request onward; a parallel handwritten record competes with it and loses.
 
-### 30.7 Cutover
+### 30.7 Consumer preconditions
+
+Bounding account acquisition at 60 seconds introduces a result the replaced proxy never produced: a local 429 with `Retry-After`, meaning this proxy declined to keep queueing, not that upstream refused the request. A caller that does not retry a 429 turns local saturation into a lost result.
+
+That is a change in the callers, and it stays there. The proxy holds no model of who calls it and gains none; it answers with a retry delay and the caller decides what to do with it. Widening the wait inside the proxy to accommodate a caller that cannot retry would reintroduce the ten-minute hang the ceiling exists to remove.
+
+Before cutover:
+
+- Confirm each caller retries a local 429 and honours `Retry-After`.
+- The once-a-day `eod` summariser is the one to change first. It runs with no session file and no operator watching, so a lost result there is invisible until someone notices a missing day. It needs retry in its own codebase before cutover.
+- A caller that cannot be changed is recorded as accepting the loss, rather than answered by relaxing the ceiling here.
+
+### 30.8 Cutover
 
 1. Preserve the existing proxy binary and configuration for rollback.
 2. Stop the old listener cleanly.
@@ -2474,7 +2486,7 @@ Record pass/fail and timestamps for each check without copying prompts, completi
 
 No traffic shadowing is used: duplicating real prompts to both proxies would spend quota, duplicate sensitive content in flight, and complicate comparison.
 
-### 30.8 Rollback
+### 30.9 Rollback
 
 Rollback must be reversible and must preserve evidence:
 
@@ -2486,7 +2498,7 @@ Rollback must be reversible and must preserve evidence:
 
 The old proxy does not read or migrate the `llmux` database. A rollback therefore cannot corrupt the new attempt log.
 
-### 30.9 Post-cutover observation
+### 30.10 Post-cutover observation
 
 For the first week of real traffic, inspect the attempt store at least daily for:
 

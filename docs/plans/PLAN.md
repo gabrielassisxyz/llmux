@@ -1376,7 +1376,7 @@ Rules:
 - A terminally failed request releases its holder.
 - When the last holder of an unconfirmed generation fails, the pin is removed immediately rather than left to expire.
 - A provisional pin’s safety expiry is the logical request deadline, not one hour. Nothing that has never succeeded earns an hour of affinity.
-- TTL is one hour from successful completion.
+- TTL is one hour of wall-clock time from successful completion.
 - A successful spill changes the pin.
 - A failed or partial spill does not.
 - A successful explicit `-kN` request changes the pin to that account.
@@ -1385,6 +1385,8 @@ Rules:
 - Every 256 session operations, a foreground sweep removes expired entries.
 - The map holds at most 4096 pins. When it is full, a session that has none routes as an unpinned base alias and creates no entry, and a warning is emitted.
 - There is no cleanup goroutine.
+
+The affinity hour is stated on the wall clock rather than left to the implementation, because §16.3 rebuilds a pin out of `finished_at_us` and that column is wall time. A live expiry measured monotonically would have to be reconstructed at startup from a quantity that cannot produce it: a clock corrected backward between the completion and the restart makes the row look younger than it is, and the recovered pin then outlives its hour by the size of the step, while a forward correction discards a pin that is still inside it. On one clock there is no conversion left to get wrong, and what a clock step costs is only what a wall step always costs here, which is a conversation keeping or losing its account earlier or later than an hour. Nothing else rides on this deadline. The rolling ceiling and the post-start blackout are monotonic by §17.1 and §16.3 precisely because a wrong answer there is an over-admission, while a pin is a cache-locality preference whose worst outcome is starting the next turn on the other of two accounts. The provisional pin is the exception that needs no rule of its own: its expiry is the request’s own context deadline, it is never persisted, and no restart recovers one.
 
 The map needs a ceiling because a pin outlives the request that created it and is keyed on client-chosen text. Every other allocation in this design is charged to a request and released when it ends, which is what invariant 16 bounds; a session pin is the one thing that survives its request, so a consumer that generated a fresh identifier per turn, by intent or by defect, would grow the map for an hour at a time with nothing to stop it. At the ceiling the proxy refuses rather than evicting: refusing costs a new session its affinity, while evicting costs an established conversation the prefix cache the pin exists to preserve, and the established one is the one with something to lose. The sweep clears the expired entries, so the ceiling releases itself.
 
@@ -2105,6 +2107,7 @@ There is no fallback JSONL file, alternate database, or memory log.
 - Persisted timestamps use UTC wall time.
 - In-process rate limiting uses monotonic time.
 - Restart recovery necessarily uses wall timestamps, and session affinity is the only thing recovered from them.
+- Session affinity expiry is therefore wall-clock too, by §16.2, so recovery converts nothing between clocks.
 - Future recovered timestamps are clamped to startup time and produce a warning.
 - Backward wall-clock changes cannot make monotonic durations negative.
 
@@ -2708,6 +2711,7 @@ Exercise:
 - Disabled health resets.
 - No startup upstream requests.
 - Clock-skew clamping.
+- A pin recovered at startup expires at the same wall instant as one established live, and a wall step after recovery moves both alike, so nothing on that path converts a stored instant into a deadline on another clock.
 - A second process pointed at the same database fails startup while the first lives, and succeeds once the first has exited, including after a SIGKILL that gave it no chance to release anything.
 
 ### 28.16 Shutdown tests
@@ -3299,7 +3303,7 @@ The project is complete only when all of the following are true:
 - Streaming responses remain retryable until the first upstream body byte is committed.
 - Non-streaming responses remain retryable through the bounded precommit phase.
 - Post-commit upstream read failures abort rather than ending as clean responses.
-- Session affinity remains account-wide for one sliding hour.
+- Session affinity remains account-wide for one sliding wall-clock hour, and a pin recovered at startup expires at the instant a live one would.
 - Saturated pins wait only when reopening can plausibly occur within five seconds, then spill when possible.
 - Every account-acquisition phase ends within 60 seconds.
 - Temporary local capacity exhaustion returns 429 with `Retry-After`.

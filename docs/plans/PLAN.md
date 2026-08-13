@@ -2443,7 +2443,7 @@ Verify:
 - A failed admission commit frees the pending RPM slot and the in-flight slot.
 - No dispatch occurs when admission persistence fails.
 - A pending reservation holds the sixtieth slot against a concurrent caller for the whole time its admission commit runs.
-- A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so 60 dispatches never fall inside one 60-second interval measured at that boundary.
+- A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so more than 60 dispatches never fall inside one 60-second interval measured at that boundary.
 - No account admits a dispatch before one full rolling window has elapsed since process start, and the first admission after that instant succeeds.
 - A crash and restart straddling a saturated window cannot place more than 60 dispatches in any rolling 60-second interval, with the wall clock deliberately stepped forward and backward across the restart.
 - Inside one live process, stepping the wall clock forward and backward while monotonic time is held changes neither the contents of the rolling window nor the remaining blackout, so no eligibility decision moves.

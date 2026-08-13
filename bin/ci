@@ -90,6 +90,14 @@ else
         ok
     fi
 
+    section "no debug or profiling endpoints"
+    if go list -deps ./cmd/llmux 2>/dev/null | grep -E '^(net/http/pprof|expvar)$' >/dev/null; then
+        printf '    forbidden debug or profiling package linked into the binary\n'
+        bad
+    else
+        ok
+    fi
+
     section "golangci-lint"
     if command -v golangci-lint >/dev/null 2>&1; then
         golangci-lint run ./... && ok || bad

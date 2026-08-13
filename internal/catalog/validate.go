@@ -64,6 +64,9 @@ func Validate(base []Route, all []Route) error {
 		}
 	}
 
+	// Other injection fields are allowed to exist, but the rules say "Only
+	// the two declared pro routes inject reasoning_effort", so only that
+	// field is counted and validated here.
 	proInjections := 0
 	for _, route := range base {
 		if route.Injection != nil && route.Injection.Field == "reasoning_effort" {
@@ -71,8 +74,6 @@ func Validate(base []Route, all []Route) error {
 				return fmt.Errorf("route %s injects reasoning_effort but is not one of the declared pro routes", route.Alias)
 			}
 			proInjections++
-		} else if route.Injection != nil {
-			// other injections might exist, but the rules say "Only the two declared pro routes inject reasoning_effort"
 		}
 	}
 	if proInjections != 2 {

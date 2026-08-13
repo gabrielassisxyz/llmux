@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Run the same checks the remote CI runs, locally, in one command.
+#
+#   bin/ci
+#
+# Mirrors .github/workflows/ci.yml. Run it before pushing, so what passes here passes
+# there. A check whose tool is missing is SKIPPED with the install command rather than
+# silently passing, and every skip is repeated in the closing summary: a lone yellow
+# line 200 lines up is invisible both to a human scrolling and to an agent reading only
+# the exit code, which is how a green run with the linter never executed happens.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+fail=0
+skipped=()
+section() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
+skip()    { printf '    \033[33mskip:\033[0m %s\n' "$1"; skipped+=("$1"); }
+ok()      { printf '    \033[32mok\033[0m\n'; }
+bad()     { printf '    \033[31mFAIL\033[0m\n'; fail=1; }
+
+# Build somewhere that is not RAM.
+#
+# WHY: Go leaves GOTMPDIR unset by default and falls back to TMPDIR, and /tmp on this
+# desktop is a 15 GB tmpfs, so every linker work directory and every compiled test
+# binary is resident memory that nothing evicts until a reboot. GOCACHE is already
+# redirected machine-wide in ~/.config/go/env, but GOTMPDIR is only an interactive-shell
+# export: a systemd unit, a cron job and a scripted harness all run without it, which is
+# exactly where an unattended `bin/ci` runs. Setting it here covers those.
+#
+# The directory test is what keeps the gate portable rather than being a leftover: a CI
+# runner has no such mount, and the temp directory is the right answer there anyway,
+# since the VM is destroyed when the job ends and nothing accumulates. Go fails outright
+# if GOTMPDIR names a directory that does not exist, which is why the mkdir is required
+# rather than tidy. GOCACHE needs none of this: it is content-addressed, so two worktrees
+# sharing it is correct rather than dangerous.
+if [ -z "${GOTMPDIR:-}" ] && [ -d /mnt/build ]; then
+    export GOTMPDIR=/mnt/build/go-tmp
+    mkdir -p "$GOTMPDIR"
+fi
+
+# Every Go gate below needs at least one package to look at, and `go vet ./...` exits
+# non-zero on "matched no packages" — so on a checkout that has the harness but not yet
+# the sources, running them would report a failure that describes nothing. This branch
+# disappears by itself the moment the first .go file is tracked; until then the skip is
+# counted in the closing summary rather than passing quietly.
+has_go_sources=0
+[ -n "$(git ls-files '*.go')" ] && has_go_sources=1
+
+if [ "$has_go_sources" -eq 0 ]; then
+    skip "no Go sources tracked yet: gofmt, vet, lint, test, race, static build and govulncheck have nothing to check (Phase 1 of docs/plans/PLAN.md lands them)"
+else
+    section "gofmt"
+    unformatted=$(gofmt -l $(git ls-files '*.go'))
+    if [ -n "$unformatted" ]; then
+        echo "$unformatted" | sed 's/^/    /'
+        echo "    run: gofmt -w ."
+        bad
+    else
+        ok
+    fi
+
+    section "go vet"
+    go vet ./... && ok || bad
+
+    section "golangci-lint"
+    if command -v golangci-lint >/dev/null 2>&1; then
+        golangci-lint run ./... && ok || bad
+    else
+        skip "golangci-lint not installed: mise use -g go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint"
+    fi
+
+    section "go test"
+    go test ./... && ok || bad
+
+    # A router that pins sessions to accounts, counts a rolling window per account and
+    # relays streams concurrently has no correctness story that a single-threaded test
+    # run can tell. The race detector is a hard gate here from the first package, not a
+    # pre-release step, because a data race found months later is found in production.
+    section "go test -race"
+    go test -race ./... && ok || bad
+
+    # The frozen constraint is one static binary with no runtime and no container
+    # (docs/plans/PLAN.md). CGO_ENABLED=0 is what makes that true, and it is also what
+    # keeps the SQLite driver choice honest: a cgo driver compiles fine in a normal
+    # build and fails only here, which is the whole point of checking it on every run.
+    section "static build (CGO_ENABLED=0)"
+    CGO_ENABLED=0 go build -o /dev/null ./... && ok || bad
+
+    section "govulncheck (dependency CVEs)"
+    if command -v govulncheck >/dev/null 2>&1; then
+        govulncheck ./... && ok || bad
+    else
+        skip "govulncheck not installed: mise use -g go:golang.org/x/vuln/cmd/govulncheck"
+    fi
+fi
+
+# The same binary and rules as the pre-commit hook, over the whole history rather than
+# the staged diff, so a commit made with --no-verify is still caught here.
+section "gitleaks (secret scan)"
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks git --no-banner --redact && ok || bad
+else
+    skip "gitleaks not installed: mise use -g go:github.com/zricethezav/gitleaks/v8"
+fi
+
+if [ ${#skipped[@]} -gt 0 ]; then
+    printf '\n\033[33mbin/ci: %d check(s) did NOT run:\033[0m\n' "${#skipped[@]}"
+    printf '    - %s\n' "${skipped[@]}"
+fi
+
+if [ "$fail" -eq 0 ]; then
+    printf '\n\033[32mbin/ci: all runnable checks passed.\033[0m\n'
+else
+    printf '\n\033[31mbin/ci: failures above.\033[0m\n'
+fi
+exit "$fail"

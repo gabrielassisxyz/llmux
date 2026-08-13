@@ -1,6 +1,8 @@
 package route
 
 import (
+	"time"
+
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 )
@@ -73,15 +75,22 @@ func (c *Coordinator) FinalizeDispatch(account catalog.Account) {
 }
 
 // pruneRateWindowLocked removes dispatch timestamps at or before now minus
-// the rolling rate window. The caller must hold c.mu. dispatchTimestamps
-// is ascending, so pruning is a single scan from the front.
+// the rolling rate window. The caller must hold c.mu.
 func (c *Coordinator) pruneRateWindowLocked(state *accountState) {
-	cutoff := c.clk.MonotonicNow() - policy.RollingRateWindow
+	state.dispatchTimestamps = pruneOlderThanLocked(state.dispatchTimestamps, c.clk.MonotonicNow()-policy.RollingRateWindow)
+}
+
+// pruneOlderThanLocked removes entries at or before cutoff from an
+// ascending slice of monotonic instants, so pruning is a single scan from
+// the front. Shared by the dispatch-timestamp deque and the recent-429
+// history, which prune the same way against different cutoffs.
+func pruneOlderThanLocked(timestamps []time.Duration, cutoff time.Duration) []time.Duration {
 	prune := 0
-	for prune < len(state.dispatchTimestamps) && state.dispatchTimestamps[prune] <= cutoff {
+	for prune < len(timestamps) && timestamps[prune] <= cutoff {
 		prune++
 	}
-	if prune > 0 {
-		state.dispatchTimestamps = state.dispatchTimestamps[prune:]
+	if prune == 0 {
+		return timestamps
 	}
+	return timestamps[prune:]
 }

@@ -329,7 +329,7 @@ The injection set is closed:
 - The proxy does not add `stream_options.include_usage`; clients that want streaming usage must request it themselves.
 - A missing usage object therefore produces nullable token fields rather than a mutated request or response.
 
-One of the two presets is not documented. Ollama’s public OpenAI compatibility page lists `reasoning_effort` values of `high`, `medium`, `low`, and `none`, and does not list `max`. The Phase 0 gate must establish against the real endpoint that `reasoning_effort="max"` is accepted and behaves differently from `high`. If it is rejected, the alias is a request that always fails; if it is silently coerced, the alias is a lie told to the client picker, which is worse because nothing reports it. Either way the entry needs a documented alternative mapping or removal before Phase 1, and it must not quietly become a second name for `high`.
+One of the two presets rests on something this document cannot check. What Ollama’s public OpenAI compatibility page lists for `reasoning_effort` has changed, and it would not settle the question even if it were stable, because a documented value establishes that the API shape accepts it and not that a deployed model treats it differently from its neighbour. The Phase 0 gate must establish against the real endpoint that `reasoning_effort="max"` is accepted and behaves differently from `high`. If it is rejected, the alias is a request that always fails; if it is silently coerced, the alias is a lie told to the client picker, which is worse because nothing reports it. Either way the entry needs a documented alternative mapping or removal before Phase 1, and it must not quietly become a second name for `high`.
 
 ## 8. Fixed route catalog
 
@@ -3034,7 +3034,7 @@ Deliver:
 
 - Exact upstream model strings copied from the current deployment.
 - Real-upstream pass/fail evidence for every distinct model and preset, per account.
-- A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed.
+- A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed. Record what the compatibility page says on the day as context, never as the answer.
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
 - Which `Content-Encoding` upstream selects when sent each consumer’s real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
 

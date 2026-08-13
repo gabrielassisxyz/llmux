@@ -666,8 +666,8 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 3. Generate a proxy logical-request ID.
 4. Create a context ending no later than ten minutes after admission.
 5. Acquire a global handler slot within one second, or return local 429 `proxy_overloaded`.
-6. Charge the aggregate memory gate for the body before reading it. A valid `Content-Length` charges its rounded allowance once. A body whose size is unknown charges the fixed initial step and extends its charge one step at a time, always staying ahead of the bytes actually buffered; a denied extension releases everything the request holds and returns local 429 `proxy_overloaded`. When the read completes the charge settles to the bytes actually held, because the replay buffer then lives for the rest of the request. Charging after the read would bound nothing, and charging the 64 MiB worst case for the lifetime of every chunked request would let eight small uploads exhaust the entire budget between them while the process was holding a few hundred kilobytes.
-7. Read the body into one bounded allocation.
+6. Charge the aggregate memory gate for the body before reading it, in allocated capacity rather than in bytes received. A valid `Content-Length` charges its rounded allowance once. A body whose size is unknown charges the fixed initial step and extends its charge one step at a time, always staying ahead of the capacity allocated, so every growth of the backing array is charged before it happens; a denied extension releases everything the request holds and returns local 429 `proxy_overloaded`. When the read completes the charge settles to the buffer’s capacity and not to its length, because capacity is what the process holds for the rest of the request. Charging after the read would bound nothing; charging the 64 MiB worst case for the lifetime of every chunked request would let eight small uploads exhaust the entire budget between them while the process was holding a few hundred kilobytes; and charging length against a geometrically grown buffer would under-count the budget by the slack that growth left, which under the usual doubling is most of the final step.
+7. Read a known-length body into one exact allocation. A body of unknown length grows inside its charge instead, because a single exact allocation is what a declared length buys and nothing else can produce it.
 8. Scan the top-level routing fields and build the immutable segmented replay plan.
 9. Charge the gate for the 8 MiB precommit allowance, and release it as soon as response classification proves it unnecessary.
 10. Resolve the route catalog entry.
@@ -2054,7 +2054,7 @@ The implementation must document and test these invariants:
 26. No admission path grants an account an exception to disabled health state.
 27. No `http.Client.Do` occurs without a committed admission row, and no admission row is committed without a held reservation.
 28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
-29. Aggregate request-owned memory never exceeds the configured budget. A request holds one charge, which may only grow while its body is read and is settled once when the read completes, and every charge is released exactly once.
+29. Aggregate request-owned memory never exceeds the configured budget, measured in allocated capacity rather than in bytes received. A request holds one charge, which may only grow while its body is read and is settled once when the read completes, and every charge is released exactly once.
 30. An unconfirmed provisional pin with no remaining holders cannot stay live.
 31. The rolling window is measured over `http.Client.Do` invocation instants, and a pending reservation occupies a slot from the moment it is granted until it is finalized or canceled.
 32. Startup recovery dates a recovered admission no earlier than the latest instant its dispatch could have occurred.
@@ -2134,7 +2134,7 @@ They must not contain:
 - 8 MiB non-streaming precommit buffer, after which relay becomes progressive.
 - Global ceiling on concurrent admitted chat handlers.
 - Weighted aggregate budget over request, replay, and precommit memory.
-- One body-sized allocation per request, replayed from immutable segments.
+- One body buffer per request, replayed from immutable segments, exact when the length was declared and grown inside its charge otherwise.
 - 64 KiB header limit.
 - Bounded JSON nesting depth.
 - Ten-minute logical request deadline.
@@ -2637,8 +2637,9 @@ Suppressions must name the exact linter and include a reason. Security-related w
 Benchmarks and load checks must establish:
 
 - Rewrite work is linear in body size.
-- Memory is bounded by one request-body allocation, bounded segment metadata, the 8 MiB non-streaming precommit buffer, and small relay/observer buffers.
-- A maximum-size body allocates once, and all four attempts replay from the same segments.
+- Memory is bounded by one request-body buffer, bounded segment metadata, the 8 MiB non-streaming precommit buffer, and small relay/observer buffers.
+- A maximum-size body with a declared length allocates once, and all four attempts replay from the same segments.
+- An unknown-length body charges every increase of its backing array before that increase happens, and its aggregate charge tracks capacity rather than length.
 - SSE relay does not accumulate total stream size.
 - Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
@@ -2686,6 +2687,7 @@ Consequences:
 
 - A request larger than 64 MiB may be accepted by upstream but is rejected by this transport envelope.
 - The body exists once. Route-owned replacements are small immutable segments over it, so replay costs metadata rather than a second copy, and the untouched bytes are never copied at all, which is the byte-preservation contract expressed as an allocation.
+- Exactly one allocation is what a declared length buys, and the claim is worth stating narrowly rather than generally. A chunked body cannot be read into a single exact buffer without knowing its size first, so it grows geometrically inside a charge raised before each growth. The accounting follows capacity rather than length so that the slack a doubling leaves is never budget the process believes it still has.
 - References to the buffered body should be dropped once no retry is possible.
 - A per-request ceiling bounds one request only. Concurrency is what turns it into a process-wide number, so the aggregate gate is what actually bounds the resource, and the per-request limit is what makes each request’s share explicit.
 
@@ -3136,7 +3138,7 @@ The project is complete only when all of the following are true:
 - Every alias resolves to its fixed upstream model and eligible account set.
 - The raw `messages` value is byte-identical at upstream.
 - Every untouched top-level field retains its raw bytes and relative order.
-- Request replay uses one body-sized allocation plus bounded segment metadata.
+- Request replay uses one body buffer plus bounded segment metadata, exact when the length was declared, and reuses it across every attempt.
 - Aggregate admitted-request memory stays within the configured budget.
 - Unsupported parameters are forwarded.
 - The two reasoning presets are injected only at top level.

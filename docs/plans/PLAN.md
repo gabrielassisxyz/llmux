@@ -1404,8 +1404,8 @@ The sweep stays a full pass rather than becoming an indexed expiry heap. A heap 
 
 Before listening:
 
-- Recover, for every `session_key` with a successful completion in the previous hour, the account served by whichever of those requests arrived last.
-- Preserve the original completion-based expiry.
+- Recover, for every `session_key` with a successful completion in the previous wall-clock hour, the account served by whichever of those requests arrived last.
+- Preserve the original completion-based expiry, which §16.2 measures on the same wall clock this query reads, so nothing is converted between clocks here.
 - Recover no rate state. The post-start dispatch blackout holds every account closed for the first 60 monotonic seconds of process life, which is one complete rolling window.
 - Set in-flight counts to zero.
 - Do not restore disabled state, because restart is how corrected credentials are installed.
@@ -2484,6 +2484,7 @@ Cover:
 - Explicit alias never spills.
 - Spill row contains source and destination.
 - Successful spill re-pins.
+- A request that runs for nine synthetic minutes dates its hour from successful full-response completion and from no earlier boundary, so its pin outlives one that started at handler start, at reservation, at `Do`, or at upstream EOF by the length of the request.
 - Upstream-error spill does not re-pin.
 - Partial stream spill does not re-pin.
 - Older concurrent completion cannot overwrite a newer pin, and a restart after that ordering recovers the same pin the live coordinator held.

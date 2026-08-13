@@ -1820,6 +1820,7 @@ Visible result: stable base and pinned aliases.
 - Active upstream body is closed.
 - Lease is released.
 - If dispatched, a terminal attempt row records cancellation.
+- If cancellation arrives while the phase is still waiting for an account, that phase appends its deduplicated skips and one terminal selection-failure row all the same. Silence is owed to the client that has gone, not to the log.
 - No new response is attempted after the client disappears.
 
 ### 23.15 `eod` request without session file
@@ -1893,7 +1894,7 @@ No startup failure triggers an upstream request.
 | All flexible accounts saturated | Wait for any account, at most 60 seconds, then local 429 |
 | All flexible accounts disabled | Immediate local 503 |
 | Deadline during wait | Local 429 if capacity was temporary; otherwise cancellation/timeout |
-| Client cancellation during wait | Stop silently |
+| Client cancellation during wait | Append the phase’s deduplicated skips and one terminal selection-failure row with outcome `client_canceled`; write no response |
 
 ### 24.4 Network and upstream failures
 
@@ -2296,6 +2297,7 @@ Cover:
 - Sixty-second account-acquisition expiry returns 429.
 - `Retry-After` is the rounded-up earliest known reopening, and falls back to one for in-flight-only saturation.
 - Selection failure transaction contains deduplicated skips and one terminal failure row.
+- Cancellation during a selection wait still leaves one terminal selection-failure row, with outcome `client_canceled`.
 
 ### 28.8 Health-state tests
 

@@ -428,6 +428,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Concern | Value |
 | --- | ---: |
 | Logical request deadline | 10 minutes |
+| Shutdown grace after the first signal | 10 minutes 10 seconds |
 | Maximum account-acquisition time per attempt | 60 seconds |
 | Maximum request body | 64 MiB |
 | Non-streaming precommit response buffer | 8 MiB |
@@ -670,7 +671,7 @@ There is no degraded startup mode.
 1. On SIGINT/SIGTERM, mark the application as draining.
 2. Stop accepting new requests.
 3. Do not cancel handler contexts on the first signal. Let active handlers finish within the remainder of their request deadline, capped by ten minutes.
-4. A second signal, or expiry of the shutdown grace, cancels the application force context and calls `Server.Close`.
+4. A second signal, or expiry of the shutdown grace of §9.2, cancels the application force context and calls `Server.Close`. That grace exceeds the logical request deadline by more than the store-operation ceiling on purpose. A handler admitted an instant before the signal may run for the full deadline and then needs its bounded store context to write the terminal row, and §12 step 26 derives that context from the force context, so a grace equal to the deadline would cancel exactly the record a graceful shutdown exists to flush.
 5. Handler cleanup releases account leases.
 6. Handler cleanup appends terminal rows where possible.
 7. Close idle upstream connections.

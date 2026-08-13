@@ -579,7 +579,7 @@ Owns the two process-wide admission bounds that no per-request limit can provide
 - A weighted budget over request-owned memory, charged in bytes and released on every exit path.
 - One bounded acquisition wait, after which the caller receives local 429 rather than queueing.
 
-Both are acquired before the body is read and released by the same defer that releases the handler slot. The gate holds no coordinator state, makes no I/O, and knows nothing about accounts: it bounds what the process has allocated, while the coordinator bounds what upstream is asked to do. Neither substitutes for the other, because a request buffers its body long before it competes for an account and may never reach one at all.
+Both are acquired before the body is read and released by the same defer that releases the handler slot. The precommit allowance is a later charge against the same budget, taken only by a response that is actually going to buffer and released by that same defer. The gate holds no coordinator state, makes no I/O, and knows nothing about accounts: it bounds what the process has allocated, while the coordinator bounds what upstream is asked to do. Neither substitutes for the other, because a request buffers its body long before it competes for an account and may never reach one at all.
 
 #### Upstream transport
 
@@ -669,7 +669,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 6. Charge the aggregate memory gate for the body before reading it, in allocated capacity rather than in bytes received. A valid `Content-Length` charges its rounded allowance once. A body whose size is unknown charges the fixed initial step and extends its charge one step at a time, always staying ahead of the capacity allocated, so every growth of the backing array is charged before it happens; a denied extension releases everything the request holds and returns local 429 `proxy_overloaded`. When the read completes the charge settles to the buffer’s capacity and not to its length, because capacity is what the process holds for the rest of the request. Charging after the read would bound nothing; charging the 64 MiB worst case for the lifetime of every chunked request would let eight small uploads exhaust the entire budget between them while the process was holding a few hundred kilobytes; and charging length against a geometrically grown buffer would under-count the budget by the slack that growth left, which under the usual doubling is most of the final step.
 7. Read a known-length body into one exact allocation. A body of unknown length grows inside its charge instead, because a single exact allocation is what a declared length buys and nothing else can produce it.
 8. Scan the top-level routing fields and build the immutable segmented replay plan.
-9. Charge the gate for the 8 MiB precommit allowance, and release it as soon as response classification proves it unnecessary.
+9. Do not reserve the precommit allowance here. It is charged only once a final response is classified as non-streaming 2xx, immediately before its buffer is allocated.
 10. Resolve the route catalog entry.
 11. Read the optional session ID, reject an oversized one, and reduce it to its digest.
 12. Build and validate the immutable upstream request template before reserving account capacity. This includes the fixed URL, the segmented replay plan, and allowed client headers, but not the account credential.
@@ -697,7 +697,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 22. If final:
     - Stage filtered upstream headers without committing them.
     - For SSE, successfully read the first non-empty upstream body chunk before downstream commitment.
-    - For non-streaming 2xx, buffer up to 8 MiB before commitment; complete small bodies in memory and transition larger bodies to progressive relay.
+    - For non-streaming 2xx, charge the gate for the 8 MiB precommit allowance and buffer up to that bound before commitment; complete small bodies in memory and transition larger bodies to progressive relay. A denied charge skips the precommit phase and relays progressively from the first byte, which is the path an oversized body already takes.
     - Commit status and headers exactly once.
     - Relay the exact staged and subsequent response bytes.
     - Observe usage and time to first event without retaining content.
@@ -818,7 +818,7 @@ For SSE:
 For a final non-streaming 2xx response:
 
 1. Stage status and filtered headers without committing them.
-2. Read into a bounded 8 MiB precommit buffer.
+2. Charge the aggregate memory gate for the 8 MiB precommit allowance and read into a bounded buffer of that size.
 3. If EOF arrives within the bound:
    - Treat the response as complete.
    - Extract a complete usage object from the buffered bytes.
@@ -828,8 +828,11 @@ For a final non-streaming 2xx response:
    - Commit status and headers.
    - Write the already-read prefix exactly.
    - Continue progressive unchanged relay through the bounded usage observer.
-5. If reading fails before commitment, classify the failure and retry when its budget allows.
-6. If reading fails after commitment, record truncation and abort the response.
+5. If the gate denies the precommit allowance, commit status and headers at once and relay progressively through the bounded usage observer, exactly as an oversized body does.
+6. If reading fails before commitment, classify the failure and retry when its budget allows.
+7. If reading fails after commitment, record truncation and abort the response.
+
+The allowance is charged here rather than at admission, which is where a per-request reservation would naturally sit. Charged early it is charged for every request, including every stream and every request still waiting for an account or backing off between attempts, and 128 concurrent handlers holding 8 MiB apiece is 1 GiB against a 512 MiB budget. The gate would spend most of that budget on a buffer most requests never allocate, and the concurrency ceiling would quietly become a memory ceiling of roughly half its stated value. Charging once the response is known to be a non-streaming 2xx means only the requests that use it hold it. What that moves is a possible denial from admission time to relay time, and the answer to a denial already exists: the body relays progressively. That costs the precommit retryability of §29.17 and nothing else, because the bytes the client receives are identical on both paths.
 
 This buffering does not persist completion text. It is request-lifetime process memory and is released immediately after relay. It is bounded independently of the request-body buffer.
 
@@ -2507,6 +2510,7 @@ Cover:
 - Client disconnect during write.
 - Exact status/header/body preservation.
 - Precommit buffers are released after response completion and do not scale with total over-threshold body size.
+- A precommit allowance denied by the aggregate gate relays the same bytes progressively rather than failing the request.
 
 ### 28.13 SQLite tests
 
@@ -2652,6 +2656,7 @@ Benchmarks and load checks must establish:
 - Sustained concurrency never violates account ceilings.
 - Concurrent admitted handlers never exceed the global ceiling.
 - Charged request, replay, and precommit memory never exceeds the aggregate budget.
+- Streaming requests, requests waiting for an account, and requests backing off between attempts hold no precommit reservation.
 - Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
 - An unsized upload’s gate charge stays ahead of its buffered bytes at every step and settles to the actual size at read completion.
 - Concurrent small unsized uploads cannot exhaust the aggregate budget, and a denied extension releases the whole charge and answers 429.
@@ -2747,7 +2752,7 @@ SQLite and structured stderr cover the stated operational need. A metrics/debug 
 
 ### 29.17 Bounded response observation
 
-Small non-streaming bodies are buffered up to 8 MiB to make body-read failures retryable before commitment and make usage extraction reliable. Larger bodies and SSE remain incremental. The tradeoff is a bounded per-request memory allocation and delayed header/body delivery for non-streaming calls, whose clients ordinarily cannot use the completion until EOF anyway.
+Small non-streaming bodies are buffered up to 8 MiB to make body-read failures retryable before commitment and make usage extraction reliable. Larger bodies and SSE remain incremental, and so does a body whose precommit allowance the aggregate gate declines, which loses that retryability rather than the response. The tradeoff is a bounded per-request memory allocation and delayed header/body delivery for non-streaming calls, whose clients ordinarily cannot use the completion until EOF anyway.
 
 ### 29.18 Request-header allowlist
 

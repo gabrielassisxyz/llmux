@@ -702,11 +702,11 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Stage filtered upstream headers without committing them.
     - For SSE, successfully read the first non-empty upstream body chunk before downstream commitment.
     - For non-streaming 2xx, charge the gate for the 8 MiB precommit allowance and buffer up to that bound before commitment; complete small bodies in memory and transition larger bodies to progressive relay. A denied charge skips the precommit phase and relays progressively from the first byte, which is the path an oversized body already takes.
+    - For a body buffered in full inside the precommit bound, close the upstream response and release the account lease before committing, because no live upstream attempt remains.
     - Commit status and headers exactly once.
     - Relay the exact staged and subsequent response bytes.
     - Observe usage and time to first event without retaining content.
-    - Close the response.
-    - Release the account lease.
+    - Close the response and release the account lease, unless the buffered path already did.
     - Update health and session state.
     - Transactionally append the selection skips and final attempt row.
 23. Release the body buffer and its memory charge as soon as no further replay can occur, which is the point at which the last attempt becomes terminal. There is no separate rewritten body to release, and no body is written to disk.
@@ -826,6 +826,7 @@ For a final non-streaming 2xx response:
 3. If EOF arrives within the bound:
    - Treat the response as complete.
    - Extract a complete usage object from the buffered bytes.
+   - Close the upstream body and release the account lease.
    - Commit the upstream status and headers.
    - Write the original buffered bytes exactly once.
 4. If the body exceeds 8 MiB:
@@ -837,6 +838,8 @@ For a final non-streaming 2xx response:
 7. If reading fails after commitment, record truncation and abort the response.
 
 The allowance is charged here rather than at admission, which is where a per-request reservation would naturally sit. Charged early it is charged for every request, including every stream and every request still waiting for an account or backing off between attempts, and 128 concurrent handlers holding 8 MiB apiece is 1 GiB against a 512 MiB budget. The gate would spend most of that budget on a buffer most requests never allocate, and the concurrency ceiling would quietly become a memory ceiling of roughly half its stated value. Charging once the response is known to be a non-streaming 2xx means only the requests that use it hold it. What that moves is a possible denial from admission time to relay time, and the answer to a denial already exists: the body relays progressively. That costs the precommit retryability of §29.17 and nothing else, because the bytes the client receives are identical on both paths.
+
+The lease goes back at upstream EOF and not after the downstream write, because by then the upstream attempt is finished and its connection closed. The in-flight ceiling bounds live upstream work; letting it follow a client that drains eight megabytes slowly would spend account concurrency on a transfer upstream is no longer part of.
 
 This buffering does not persist completion text. It is request-lifetime process memory and is released immediately after relay. It is bounded independently of the request-body buffer.
 
@@ -1460,7 +1463,7 @@ A lease contains:
 Rules:
 
 - Install cleanup immediately after acquisition.
-- Release after upstream body closure.
+- Release after upstream body closure, which for a response buffered in full precedes the downstream write, so a slow reader never holds an account slot.
 - Release on success, errors, panic, retry, cancellation, and shutdown.
 - Decrement in-flight exactly once.
 - Retain the RPM timestamp until it naturally expires.
@@ -2516,6 +2519,7 @@ Cover:
 - Client disconnect during write.
 - Exact status/header/body preservation.
 - Precommit buffers are released after response completion and do not scale with total over-threshold body size.
+- A fully buffered response releases its account in-flight lease before the downstream write, and a slow reader cannot hold account capacity.
 - A precommit allowance denied by the aggregate gate relays the same bytes progressively rather than failing the request.
 
 ### 28.13 SQLite tests

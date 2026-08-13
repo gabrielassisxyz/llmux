@@ -82,6 +82,14 @@ else
     section "go vet"
     go vet ./... && ok || bad
 
+    section "package dependencies"
+    if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./internal/... 2>/dev/null | grep -E ' (github.com/gabrielassisxyz/llmux/internal/app|github.com/gabrielassisxyz/llmux/cmd)' >/dev/null; then
+        printf '    lower-level package imports internal/app or cmd/llmux\n'
+        bad
+    else
+        ok
+    fi
+
     section "golangci-lint"
     if command -v golangci-lint >/dev/null 2>&1; then
         golangci-lint run ./... && ok || bad

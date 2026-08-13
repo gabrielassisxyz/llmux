@@ -456,6 +456,7 @@ The binary reads configuration from the environment, but the operating documenta
 - Do not put proxy or account keys in command-line flags, checked-in unit files, shell history, or example files.
 - For a service manager, use an owner-readable environment file outside the repository, mode `0600`, referenced by the user service.
 - The example environment file committed to the repository contains names and placeholders only.
+- The reference service definition disables core dumps and sets an owner-only umask, since a core file of this process contains four credentials and whatever prompt text was in flight.
 - The log directory should be owned by the user and should not grant write access to other users.
 - The service definition should set `GOMEMLIMIT` above the aggregate memory budget with room to spare, since the budget covers only request-owned buffers.
 - Startup messages may name a missing variable but must never print its value.
@@ -480,7 +481,7 @@ Lower-level components do not import the application or command package.
 
 | Path | Responsibility |
 | --- | --- |
-| `cmd/llmux` | Minimal entry point, configuration load, construction, run, exit status |
+| `cmd/llmux` | Minimal entry point, `version` subcommand, configuration load, construction, run, exit status |
 | `internal/app` | Composition root, server lifecycle, startup recovery, signal handling |
 | `internal/catalog` | Fixed routes, generated pinned variants, model-list projection |
 | `internal/proxy` | Auth, handlers, body rewriting, retry loop, headers, relay, usage observation |
@@ -2049,7 +2050,7 @@ Use standard-library structured logging with JSON output to stderr.
 
 Events include:
 
-- Startup complete.
+- Startup complete, carrying version, revision, schema version, and Go toolchain.
 - Shutdown requested/completed.
 - Fatal configuration/database/listener errors.
 - Account disabled.
@@ -2493,6 +2494,7 @@ Every release must pass:
 - `govulncheck`.
 - Security static analysis.
 - `CGO_ENABLED=0` build.
+- Reproducible `-trimpath` release build with artifact checksums.
 - Verification that the resulting Linux binary has no dynamic runtime dependency.
 - Search proving no prompt/completion logging calls.
 - Search proving no cost/currency implementation.
@@ -2644,7 +2646,10 @@ Implementation is not complete without:
 - A placeholder-only environment-file template.
 - A reference user-service definition that runs the static binary as the current user, restarts only on process failure, and does not contain health probes.
 
-These are documentation and launch aids, not a UI or additional runtime service. The list stops where a document would start describing the process rather than the system: build identity is already recoverable from `go.mod`, `PRAGMA user_version` and the binary itself, so a checklist restating it would only be a second copy free to be wrong.
+- A `llmux version` subcommand printing version, revision, schema version, and Go toolchain.
+- Release artifacts built with `-trimpath`, published with checksums.
+
+These are documentation and launch aids, not a UI or additional runtime service. The list still stops where a document would start describing the process rather than the system: a written checklist restating build identity would be a second copy free to be wrong, which is exactly why the subcommand reads `debug.ReadBuildInfo` and `PRAGMA user_version` at runtime instead of printing strings someone stamped in by hand. It derives the answer rather than repeating it, and during a cutover or a rollback "which binary is this" is a question worth being able to ask the binary.
 
 ### 30.2 Installation
 
@@ -2926,7 +2931,8 @@ Deliver:
 - Panic recovery.
 - Structured lifecycle logging.
 - Secure file checks.
-- Static build automation.
+- Static build automation with `-trimpath` and published checksums.
+- `llmux version`, deriving its output rather than restating it.
 - Lint/security configuration.
 
 Gate:

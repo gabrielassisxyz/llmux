@@ -418,6 +418,18 @@ These requests are made by the operator against the upstream, not by the proxy. 
 
 The alternative is not free: a provisional string that survives into the catalog fails at the first real request, and a preset that upstream ignores fails at no point at all, which is the case this gate exists for.
 
+#### Gate outcome
+
+The gate is closed. Phase 1 builds on the findings below rather than on the paragraphs above, and the recorded evidence sits in the operator's inventory records alongside the bead that produced each line.
+
+- **Upstream model strings.** Transcribed into §8.1 from the deployed route catalog. The provider prefix carried there is internal routing and does not cross to upstream, so it is stripped.
+- **Reachability.** Every one of the seven route entries answers on all three accounts, 21 of 21. The eligible-account set stands as written and needed no correction.
+- **`reasoning_effort="max"`.** Supported and distinct, so both pro aliases stay as written. It is not a second name for `high`: the request carries a fixed extra preamble, and on a prompt that requires multi-step work `high` finishes unaided while `max` runs past a budget four times the size of the answers `high` returns.
+- **Revoked credential.** Upstream answers 401, with no `WWW-Authenticate` and no stable machine-readable code. The account-disablement rule stands as written and the conditional 403 code projection is not built.
+- **Response `Content-Encoding`.** Identity throughout, for every advertised `Accept-Encoding`, streaming and non-streaming. The bounded observation decoder of Phase 6 is not built.
+- **Rate-limit headers.** No numeric family, on any account. The two nullable columns and their migration are not built, and the weekly ceiling re-derivation stays one-sided, bounded by sustained 429s under the local guard and by nothing from above.
+- **`Retry-After`.** Not observed: no 429 and no 5xx occurred across the inventory, so its wire form on this provider is unrecorded and both forms ship as planned. `Date` is present on every response, in HTTP-date form, so the absolute form is derivable against upstream's own clock and the no-usable-`Date` path is the rare one rather than an assumed one.
+
 ## 9. Configuration
 
 ### 9.1 Environment variables

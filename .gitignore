@@ -34,3 +34,15 @@
 # for the same reason the block above gives.
 /.beads
 /.bv
+
+# The reservation-guard plugin, generated per machine. `.githooks/pre-commit` is a
+# chain runner: it executes every plugin in `hooks.d/pre-commit/` and then the
+# preserved original hook, so the secret scan still runs last and a checkout with no
+# plugins behaves exactly as it did before. The plugin itself is not shareable, because
+# the generator writes the absolute path of one machine's reservation store into it, and
+# it is inert anywhere else regardless: it exits zero unless GIT_IDENTITY_ENABLED is set
+# in the environment of whoever runs the commit. The Windows shims are install artifacts
+# of the same generator.
+/.githooks/hooks.d
+/.githooks/pre-commit.cmd
+/.githooks/pre-commit.ps1

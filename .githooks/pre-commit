@@ -1,12 +1,51 @@
-#!/usr/bin/env bash
-# Deterministic gate: block a staged secret from ever reaching a commit.
-# The probabilistic counterpart (show `git diff --cached` before commit) lives in
-# AGENTS.md — this hook is the trava that survives forgetting.
-set -euo pipefail
+#!/usr/bin/env python3
+# mcp-agent-mail chain-runner (pre-commit)
+import os
+import sys
+import stat
+import subprocess
+from pathlib import Path
 
-if ! command -v gitleaks >/dev/null 2>&1; then
-    echo "gitleaks not installed — see https://github.com/gitleaks/gitleaks" >&2
-    exit 1
-fi
+HOOK_DIR = Path(__file__).parent
+RUN_DIR = HOOK_DIR / 'hooks.d' / 'pre-commit'
+ORIG = HOOK_DIR / 'pre-commit.orig'
 
-gitleaks protect --staged --no-banner
+def _is_exec(p: Path) -> bool:
+    try:
+        st = p.stat()
+        return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    except Exception:
+        return False
+
+def _list_execs() -> list[Path]:
+    if not RUN_DIR.exists() or not RUN_DIR.is_dir():
+        return []
+    items = sorted([p for p in RUN_DIR.iterdir() if p.is_file()], key=lambda p: p.name)
+    # On POSIX, honor exec bit; on Windows, include all files (we'll dispatch .py via python).
+    if os.name == 'posix':
+        try:
+            items = [p for p in items if _is_exec(p)]
+        except Exception:
+            pass
+    return items
+
+# Forward Git's hook arguments (e.g. pre-push <remote> <url>) to children.
+ARGV = sys.argv[1:]
+
+def _run_child(path: Path, * , stdin_bytes=None):
+    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.
+    if os.name != 'posix' and path.suffix.lower() == '.py':
+        return subprocess.run(['python', str(path), *ARGV], input=stdin_bytes, check=False).returncode
+    return subprocess.run([str(path), *ARGV], input=stdin_bytes, check=False).returncode
+
+for exe in _list_execs():
+    rc = _run_child(exe)
+    if rc != 0:
+        sys.exit(rc)
+
+# Run the preserved original hook last (POSIX: only if it is executable).
+if ORIG.exists() and (os.name != 'posix' or _is_exec(ORIG)):
+    rc = _run_child(ORIG)
+    if rc != 0:
+        sys.exit(rc)
+sys.exit(0)

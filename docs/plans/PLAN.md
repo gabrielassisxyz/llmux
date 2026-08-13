@@ -2088,6 +2088,8 @@ All time-dependent tests must use either the complete injected clock/timer bound
 
 The scripted fake upstream must record the account by the bearer key it actually receives, dispatch start time, live concurrency, request bytes, and cancellation. Limiter invariants must be asserted at this external observation point as well as against coordinator state.
 
+The coordinator additionally carries model-based tests that generate random sequences of reservation, admission success and failure, dispatch, release, cooldown, cancellation, crash and recovery events against a reference model of the same state. Example-based tests cover the interleavings someone thought of, and the failures worth fearing in a component like this one are the interleavings nobody did.
+
 Crash behavior is tested with real subprocesses killed at each boundary that the two commit points create: after coordinator reservation, after the admission commit, after `http.Client.Do` returns, after downstream commitment, and after the terminal insert. A restarted process reading that store must never admit more than the ceiling allows for the window the crash fell in.
 
 ### 28.1 Catalog tests
@@ -2526,6 +2528,7 @@ Benchmarks and load checks must establish:
 - Concurrent admitted handlers never exceed the global ceiling.
 - Charged request, replay, and precommit memory never exceeds the aggregate budget.
 - Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
+- A slow upload terminates at the request-read deadline instead of holding its buffer.
 
 Benchmarks use `b.Loop`, run with `-benchmem`, and are compared across repeated runs with `benchstat` rather than by reading one number. No performance optimization is accepted if it weakens message preservation, rate correctness, or append-only evidence.
 
@@ -2940,6 +2943,8 @@ Deliver:
 Gate:
 
 - Shutdown/restart/failure-injection tests pass.
+- Crash-boundary admission tests pass.
+- Aggregate-memory and slow-client tests pass.
 - No background upstream request occurs while idle.
 
 ### Phase 8: Operations and black-box acceptance
@@ -3030,6 +3035,7 @@ The project is complete only when all of the following are true:
 - Currency and cost logic are absent.
 - Startup recovers recent rate timestamps and successful session pins.
 - Graceful shutdown releases permits and closes SQLite last.
+- Request bodies, account acquisition, retries, downstream writes, and store cleanup each have an independently enforceable bound.
 - Installation, backup, recovery, cutover, and rollback runbooks are complete and tested.
 - Real Ollama Cloud acceptance includes a multi-turn tool-call/tool-result loop.
-- Unit, integration, race, fuzz, privacy, failure-injection, restart, and static-build gates pass.
+- Unit, integration, race, fuzz, model-based, crash-boundary, privacy, resource, failure-injection, restart, and static-build gates pass.

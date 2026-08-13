@@ -626,7 +626,7 @@ Properties:
 - Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
 - One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
-- One row per authenticated chat request that ends before account selection begins.
+- One row per authenticated chat request that receives a local response before account selection begins.
 - One lifecycle row at startup and one at shutdown.
 - Startup-only recovery queries.
 - No ORM or database server.
@@ -731,7 +731,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Transactionally append the selection skips and final attempt row.
 23. Release the body buffer and its memory charge as soon as no further replay can occur, which is the point at which the last attempt becomes terminal. There is no separate rewritten body to release, and no body is written to disk.
 24. Release the global handler slot and any remaining memory charge on every exit path, including panic and cancellation.
-25. A request that ended before step 13 began writes its local result to the client and then appends one `unrouted_request` row, which is the only durable record such a request produces.
+25. A request that ended before step 13 began writes its local result to the client and then appends one `unrouted_request` row, which is the only durable record such a request produces. A request whose client vanished before any status was written appends nothing, which §15.3 states as a decision rather than an omission.
 26. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
 27. Return only after the terminal transaction has been attempted.
 

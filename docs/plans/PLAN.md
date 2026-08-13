@@ -425,6 +425,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Concurrent admitted chat requests | 128 |
 | Global request-admission wait | 1 second |
 | Session affinity TTL | 1 hour |
+| Live session pins | 4096 |
 | Provisional pin maximum lifetime | Logical request deadline |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
@@ -1270,7 +1271,12 @@ Rules:
 - A sequence guard prevents an older concurrent request from overwriting a newer pin update.
 - An expired pin is removed lazily.
 - Every 256 session operations, a foreground sweep removes expired entries.
+- The map holds at most 4096 pins. When it is full, a session that has none routes as an unpinned base alias and creates no entry, and a warning is emitted.
 - There is no cleanup goroutine.
+
+The map needs a ceiling because a pin outlives the request that created it and is keyed on client-chosen text. Every other allocation in this design is charged to a request and released when it ends, which is what invariant 16 bounds; a session pin is the one thing that survives its request, so a consumer that generated a fresh identifier per turn, by intent or by defect, would grow the map for an hour at a time with nothing to stop it. At the ceiling the proxy refuses rather than evicting: refusing costs a new session its affinity, while evicting costs an established conversation the prefix cache the pin exists to preserve, and the established one is the one with something to lose. The sweep clears the expired entries, so the ceiling releases itself.
+
+The sweep stays a full pass rather than becoming an indexed expiry heap. A heap would make expiry logarithmic and refresh a fix-up instead of a rescan, and it would be a second structure that has to agree with the map through pin creation, provisional confirmation, TTL refresh, holder release, and lazy removal, which is five places for the two to disagree. Against a map the rule above bounds at 4096 entries, holding live conversations that number in the tens for three local consumers, the pass costs less than the lock acquisition around it. The ceiling is what makes that true, and it is the thing to revisit if it stops being true.
 
 ### 16.3 Startup recovery
 
@@ -2116,6 +2122,7 @@ They must not contain:
 - Bounded retry drain.
 - Maximum four dispatches.
 - Bounded deduplicated skip collection.
+- Ceiling on live session pins, which are the one allocation that outlives the request creating it.
 - No unbounded log queue.
 - No per-request unbounded goroutine creation.
 
@@ -2327,6 +2334,7 @@ Cover:
 - Partial stream spill does not re-pin.
 - Older concurrent completion cannot overwrite a newer pin, and a restart after that ordering recovers the same pin the live coordinator held.
 - A failed first request in a new session leaves no pin behind.
+- A new session arriving while the pin map is full routes unpinned, creates no entry, and evicts nothing.
 - Concurrent first requests share one provisional pin, and it survives while any of them is still running.
 - The last concurrent first request to fail removes the provisional pin.
 - Deadline during grace.

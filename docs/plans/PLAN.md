@@ -72,6 +72,7 @@ Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and intro
 21. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
 22. No client-supplied query string is ever forwarded upstream.
 23. Raw session identifiers are never persisted or logged. Only keyed digests are stored.
+24. The rolling rate window is measured over `http.Client.Do` invocation instants. A reservation occupies a slot from the moment it is granted, but the timestamp the window is defined against is installed at the dispatch boundary.
 
 ## 5. Fixed design decisions
 
@@ -435,6 +436,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | SSE observer line cap | 1 MiB |
 | Observer cumulative decoded-output cap | 64 MiB per response |
 | SQLite busy timeout | 5 seconds |
+| Store-operation ceiling | 6 seconds |
 | WAL size warning threshold | 64 MiB |
 | Server header-read timeout | 5 seconds |
 | Server request-read timeout | 2 minutes |
@@ -674,13 +676,13 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Compute `Retry-After` when at least one account has temporary capacity state.
     - Transactionally append the deduplicated skip rows and one `selection_failure` row.
     - Return local 429 for temporary capacity exhaustion or local 503 when no flexible account is usable.
-16. If selection succeeds, install release cleanup immediately. The lease is provisional until its admission row commits.
-17. Generate the attempt’s `attempt_id` and synchronously commit its `dispatch_admission` row.
+16. If selection succeeds, install release cleanup immediately. The lease holds a pending reservation: it occupies one RPM slot and one in-flight slot from this moment, and no dispatch timestamp exists for it yet.
+17. Generate the attempt’s `attempt_id` and synchronously commit its `dispatch_admission` row, inside the bounded store-operation ceiling.
 18. If the admission commit fails:
-    - Cancel the provisional lease, which removes its uncommitted RPM timestamp and releases its in-flight slot.
+    - Cancel the pending reservation, which frees the RPM slot it was holding and releases its in-flight slot.
     - Append no dispatch row, because no dispatch occurred.
     - Return local 503 `admission_store_unavailable`.
-19. Mark the lease dispatchable and call `http.Client.Do` immediately. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
+19. Reacquire the coordinator mutex, convert the pending reservation into a dispatch timestamp at the current instant, unlock, and call `http.Client.Do` immediately. That second critical section touches memory only and has no failure branch: the admission is committed, so the attempt is going upstream whatever the mutex reveals. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its slot is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
 20. Classify transport errors and upstream status before writing any downstream status or headers.
 21. If retrying:
     - Drain and close the intermediate response within bounds.
@@ -972,7 +974,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Attempt a passive checkpoint in the foreground after a bounded number of terminal commits, and again when a terminal commit finds the WAL past its warning threshold. A checkpoint never runs in the foreground of an admission commit: that commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw, while the same work behind a terminal commit runs after the response was relayed and is invisible to every client.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
-- Use a five-second busy timeout.
+- Use a five-second busy timeout, and bound every store operation with a six-second context so SQLite’s own busy handling always finishes before the application deadline fires. An application deadline shorter than the busy timeout would cancel exactly the contended writes the busy timeout exists to let through, and an unbounded one would leave the pending-reservation window of §17.1 with no stated ceiling for recovery to be conservative against.
 - Set maximum open and idle database connections to one.
 - Use parameterized SQL only.
 - Check every database error.
@@ -1006,6 +1008,8 @@ Three append-only tables exist, and the split is by commit point rather than by 
 | `limiter_in_flight` | Integer, non-null | Post-reservation snapshot |
 
 An admission row carries only what rate recovery needs and what identifies the attempt it authorized. It is never updated, so an admission without a matching terminal attempt row is itself a fact: the process crashed, stopped between the commit and the send, or lost its store before the attempt finished. Recovery counts it either way.
+
+`reserved_at_us` records the reservation and not the dispatch, because the row is committed before the dispatch it authorizes exists to be timed. The live window is measured at the dispatch boundary all the same, and §16.3 says what recovery does with the difference.
 
 `attempt_log` holds what became known after the fact.
 
@@ -1274,12 +1278,14 @@ Before listening:
 
 - Recover the newest successful account for every `session_key` completed in the previous hour.
 - Preserve the original completion-based expiry.
-- Recover dispatch admissions from the previous 60 seconds into account rolling windows.
+- Recover dispatch admissions whose reservation instant, advanced by the store-operation ceiling, falls inside the previous 60 seconds, into account rolling windows.
 - Set in-flight counts to zero.
 - Do not restore disabled state, because restart is how corrected credentials are installed.
 - Do not call upstream to validate recovered state.
 
-Rate recovery reads `dispatch_admission` and never the terminal attempt rows. An attempt that was in flight when the process died left an admission and no result, and recovery counts it exactly like a completed one: the timestamp is what the ceiling is defined over, and the outcome is irrelevant to it. The ledger can therefore be wrong in one direction only, counting a slot that a crash between the commit and the send never actually spent.
+Rate recovery reads `dispatch_admission` and never the terminal attempt rows. An attempt that was in flight when the process died left an admission and no result, and recovery counts it exactly like a completed one: the instant is what the ceiling is defined over, and the outcome is irrelevant to it. The ledger can therefore be wrong in one direction only, counting a slot that a crash between the commit and the send never actually spent.
+
+Recovery cannot read the instant a dispatch actually left, because the admission row is committed before it. It advances `reserved_at_us` by the store-operation ceiling, which is the latest moment the corresponding `Do` could have happened, so a recovered slot stays in the window at least as long as the live process would have kept it. That is the conservative direction, and the wrong one is available too: dating a recovered slot from its reservation would expire it early and let a restarted process readmit capacity the previous one had already spent, which is the failure the admission ledger exists to prevent. The value is derived at recovery time rather than stored, because a column holding a number computable from one already present is a second copy free to disagree with the first.
 
 ## 17. Concurrency-correct rate accounting
 
@@ -1290,24 +1296,29 @@ All account and session state is guarded by one coordinator mutex.
 For an account candidate:
 
 1. Read the monotonic clock.
-2. Remove timestamps at or before `now - 60 seconds`.
+2. Remove dispatch timestamps at or before `now - 60 seconds`.
 3. Expire a completed cooldown.
 4. Reject disabled or cooling accounts.
 5. Reject if in-flight is already 12.
-6. Reject if 60 timestamps remain.
-7. Otherwise append `now`.
+6. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
+7. Otherwise increment pending reservations.
 8. Increment in-flight.
-9. Return an immutable release-once lease.
+9. Return an immutable release-once pending lease.
 10. Unlock.
 
 The rate check and both mutations are one critical section. Concurrent goroutines cannot claim the same final slot.
+
+A second critical section closes the reservation. Once the admission row has committed, the caller reacquires the mutex, decrements the account’s pending count, appends the current monotonic instant to its dispatch deque, unlocks, and calls `http.Client.Do`. Neither section performs I/O of any kind.
+
+The window is defined over the instants of the calls it exists to bound, and the pending count is what makes that safe to measure there. Dating a slot from its reservation instead puts the admission commit inside the number: the slot expires from the window that much sooner than the call it authorized turns a minute old, so a saturated account can put more than 60 real dispatches inside one real minute by exactly the commit latency, and the excess grows with whatever the store is doing at the time. Counting pending reservations against the ceiling preserves the property the single critical section provided, which is that a concurrent caller cannot be admitted into a slot that is about to be taken. This is the correction §14.1 already makes for `time_to_first_event`: a quantity named for a boundary is measured at that boundary, and a durable commit placed in front of it does not get to move it.
 
 ### 17.2 Limit semantics
 
 | Event | RPM slot | In-flight slot |
 | --- | --- | --- |
 | Candidate inspected and skipped | No | No |
-| Dispatch reservation | Yes, never refunded | Held immediately |
+| Pending reservation | Occupies a slot; freed only if the admission commit fails | Held immediately |
+| `Do` invocation | Timestamp installed, never refunded | Already held |
 | Successful `Do` invocation | Already consumed | Until body closes |
 | `Do` transport failure | Yes | Until `Do` returns |
 | Upstream 4xx/5xx | Yes | Until body closes |
@@ -1316,7 +1327,7 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | `/v1/models` | No | No |
 | Local pre-routing rejection | No | No |
 
-Every committed dispatch reservation is counted because the proxy cannot prove that a request failing at the send boundary was unseen by upstream. All body rewriting, URL construction, and header filtering occur before reservation, so the only fallible step left between reservation and `Do` is the admission commit, whose failure cancels the reservation outright rather than being retried or ignored.
+Every finalized reservation is counted because the proxy cannot prove that a request failing at the send boundary was unseen by upstream. All body rewriting, URL construction, and header filtering occur before reservation, so the only fallible step left between reservation and `Do` is the admission commit, whose failure cancels the reservation outright rather than being retried or ignored.
 
 ### 17.3 Wait and wake
 
@@ -1416,12 +1427,14 @@ Rules:
 - Notify waiters on release.
 - Never hold coordinator state across network or database I/O.
 
-A lease is provisional between reservation and the commit of its admission row:
+A lease is pending between reservation and the commit of its admission row:
 
 - A pending reservation counts against RPM and in-flight for the whole time its admission transaction runs, so a concurrent caller can never be admitted into a slot that is about to be taken.
-- On commit success the lease becomes dispatchable, and `Do` follows immediately.
-- On commit failure the lease is canceled, which is the one path that removes an RPM timestamp: no dispatch happened, and no evidence of one exists.
+- On commit success the reservation is finalized under the coordinator mutex, which installs the account’s dispatch timestamp, and `Do` follows immediately.
+- On commit failure the lease is canceled, which is the one path that frees a pending slot: no dispatch happened, and no evidence of one exists.
 - A crash between commit and dispatch leaves an admission with no dispatch. That is the deliberate direction of the error, because the opposite one is a real dispatch with no record.
+
+Finalization has no failure branch, and the case that argues for one is answered here rather than left open. A concurrent 401 can disable an account while an admission commit is running, so a request can finalize into an account the process has just learned is revoked. Refusing to dispatch there would need a durable record of the refusal, because §15.3 reads an admission with no terminal row as a crash, and that record would need a record kind, an outcome value, and constraints of its own. It would buy nothing. A request inside the commit window is in exactly the position of one already in flight to that account when the 401 arrived, and this document already says what happens to those: it receives its own 401, the account is disabled either way, and a flexible route fails over. What it costs is one slot on an account that will not be used again for the rest of the process lifetime.
 
 ## 19. Saturated pinned-session policy
 
@@ -2009,6 +2022,8 @@ The implementation must document and test these invariants:
 28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
 29. Aggregate request-owned memory never exceeds the configured budget. A request holds one charge, which may only grow while its body is read and is settled once when the read completes, and every charge is released exactly once.
 30. An unconfirmed provisional pin with no remaining holders cannot stay live.
+31. The rolling window is measured over `http.Client.Do` invocation instants, and a pending reservation occupies a slot from the moment it is granted until it is finalized or canceled.
+32. Startup recovery dates a recovered admission no earlier than the latest instant its dispatch could have occurred.
 
 ## 26. Security and privacy
 
@@ -2262,9 +2277,12 @@ Verify:
 - RPM expiry requires no background goroutine.
 - Cooldown expiry is lazy and correct.
 - Double lease release is harmless or detected without underflow.
-- A failed admission commit rolls back the provisional RPM timestamp and in-flight slot.
+- A failed admission commit frees the pending RPM slot and the in-flight slot.
 - No dispatch occurs when admission persistence fails.
 - A committed admission with no terminal row is recovered as a spent slot.
+- A pending reservation holds the sixtieth slot against a concurrent caller for the whole time its admission commit runs.
+- A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so 60 dispatches never fall inside one 60-second interval measured at that boundary.
+- A recovered admission is dated by its reservation instant advanced by the store-operation ceiling, and a restart during a saturated window readmits nothing.
 
 ### 28.6 Concurrency stress tests
 
@@ -2275,7 +2293,7 @@ Assert:
 - At most twelve leases per account at every observation point.
 - No rolling interval exceeds 60 admissions.
 - The fake upstream itself never observes more than twelve live requests for one account key.
-- The fake upstream’s dispatch-start timestamps never contain more than 60 starts for one account in any rolling 60-second interval.
+- The fake upstream’s dispatch-start timestamps never contain more than 60 starts for one account in any rolling 60-second interval, including under a store fake that delays every admission commit close to its ceiling.
 - Requests arriving through different aliases, pinned aliases, sessions, and retries still share those upstream-observed ceilings.
 - Concurrent final-slot claims admit only one caller.
 - No races under `go test -race`.
@@ -2646,7 +2664,7 @@ Two immutable rows per dispatch satisfy append-only logging without updates and 
 
 It matches the configured account ceiling without boundary bursts. A deque is more exact than a token bucket and trivial at 60 timestamps per account.
 
-Exactness still matters after the ceilings were raised, and arguably matters more. The ceiling is now a bound whose correct value is unknown and will be re-derived from the attempt log, and a limiter that admits boundary bursts would make that log measure the limiter’s own imprecision rather than upstream’s behavior.
+Exactness still matters after the ceilings were raised, and arguably matters more. The ceiling is now a bound whose correct value is unknown and will be re-derived from the attempt log, and a limiter that admits boundary bursts would make that log measure the limiter’s own imprecision rather than upstream’s behavior. That is also why the window is anchored at the `Do` invocation rather than at the reservation that precedes it: an anchor that drifts by the store’s commit latency would fold this machine’s filesystem into a measurement of upstream’s tolerance.
 
 ### 29.8 One coordinator mutex
 
@@ -3091,11 +3109,11 @@ The project is complete only when all of the following are true:
 - Every account-acquisition phase ends within 60 seconds.
 - Temporary local capacity exhaustion returns 429 with `Retry-After`.
 - Successful spill updates affinity; failed/partial spill does not.
-- No account exceeds 60 dispatch starts in a rolling minute.
+- No account exceeds 60 dispatch starts in a rolling minute, measured at the `http.Client.Do` boundary rather than at reservation.
 - No account exceeds twelve in-flight attempts.
 - Those ceilings are proven from the fake upstream’s observations, not only coordinator counters.
 - Every actual dispatch has a durable admission row committed before it.
-- Recovery counts admission rows even when the matching terminal metadata is absent.
+- Recovery counts admission rows even when the matching terminal metadata is absent, and dates them no earlier than the latest instant their dispatch could have occurred.
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.

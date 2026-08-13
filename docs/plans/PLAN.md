@@ -2539,6 +2539,7 @@ Cover:
 - TLS permanent error with no retry.
 - Client cancellation during backoff.
 - Deadline during backoff.
+- A retry left with exactly the five-second runway once its backoff and selection time are subtracted is admitted, and one a single monotonic tick short of it is suppressed as `suppressed_deadline`, reaching no `Do` and consuming no RPM slot. The case above cannot fail on this boundary, because it ends the request while the wait is still running: an implementation that dispatches with one second left and expires mid-call passes it and spends a slot on a request certain not to finish.
 - Overall ten-minute logical deadline is never renewed or retried.
 - Retry account preference.
 - Explicit alias retry remains on one account.

@@ -272,8 +272,12 @@ A dedicated lexical top-level JSON scanner must:
 7. Reject malformed syntax and ambiguous route-owned duplicates without panicking.
 8. Track depth with an iterative state machine or an explicitly bounded stack, so input nesting cannot consume the Go call stack.
 9. Retain spans only for the members the proxy reads or replaces. A body with millions of unrelated top-level members must not produce a second body-sized metadata structure.
+10. Compare top-level member names after decoding JSON string escapes, so that `"model"` and `"\u006dodel"` are one member and therefore a duplicate. The rule covers `stream` and the active route-owned injection key equally.
+11. Decode only those short routing names. A decoded copy of `messages`, or of any other opaque value, is forbidden: it would be the second body-sized allocation §7.2 exists to avoid.
 
 The implementation must not unmarshal the request into a map and marshal it again.
+
+Comparing member names as raw bytes is the tempting shortcut, and it reopens the ambiguity §6.5 closes. A body carrying `"model"` and its escaped spelling presents the scanner with two different names, so one is rewritten and the other crosses untouched as an unknown member, while upstream’s own parser decodes both, sees a duplicate, and keeps whichever its implementation prefers. That is routing decided by somebody else’s parser, which is precisely what the duplicate rules exist to prevent.
 
 ### 7.2 Rewrite operation
 
@@ -2290,6 +2294,7 @@ Cover:
 - Missing route-owned field.
 - Duplicate model.
 - Duplicate route-owned injection.
+- Escaped spellings of `model`, `stream`, and the route-owned injection key, alone and alongside their plain spellings.
 - Malformed JSON at every structural position.
 - Trailing garbage.
 - Top-level arrays/scalars.
@@ -2314,6 +2319,7 @@ Fuzz targets must:
 
 - Generate nested objects and arrays.
 - Generate arbitrary valid strings and escapes.
+- Generate escaped spellings of the route-owned member names.
 - Mutate valid bodies into malformed inputs.
 - Generate nesting at, below, and above the depth limit.
 - Seed real multi-turn tool-loop shapes.

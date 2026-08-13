@@ -63,7 +63,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 17. The proxy never injects `stream_options.include_usage`, never alters `stream`, and never changes the response stream to improve observability. Missing usage remains missing.
 18. Every account-acquisition phase ends in either one atomically reserved dispatch or one explicit terminal selection-failure record. It cannot wait indefinitely.
 19. A committed response that later breaks is aborted as a transport failure; the proxy must not make a truncated upstream body look like a cleanly completed HTTP response.
-20. A user-triggered exact `-kN` request may deliberately probe an account disabled by an earlier authentication failure. This is foreground request traffic, not a health check, and only a completely successful response may restore the account.
+20. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
 
 ## 5. Fixed design decisions
 
@@ -88,7 +88,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 | Retry placement | 429 and processing timeouts prefer another account; an initial 5xx/408/transient-network retry prefers the same account to retain cache |
 | Request headers | Fixed end-to-end allowlist; all proxy-internal and hop-by-hop headers are removed |
 | Logging | One synchronous SQLite transaction per terminal routing phase; pending skips and its dispatch/failure are committed together |
-| Disabled-account recovery | A successful exact `-kN` foreground request restores the account; rotated credentials still require restart |
+| Disabled-account recovery | Restart only |
 | Process model | One proxy process |
 | Backend definition | Fixed source catalog |
 | Upstream base | `https://ollama.com/v1` |
@@ -314,7 +314,6 @@ Each variant:
 - Uses the same real account limiter as every other route to that account.
 - Never spills to a different account.
 - Overrides a conflicting session pin for that request.
-- May act as an explicit foreground recovery probe when the named account is disabled.
 - Updates a supplied session pin only after a completely successful response, preserving future cache locality on the explicitly selected account.
 
 Arbitrary `-kN` suffix parsing is not allowed. Only exact generated catalog entries resolve.
@@ -877,7 +876,6 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `pin_account_at_start` | Text, nullable | Session pin before routing |
 | `account_label` | Text, nullable | `k1`, `k2`, or `k3`; null only for terminal selection failure |
 | `attempt_no` | Integer, nullable | 1-based dispatch count; null for skips |
-| `is_forced` | Boolean integer, non-null | Exact `-kN` route selected one account |
 | `is_spill` | Boolean integer, non-null | Dispatch differs from valid initial pin |
 | `spill_from_account` | Text, nullable | Original pin for a spill |
 | `pin_effect` | Text, nullable | Stable final affinity effect of a dispatched attempt |
@@ -913,7 +911,6 @@ The schema contains no body, message, completion, header, key, raw upstream erro
 - `confirmed_initial`
 - `refreshed`
 - `moved_after_spill`
-- `moved_by_forced`
 - `removed_after_auth`
 - `suppressed_stale`
 
@@ -1089,14 +1086,13 @@ For an account candidate:
 1. Read the monotonic clock.
 2. Remove timestamps at or before `now - 60 seconds`.
 3. Expire a completed cooldown.
-4. Reject disabled accounts unless this is an exact forced-account recovery request.
-5. Reject cooling accounts.
-6. Reject if in-flight is already 3.
-7. Reject if 25 timestamps remain.
-8. Otherwise append `now`.
-9. Increment in-flight.
-10. Return an immutable release-once lease.
-11. Unlock.
+4. Reject disabled or cooling accounts.
+5. Reject if in-flight is already 3.
+6. Reject if 25 timestamps remain.
+7. Otherwise append `now`.
+8. Increment in-flight.
+9. Return an immutable release-once lease.
+10. Unlock.
 
 The rate check and both mutations are one critical section. Concurrent goroutines cannot claim the same final slot.
 
@@ -1110,7 +1106,6 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | `Do` transport failure | Yes | Until `Do` returns |
 | Upstream 4xx/5xx | Yes | Until body closes |
 | Retry dispatch | Another slot | Another lease |
-| Forced recovery probe | Yes | Until body closes |
 | Waiting/backoff | No | No |
 | `/v1/models` | No | No |
 | Local pre-routing rejection | No | No |
@@ -1191,11 +1186,9 @@ Shuffle is for fairness, not security. Tests inject deterministic permutations.
 - Only the named account is eligible.
 - It never spills.
 - It waits for temporary rate, in-flight, or cooldown capacity for at most 60 seconds.
-- It may bypass only the disabled-health gate, making the foreground request a deliberate recovery probe.
 - It still respects RPM, in-flight, cooldown, logical-deadline, and retry limits.
 - If no capacity is acquired, it returns local 429 with `Retry-After`.
-- If the account still returns 401/403, it remains disabled.
-- A completely relayed 2xx response clears disabled state and wakes waiters.
+- It fails immediately with local 503 if the account is disabled.
 - On success, it updates the session pin if a session ID was supplied.
 
 ### 18.5 Lease lifecycle
@@ -1273,19 +1266,9 @@ Actions:
 - Do not retry the current logical request.
 - Relay the upstream 401/403 unchanged as the final response.
 - Exclude the account from subsequent base-alias requests.
-- Permit only exact `-kN` foreground requests to bypass disabled state.
+- Explicit aliases targeting it return local 503 on later requests.
 
-Recovery rules:
-
-- A completely successful 2xx exact-account response clears disabled state.
-- A partial stream, client disconnect, transport failure, 3xx, 4xx, 5xx, or retry exhaustion does not clear it.
-- The recovery request counts against the same account RPM and in-flight ceilings.
-- The recovery request is logged with `is_forced = true`.
-- A renewed subscription using the same key can therefore be restored without restart.
-- A rotated/replaced key still requires restart because keys are not hot-reloaded.
-- Restart clears volatile disabled state without making a probe.
-
-This introduces no automatic health traffic. The human’s explicit model choice is the request that tests the repaired account.
+The account remains disabled for the process lifetime. Correcting the key requires restart, which is also how a renewed subscription on an unchanged key is put back into rotation. Nothing inside the process re-tests a disabled account, on a timer or on a request.
 
 ### 20.2 Rate-limit failures
 
@@ -1463,6 +1446,7 @@ Messages are stable and sanitized.
 | Invalid routing envelope | 400 | `invalid_request_error` / `invalid_request` |
 | Unknown alias | 404 | `invalid_request_error` / `model_not_found` |
 | Temporary account-capacity timeout | 429 | `rate_limit_error` / `account_capacity_timeout` |
+| Explicit account disabled | 503 | `server_error` / `account_unavailable` |
 | Every flexible account disabled | 503 | `server_error` / `account_unavailable` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
 | Overall timeout before commit | 504 | `server_error` / `upstream_timeout` |
@@ -1525,12 +1509,10 @@ Visible result: stable base and pinned aliases.
 
 1. Client asks for an exact `-k2` alias.
 2. Only `k2` is considered.
-3. Temporary saturation causes waiting for at most 60 seconds.
-4. If `k2` was disabled, this explicit request is allowed to probe it.
+3. Temporary saturation causes waiting for at most 60 seconds, then local 429 with `Retry-After`.
+4. Disabled `k2` causes local 503.
 5. No spill is permitted.
-6. A still-invalid key returns the unchanged upstream 401/403 and remains disabled.
-7. A fully relayed 2xx restores `k2`.
-8. Successful completion updates any supplied session pin to `k2`.
+6. Successful completion updates any supplied session pin to `k2`.
 
 ### 23.7 Saturated session pin with available alternative
 
@@ -1586,8 +1568,7 @@ Visible result: stable base and pinned aliases.
 4. Current request is not retried.
 5. Upstream response is relayed unchanged.
 6. Later base routes avoid the account.
-7. A later exact-account route may deliberately test it.
-8. Only a completely successful probe restores it.
+7. Later explicit routes to it return local 503.
 
 ### 23.12 Malformed or unsupported request parameter
 
@@ -1678,6 +1659,7 @@ No startup failure triggers an upstream request.
 | Pinned account with known reopening after grace | Spill scan immediately |
 | Pinned account blocked only by in-flight work | Wait at most five seconds, then spill scan |
 | Explicit account saturated | Wait only for that account, at most 60 seconds |
+| Explicit account disabled | Immediate local 503 |
 | All flexible accounts saturated | Wait for any account, at most 60 seconds, then local 429 |
 | All flexible accounts disabled | Immediate local 503 |
 | Deadline during wait | Local 429 if capacity was temporary; otherwise cancellation/timeout |
@@ -1765,11 +1747,11 @@ The implementation must document and test these invariants:
 19. Observer errors cannot affect response relay.
 20. Client cancellation propagates through waiting, backoff, upstream I/O, and database calls where applicable.
 21. Every selection phase is bounded by 60 seconds and records one terminal dispatch or selection failure.
-22. A forced recovery request bypasses only disabled health state, never rate or concurrency admission.
-23. The first same-session request cannot split its provisional pin across accounts under concurrent arrival.
-24. No response header reaches the downstream writer until the final-response state machine commits.
-25. A post-commit upstream read failure cannot return normally through the HTTP handler.
-26. Pending skip facts are bounded by the fixed account/reason vocabulary and cannot form an unbounded per-request queue.
+22. The first same-session request cannot split its provisional pin across accounts under concurrent arrival.
+23. No response header reaches the downstream writer until the final-response state machine commits.
+24. A post-commit upstream read failure cannot return normally through the HTTP handler.
+25. Pending skip facts are bounded by the fixed account/reason vocabulary and cannot form an unbounded per-request queue.
+26. No admission path grants an account an exception to disabled health state.
 
 ## 26. Security and privacy
 
@@ -2020,7 +2002,6 @@ Assert:
 - Notification replacement does not lose wakeups.
 - New concurrent session requests select one initial account.
 - Concurrent pin updates honor arrival sequence.
-- A forced recovery request cannot bypass RPM or in-flight admission.
 - No goroutine leaks.
 
 ### 28.7 Saturation/spill tests
@@ -2058,13 +2039,8 @@ Verify:
 - Pins to disabled account are removed.
 - Current auth failure is not retried.
 - Subsequent base requests skip disabled account.
-- Exact forced route reaches a disabled account.
-- Forced route still observes RPM, in-flight, cooldown, and deadline limits.
-- Forced 401/403 leaves the account disabled.
-- Forced transport/3xx/4xx/5xx/partial-stream outcomes leave it disabled.
-- Completely relayed forced 2xx restores it and wakes waiters.
-- Successful forced request with a session moves that session’s pin.
-- Rotated key remains unavailable until process restart loads the new environment.
+- Explicit route fails locally.
+- No code path re-enables a disabled account within one process lifetime.
 - One or two 429 responses do not enter cooldown.
 - Third 429 in 60 seconds enters cooldown.
 - Old 429 timestamps expire.
@@ -2367,7 +2343,7 @@ This can expose a transport-level truncated response rather than transparently r
 
 ### 29.13 In-memory health state
 
-Credential disablement and cooldown are process-local. A valid exact-account foreground request can restore a renewed subscription using the same key; key rotation still requires restart. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
+Credential disablement and cooldown are process-local, and restart is the entire recovery mechanism for both a rotated key and a renewed subscription on an unchanged key. A faster path was considered and rejected: letting an explicit account alias re-test a disabled account would buy back a restart that already costs one command on this machine, and would charge for it the only exception to the rule that a disabled account stays disabled, placed inside the admission path. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
 
 ### 29.14 Stable model list despite health
 
@@ -2393,15 +2369,11 @@ Waiting for all capacity until the full ten-minute logical deadline would conver
 
 Delaying downstream headers until one upstream body chunk is successfully read does not delay the first visible token, because the client could not consume a body before that chunk existed, and it preserves the ability to retry an upstream that closes immediately after headers.
 
-### 29.20 Explicit forced-account recovery
-
-An exact `-kN` request is already an explicit account instruction. Allowing it to test a disabled account provides a human-driven recovery path without a new endpoint, a timer, or a health probe. Only complete 2xx success restores rotation, limiting false recovery.
-
-### 29.21 Ambiguous-send duplication
+### 29.20 Ambiguous-send duplication
 
 Retrying a connection that failed after send may duplicate upstream generation. The proxy accepts duplicate flat-rate computation because it executes no tool side effects itself and because every dispatch remains independently limited and logged.
 
-### 29.22 Same-account first retry for isolated server failures
+### 29.21 Same-account first retry for isolated server failures
 
 An isolated 5xx/408/transient connection failure does not prove the account is unusable. Preferring it once preserves prompt cache; a repeated failure then prefers another account. Rate limits and processing timeouts still move away immediately because they are stronger account-specific signals.
 
@@ -2443,7 +2415,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request.
-- Authentication failures and subsequent forced recovery.
+- Authentication failures and the account disablement they caused.
 - Attempt and logical-request latency distributions.
 - TTFT distributions for streaming calls.
 - Prompt, completion, and total token sums with nulls kept distinct from zeros.
@@ -2465,14 +2437,14 @@ No built-in query, README recipe, or report computes currency cost.
 
 ### 30.5 Disabled-account recovery
 
-When a subscription using the same credential is renewed:
+An upstream 401 or 403 disables an account for the rest of the process lifetime, and nothing inside the process puts it back:
 
-1. Send a valid, sessionless request to one exact alias for that account.
-2. Confirm the attempt received a complete 2xx response.
-3. Verify that the attempt row records forced selection and successful restoration.
+1. Confirm from the attempt log which account was disabled and when.
+2. If the credential itself changed, update the owner-only environment file.
+3. Restart the service.
 4. Confirm a later flexible request can use the account.
 
-When the credential itself changes, update the owner-only environment file and restart. Do not add reload or probe machinery.
+Restart is the whole procedure, for a rotated key and for a renewed subscription on an unchanged key alike. Do not add reload or probe machinery.
 
 ### 30.6 Pre-cutover acceptance against real upstream
 
@@ -2597,7 +2569,6 @@ Deliver:
 - Shuffle selection.
 - Reopen-aware bounded wait and spill behavior.
 - Sixty-second acquisition ceiling and `Retry-After`.
-- Forced-account recovery admission.
 - Health transitions.
 - Startup state loading.
 
@@ -2691,7 +2662,6 @@ Run representative requests for:
 - Base aliases.
 - All account-pinned variants.
 - Saturation and spill.
-- Disabled-account forced recovery.
 - Retryable and non-retryable failures.
 
 Inspect SQLite to prove:
@@ -2734,8 +2704,7 @@ The project is complete only when all of the following are true:
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.
-- Upstream authentication disables an account on its first failure.
-- A completely successful exact-account foreground request can restore a renewed account without a background probe.
+- Upstream authentication disables an account on its first failure and nothing but restart re-enables it.
 - Repeated 429 responses cause bounded cooldown.
 - No background health or model probes exist.
 - Each dispatch has exactly one append-only terminal row when its transaction succeeds.

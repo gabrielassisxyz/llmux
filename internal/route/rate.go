@@ -10,12 +10,24 @@ import (
 // reservations have not already reached the per-account ceiling, reserves
 // a pending slot and returns true.
 //
-// This checks the rate window only. It does not touch in-flight, health,
-// or the post-start dispatch blackout; a caller composes those separately
-// before treating an account as admitted.
+// Every account is refused unconditionally for one full rolling window
+// after process start, measured on the monotonic clock from its own zero
+// point. A restarted process reads no rate state from the store, so this
+// is the only thing standing between it and exceeding the ceiling it
+// claims to enforce: every dispatch of the previous process precedes that
+// process's death, every dispatch of this one follows this one's start by
+// a full window, and no 60-second interval can contain both.
+//
+// This checks the rate window and the blackout only. It does not touch
+// in-flight or health; a caller composes those separately before treating
+// an account as admitted.
 func (c *Coordinator) ReserveRateSlot(account catalog.Account) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.clk.MonotonicNow() < policy.PostStartDispatchBlackout {
+		return false
+	}
 
 	state := &c.accounts[accountIndex(account)]
 	c.pruneRateWindowLocked(state)

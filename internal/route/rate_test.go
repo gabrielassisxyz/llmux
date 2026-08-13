@@ -11,9 +11,16 @@ import (
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
+// newRateTestCoordinator returns a coordinator with its fake clock already
+// advanced past the post-start dispatch blackout, so tests about the rate
+// window itself are not incidentally also testing the blackout. Blackout
+// behavior has its own dedicated tests in blackout_test.go, constructed
+// with a clock still at its zero point.
 func newRateTestCoordinator() (*Coordinator, *testsupport.FakeClock) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	return NewCoordinator(testKeys(), fake), fake
+	c := NewCoordinator(testKeys(), fake)
+	fake.AdvanceMonotonic(policy.PostStartDispatchBlackout)
+	return c, fake
 }
 
 // reserveAndFinalize is the two-phase sequence a real caller performs:

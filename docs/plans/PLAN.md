@@ -262,7 +262,7 @@ The fixed session header is `X-Session-ID`.
 - It is not forwarded upstream.
 - It is reduced to `HMAC-SHA-256(LLMUX_AFFINITY_HMAC_KEY, sessionID)`, and only that versioned digest, named `session_key`, exists in memory or in SQLite.
 - Affinity is keyed only by `session_key`, not by alias or model.
-- A value over 256 bytes returns local 400.
+- A value over 256 bytes returns local 400. That rejection and the several-fields rejection above both carry the `invalid_session_header` code of §22, and both are members of `unrouted_request` by §15.3, so the row §15.8 constrains to §22's vocabulary has a value to hold. Neither is an invalid routing envelope: that code names the routing fields of the body, and these two are header rejections that happen before a body is read.
 
 Affinity needs stable equality, not the caller’s string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess. The claim is about what the proxy retains, not about what the process can touch: the inbound `http.Request` necessarily holds the raw header until the handler returns, and what the rule forbids is making a second copy of it, carrying it past validation, or writing it anywhere at all.
 
@@ -1316,6 +1316,7 @@ The schema enforces:
 Create indexes for:
 
 - `dispatch_admission(account_label, reserved_at_us)`, which is the offline admission-pressure query of §30.3.
+- `attempt_log(attempt_id)`, which is the other half of that same §30.3 bullet. The admissions-no-terminal-row figure joins this column against the primary key `dispatch_admission` already carries on `attempt_id`, and the child side is a nullable column with no index of its own, so the join degrades to a scan of the table this document expects to grow for months while the sibling figure beside it in the same bullet is indexed. It is declared here rather than left to a later migration because §15.10 forbids updating the schema in place, which makes an index that ships with the initial migration free and the same index discovered afterwards a migration of its own.
 - `attempt_log(event_at_us)`.
 - `attempt_log(account_label, event_at_us)`.
 - `(logical_request_id, sequence_no)`.
@@ -1856,6 +1857,7 @@ Messages are stable and sanitized.
 | Unsupported method | 405 | `invalid_request_error` / `method_not_allowed` |
 | Unknown path | 404 | `invalid_request_error` / `not_found` |
 | Non-empty query string | 400 | `invalid_request_error` / `query_not_supported` |
+| Invalid session header | 400 | `invalid_request_error` / `invalid_session_header` |
 | Body too large | 413 | `invalid_request_error` / `request_too_large` |
 | Compressed body | 415 | `invalid_request_error` / `unsupported_content_encoding` |
 | Invalid routing envelope | 400 | `invalid_request_error` / `invalid_request` |

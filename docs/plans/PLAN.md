@@ -602,7 +602,6 @@ Copy only this fixed end-to-end request-header allowlist when present:
 - `Accept`
 - `Accept-Encoding`
 - `User-Agent`
-- `Idempotency-Key`
 
 Set or derive:
 
@@ -621,7 +620,14 @@ Never forward:
 - `Content-Encoding`, because compressed request bodies are rejected before rewrite.
 - `Connection`, `Keep-Alive`, `Transfer-Encoding`, upgrade headers, or any header named by `Connection`.
 
-The narrow allowlist is deliberate. The fixed consumers need body compatibility, not an arbitrary-header tunnel, and it prevents accidental credential or machine-metadata leakage. The proxy does not invent an idempotency key, but preserves one supplied by the client. A header outside the allowlist is dropped silently; the allowlist is the contract, so a consumer that starts depending on a new header changes this list rather than discovering the loss at runtime.
+The narrow allowlist is deliberate. The fixed consumers need body compatibility, not an arbitrary-header tunnel, and it prevents accidental credential or machine-metadata leakage.
+
+A drop is never silent. Each attempt records the count of request headers the allowlist removed, and a debug-level structured event names them:
+
+- Only header names are emitted, never values, because a value is where a cookie or a credential lives.
+- Names are emitted to the process log, never to the attempt store, whose schema has no header column.
+- The count alone is enough to notice that a consumer began sending something; the names are what identify it.
+- A consumer that turns out to need a dropped header changes this list, which is a deliberate edit, rather than discovering the loss as unexplained upstream behavior.
 
 The incoming raw query string is preserved.
 
@@ -899,6 +905,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `limiter_in_flight` | Integer, nullable | Per-account post-reservation or skip snapshot |
 | `skip_reason` | Text, nullable | Local selection reason |
 | `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
+| `dropped_header_count` | Integer, nullable | Request headers removed by the allowlist; null for skips |
 
 The schema contains no body, message, completion, header, key, raw upstream error, upstream ID, cost, price, or currency column.
 
@@ -950,6 +957,7 @@ The schema enforces:
 - `attempt_no` required only for dispatch records.
 - `skip_reason` required only for skip records.
 - `skip_observation_count >= 1` only for skip records.
+- `dropped_header_count` non-negative, and present only for dispatch records.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
 - Non-negative durations.
@@ -1410,7 +1418,7 @@ The proxy accepts this tradeoff because:
 - Availability after an ambiguous transport failure is more valuable than avoiding duplicate flat-rate upstream computation.
 - Every dispatch is independently rate-accounted and logged.
 
-The proxy does not invent or inject an idempotency key. If the client supplies `Idempotency-Key`, it is forwarded unchanged; upstream decides whether it has meaning.
+The proxy neither invents nor forwards an idempotency key. One supplied by a client is dropped like any other header outside the allowlist, and is recorded as a drop. Nothing in the fixed consumer set sends one, so carrying it would be a forwarding rule written for a caller that does not exist.
 
 ## 22. Proxy-generated errors
 
@@ -1792,6 +1800,7 @@ Process logs may contain:
 - Status code.
 - Duration.
 - Retry decision.
+- Names of request headers removed by the allowlist.
 
 They must not contain:
 
@@ -1801,7 +1810,7 @@ They must not contain:
 - Authorization headers.
 - Account keys.
 - Raw upstream error bodies.
-- Complete arbitrary headers.
+- Any request or response header value, including those of headers named in a drop event.
 - Session IDs in stderr by default.
 - Upstream-generated IDs.
 - Currency or cost.
@@ -1835,6 +1844,7 @@ Events include:
 - Fatal configuration/database/listener errors.
 - Account disabled.
 - Account cooldown entered/expired.
+- Request headers removed by the allowlist, at debug level, by name only.
 - Runtime attempt-log insert failure.
 - Recovered handler panic.
 - Forced shutdown.
@@ -2065,7 +2075,7 @@ Cover:
 - Intermediate response bodies are boundedly drained and closed.
 - Final exhausted upstream body is relayed unchanged.
 - An ambiguous transport failure followed by retry creates two independently rate-accounted attempt rows.
-- A client-supplied idempotency header crosses unchanged; the proxy never invents one.
+- A client-supplied idempotency header is dropped and counted like any other unlisted header, and the proxy never invents one.
 
 ### 28.10 HTTP handler tests
 
@@ -2081,6 +2091,7 @@ Verify:
 - Account authorization does reach upstream.
 - Each allowlisted end-to-end header is preserved.
 - Cookies, forwarding headers, trace headers, and arbitrary custom headers are stripped.
+- A stripped header is counted on its attempt row and named in a debug event, and its value appears nowhere.
 - Hop-by-hop headers are stripped.
 - Raw query string is preserved.
 - Redirects are not followed.
@@ -2195,6 +2206,7 @@ After requests:
 - Assert account keys and proxy key do not exist.
 - Assert token counts and allowed metadata do exist.
 - Assert stripped header markers never reach the upstream.
+- Assert a dropped header's name may appear in a debug event while its marker value appears in no log and no database file.
 - Assert JSON parse errors and panic logs contain positions/classifiers but not nearby body excerpts.
 
 No test may create temporary prompt spool files.
@@ -2407,6 +2419,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Prompt, completion, and total token sums with nulls kept distinct from zeros.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
+- Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Sessionless calls in the expected `eod` execution window.
 
 No built-in query, README recipe, or report computes currency cost.

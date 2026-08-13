@@ -975,6 +975,14 @@ The decoder exists because without it the evidence the whole of §30 rests on ca
 
 Forcing `Accept-Encoding: identity` upstream and dropping the header from the request allowlist would delete the decoder, its bridge, and the decompression-bomb path in one move, and it remains rejected. It alters what the client asked for so that the proxy can read the answer more easily, which §30.7 states as a general principle in the other direction: the proxy will not alter a request or a response to improve its own observability, and what the callers send is therefore what decides what the log can hold. It also spends real bandwidth on every completion, permanently, to solve something on the observer’s side of the process. What it removes is conditional, since the decoder ships only if the Phase 0 gate finds upstream selecting a compressed encoding at all, so the trade is a bounded buffer and one lifecycle against a stated principle and a standing cost.
 
+### 14.4 Upstream rate-limit headers
+
+§9.2 concedes that the local ceilings cannot be measured from below: the guard prevents exactly the dispatches that would locate the wall, so the evidence about it runs in one direction only. Numeric rate-limit response headers are the one exception upstream can offer, because they arrive on successes rather than on refusals, and an observed remaining-quota floor across a week is the measured distance between the guard and the wall, which is the direction 429 silence never bounds.
+
+Whether they exist is a question about upstream and not a design choice, so it is settled where the other such questions are. If the Phase 0 gate records upstream sending a stable numeric family of them, a migration adds two nullable integer columns to the terminal attempt row and Phase 5 fills them by parsing the exact header names Phase 0 recorded, never a body, leaving them null whenever a header is absent or does not parse. Nothing routes, throttles, retries, or waits on them; their only reader is the weekly re-derivation of §30.10, which today reads silence as evidence of nothing. If Phase 0 finds no such headers, nothing ships and the schema gains nothing, which is the same conditional the observation decoder above already carries.
+
+The columns are not declared in §15.5 ahead of that answer. A conditional behavior is cheap to describe and a conditional column is not, because the schema is the thing §15.10 forbids updating and a migration is the sanctioned way to add to it; the condition is recorded there instead, in the form that section already uses for a column it has declined.
+
 ## 15. Durable data model
 
 ### 15.1 Store choice
@@ -1174,6 +1182,8 @@ The schema carries no field that exists only to explain the proxy to itself. A p
 `usage_observation` is the exception that proves the rule above rather than a breach of it, and it earns its place on the test `upstream_retry_after_s` passed: a named reader on the day it is written. A null token count means any of upstream sending no usage object, a streaming client never asking for one, a response encoding the observer could not decode, a line past the observer’s cap, or a truncated stream, and today nothing separates them. §30.3 tells the operator to notice a run of nulls and then go and work out which, and §30.10 re-derives the per-account ceilings from a signal that can quietly fall to zero for one of those reasons without anything reporting it. Seven closed values with a single writer replace a heuristic that whoever reads the runbook next has to re-derive.
 
 A validated consumer label, supplied by the caller in a fixed header, was considered on the same rule and rejected by it. It would be evidence rather than tenancy, since nothing would authenticate, route, or throttle on it, and a closed lowercase vocabulary rejected on mismatch would not reopen the question §6.6 settles for session identifiers. What it lacks is a reader the existing columns cannot serve. With three consumers, one of which is the only sessionless caller, `session_key`, `requested_alias`, and `request_streaming` already separate them, and the header would have to be added to all three callers as one more cutover precondition to buy that. It earns its cost at a fourth consumer, or at a second sessionless one, which is the point at which the attribution in §30.3 stops working; adding the column then is a migration, and a migration is the direction this schema treats as cheap.
+
+The rate-limit projection of §14.4 is recorded here on the same terms, read forward rather than backward. Its reader exists today in §30.10 and the fact it would hold is one no other column can produce, since nothing else in this store can bound the local ceiling from below. What is not established is that upstream sends the headers at all, and that is what the Phase 0 gate answers. So the condition is written down and the columns are not: if the gate finds a stable numeric header family, a migration adds `upstream_rl_limit` and `upstream_rl_remaining` as nullable integers before Phase 5 fills them, and if it does not, nothing was carried for a fact that never arrives.
 
 ### 15.6 Outcome vocabulary
 
@@ -3040,7 +3050,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on the 429 rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants; the same column on a 5xx row belongs to a different question and is filtered out here.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. Where §14.4 shipped, the lowest remaining quota observed across the week bounds it from below, which is the direction 429 silence never could, and the re-derivation stops being one-sided. The retry delays stored on the 429 rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants; the same column on a 5xx row belongs to a different question and is filtered out here.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
@@ -3062,6 +3072,7 @@ Deliver:
 - A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed. Record what the compatibility page says on the day as context, never as the answer.
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
 - Which `Content-Encoding` upstream selects when sent each consumer’s real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
+- Whether upstream responses carry numeric rate-limit headers, recorded by exact header name and per account. This decides whether the bounded projection of §14.4 ships in Phase 5, and it costs one look at headers the inventory requests are already receiving.
 
 Gate:
 
@@ -3164,6 +3175,7 @@ Deliver:
 - Intermediate response drain.
 - Final response commitment rules.
 - Ambiguous-send accounting.
+- The bounded rate-limit header projection of §14.4, if Phase 0 recorded upstream sending one.
 
 Gate:
 

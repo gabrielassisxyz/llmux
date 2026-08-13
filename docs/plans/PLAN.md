@@ -669,7 +669,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - For non-streaming 2xx, buffer up to 8 MiB before commitment; complete small bodies in memory and transition larger bodies to progressive relay.
     - Commit status and headers exactly once.
     - Relay the exact staged and subsequent response bytes.
-    - Observe usage and TTFT without retaining content.
+    - Observe usage and time to first event without retaining content.
     - Close the response.
     - Release the account lease.
     - Update health and session state.
@@ -753,7 +753,14 @@ Application-level “unchanged” means unchanged status, end-to-end headers, an
 
 ### 13.4 Streaming
 
-Streaming is recognized primarily from upstream `Content-Type: text/event-stream`. The raw request’s top-level `stream` value is also observed when it is exactly `true`, but is never validated.
+Streaming relay is selected when either of these holds:
+
+- The unique raw top-level request `stream` value is exactly `true`.
+- The upstream media type parses as `text/event-stream`.
+
+Recognizing it from the upstream content type alone was one signal short. A request that asked for a stream and came back labelled something else would be buffered toward the 8 MiB precommit bound, so the client's first token would arrive when the generation finished rather than when it started, and nothing would report why. The request's own `stream` value is still never validated and never altered; it selects relay behavior and nothing more.
+
+A disagreement between the two signals is emitted as a debug-level process event, by classification only and with no content, in the same shape as the dropped-header event. It never changes a single response byte.
 
 For SSE:
 
@@ -834,14 +841,14 @@ A downstream write error means the client is already gone. In that case, cancel 
 - `ReadTimeout` is two minutes and bounds receipt of the complete request body. `ReadHeaderTimeout` bounds only the headers, so without it a client that trickles a body holds a handler and its buffered body for as long as it likes: neither the logical context nor client cancellation interrupts a body read, because a slow client has not disconnected.
 - A downstream write deadline is armed immediately before each write or flush and cleared as soon as that call returns. It bounds the write, never the wait for upstream, so a model that produces nothing for five minutes is untouched by it while a consumer that has stopped reading is not.
 
-## 14. Time-to-first-token and token observation
+## 14. First-event and token observation
 
-### 14.1 TTFT definition
+### 14.1 First-event definition
 
-For successful SSE responses, `time_to_first_token` is operationally defined as:
+For successful uncompressed SSE responses, `time_to_first_event` is operationally defined as:
 
 - Dispatch reservation immediately before `http.Client.Do`, through
-- Recognition of the first non-empty SSE `data:` frame other than `[DONE]`.
+- Recognition of the first complete non-empty SSE `data:` event other than `[DONE]`.
 
 This definition excludes:
 
@@ -850,9 +857,11 @@ This definition excludes:
 - SSE comments.
 - `[DONE]`.
 
-It does not retain the frame’s content.
+It does not retain the event’s content.
 
-For non-streaming responses, TTFT is `NULL` because the proxy cannot observe when the upstream generated its first token. Total attempt duration remains available.
+It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token's name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
+
+For non-streaming responses, and for any response whose content encoding puts the stream out of semantic reach, `time_to_first_event` is `NULL`. Total attempt duration remains available.
 
 ### 14.2 Token counts
 
@@ -870,6 +879,7 @@ Rules:
 - Never sum retry attempts.
 - Missing or malformed values remain `NULL`.
 - If several complete usage objects appear, the last complete one wins.
+- Only a top-level response `usage` object is read. A string or a nested application value that happens to be named `usage` is ignored.
 - Partial usage data is not persisted as if complete.
 - A disconnect or truncated stream generally leaves counts `NULL`.
 - The proxy never modifies the request to force usage reporting.
@@ -882,6 +892,7 @@ The observer must not retain unbounded response text.
 - A complete non-streaming body within the 8 MiB precommit bound is parsed from that already-required buffer using a narrow usage projection, then discarded.
 - A larger non-streaming body is observed incrementally after transition to progressive relay.
 - SSE frames are observed incrementally while the original bytes are relayed.
+- Semantic observation is disabled entirely for a non-identity content encoding, unless a separate bounded decoder is deliberately implemented. Automatic decompression is off so that bytes relay unchanged, which also means the observer would otherwise be parsing compressed bytes as if they were JSON. Exact relay continues either way, and both token counts and first-event timing are `NULL`.
 - Under progressive relay, whether SSE or oversized non-streaming, the observer consumes chunks after or alongside successful downstream writes, so observation can never delay or reorder relay.
 - JSON strings and unrelated values are skipped rather than copied into a second response-sized structure.
 - SSE parsing keeps at most a 1 MiB line buffer.
@@ -1008,7 +1019,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `selection_wait_us` | Integer, nullable | Phase start through lease acquisition/failure; null for individual skips |
 | `attempt_duration_us` | Integer, nullable | Monotonic dispatch duration |
 | `logical_elapsed_us` | Integer, non-null | Handler start through this row |
-| `time_to_first_token_us` | Integer, nullable | Streaming TTFT |
+| `time_to_first_event_us` | Integer, nullable | Time to the first complete non-empty SSE data event |
 | `outcome` | Text, non-null | Stable terminal outcome |
 | `upstream_status_code` | Integer, nullable | Upstream HTTP status |
 | `error_class` | Text, nullable | Stable low-cardinality classifier |
@@ -1645,7 +1656,7 @@ Visible result: stable base and pinned aliases.
 2. Account selection and provisional pin creation are atomic.
 3. Request is dispatched to that account.
 4. SSE bytes are relayed and flushed.
-5. TTFT is observed at the first non-empty data frame.
+5. Time to the first complete non-empty data event is observed.
 6. On full 2xx completion, the pin is confirmed for one hour.
 7. The attempt is appended with account and session.
 
@@ -2319,10 +2330,13 @@ Test:
 - EOF before the first body byte remains uncommitted and retries when eligible.
 - Read error before the first body byte remains uncommitted and retries.
 - The first non-empty chunk is relayed exactly after commitment.
-- First-event TTFT.
+- First-event timing at the first complete non-empty data event.
 - Final usage extraction.
 - No usage.
 - Malformed usage.
+- A nested value named `usage` that is not the top-level object.
+- A request marked `"stream": true` whose upstream content type says otherwise still relays progressively.
+- A compressed response relays byte-identically with observation disabled and null counts.
 - No proxy-injected `stream_options`.
 - No retry after first committed byte.
 - Post-commit upstream read failure produces a raw-client transport error rather than a clean completed response.
@@ -2634,8 +2648,8 @@ The README must provide SQLite query recipes, described and tested against the a
 - Retry chains grouped by logical request.
 - Authentication failures and the account disablement they caused.
 - Attempt and logical-request latency distributions.
-- TTFT distributions for streaming calls.
-- Prompt, completion, and total token sums with nulls kept distinct from zeros.
+- First-data-event distributions for streaming calls.
+- Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began requesting a compressed response, which disables observation by design.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
@@ -2678,7 +2692,7 @@ These checks are deliberately manual because they consume real account quota:
 7. Run one `eod` dry run without a session file.
 8. Exercise one controlled spill scenario.
 9. Exercise one retryable error against a test upstream, not by intentionally wasting real upstream requests.
-10. Inspect SQLite for account, spill, retry, skip, latency, TTFT, and token facts.
+10. Inspect SQLite for account, spill, retry, skip, latency, first-event, and token facts.
 11. Run the privacy-marker inspection against the database, WAL, and process logs.
 
 Record pass/fail and timestamps for each check without copying prompts, completions, keys, or raw upstream error bodies. The durable acceptance evidence is the attempt store itself, which holds one row per upstream attempt from the first real request onward; a parallel handwritten record competes with it and loses.
@@ -2863,7 +2877,7 @@ Deliver:
 - SSE flushing.
 - Client cancellation.
 - Committed-response abort handling.
-- TTFT observation.
+- First-data-event observation.
 - Selective token extraction.
 - Exact final response preservation.
 
@@ -2927,7 +2941,7 @@ Inspect SQLite to prove:
 - Retries and skip reasons are reconstructable.
 - Terminal capacity failures are explicit.
 - Session pin moves are reconstructable from spill source and serving account.
-- Latency and TTFT are present where observable.
+- Latency and first-event timing are present where observable.
 - Token counts are present only when upstream reports them.
 - No prompt/completion text or cost exists.
 

@@ -111,10 +111,11 @@ The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s offic
 ### 6.1 Listen address
 
 - Default: `127.0.0.1:4000`.
-- `LLMUX_LISTEN_ADDR` may change the loopback address or the port.
-- A wildcard address, a hostname that resolves outside loopback, or any non-loopback IP is a fatal configuration error. Remote exposure belongs behind a separately configured reverse proxy that terminates TLS and authenticates, not behind a flag on this process.
+- `LLMUX_LISTEN_ADDR` may change the literal loopback address or the port.
+- Only an IPv4 loopback literal or `::1` is accepted. A hostname, a wildcard, the unspecified address, and any non-loopback IP are fatal configuration errors. Remote exposure belongs behind a separately configured reverse proxy that terminates TLS and authenticates, not behind a flag on this process.
+- Accepting a hostname would turn the loopback rule into a question about name resolution. What a name resolves to at startup is not what it resolves to later, and a name with several records is a choice of address the operator never made. A literal is checkable without asking anything, which is what lets §26.4 claim the binding is loopback rather than that it was loopback at the moment somebody looked.
 - TLS is not added because all specified consumers are local, which is the same decision as the rule above rather than a second one: a shared bearer key in cleartext on a wildcard bind is the failure that rule prevents.
-- The local server speaks HTTP/1.x only. Cleartext HTTP/2 requires prior knowledge that none of the three consumers use, and restricting it makes the committed-response abort semantics one path instead of two, the second of which could never be exercised here.
+- The local server speaks HTTP/1.x only, configured explicitly through `http.Server.Protocols` rather than left to whatever a given Go release defaults to. Cleartext HTTP/2 requires prior knowledge that none of the three consumers use, and restricting it makes the committed-response abort semantics one path instead of two, the second of which could never be exercised here. The upstream transport already names its protocols explicitly, and this is the same rule applied to the side that faces the consumers.
 - No CORS behavior is added.
 
 ### 6.2 Routes
@@ -233,6 +234,7 @@ The fixed session header is `X-Session-ID`.
 
 - Missing or empty means no affinity.
 - A non-empty value is an opaque, case-sensitive session identifier of at most 256 bytes.
+- Exactly one `X-Session-ID` header field is accepted. Several fields is a local 400, which is the answer §6.3 already gives to several `Authorization` fields and for the same reason: taking the first would make a conversation’s affinity depend on an implementation’s choice among values the client sent.
 - It is not interpreted or rewritten.
 - It is not forwarded upstream.
 - It is reduced to `HMAC-SHA-256(LLMUX_AFFINITY_HMAC_KEY, sessionID)`, and only that versioned digest, named `session_key`, exists in memory or in SQLite.
@@ -739,6 +741,8 @@ Set or derive:
 - `Authorization: Bearer <selected account key>`.
 - Correct `Content-Length` for the replayed segments.
 - The fixed upstream host and chat-completions path.
+- An explicitly empty `User-Agent` when the client sent none. `net/http.Transport` otherwise synthesizes its own default, so the narrow allowlist would be leaking this process’s runtime to upstream through a header the client never set.
+- No `GetBody` on the outbound request, and no idempotency header. Either would let the transport transparently replay this POST, and a replay it performed would be an upstream dispatch with no admission row and no RPM slot, breaking invariants 10 and 11 underneath every layer that does the accounting.
 
 Never forward:
 
@@ -786,6 +790,7 @@ For the final upstream response:
 - Relay exact body bytes.
 - Preserve compression when explicitly used.
 - Preserve application trailers when supported, declaring the allowed trailer names before commitment and filling their values only after upstream EOF.
+- Validate the declared trailer names against the same framing, connection, routing, cookie, authentication, and proxy-owned rules as ordinary response headers, and treat an invalid declaration as an invalid upstream response before commitment. Otherwise the trailer field is a channel around every header rule above it, and the declaration arrives before commitment precisely so that the judgement is still available.
 - Do not parse or rewrite completion JSON or SSE events.
 - Forward upstream-generated IDs but do not store them.
 - Replace any upstream `X-LLMux-Request-ID` with the proxy logical request ID.
@@ -885,6 +890,7 @@ A downstream write error means the client is already gone. In that case, cancel 
 - Client cancellation wins immediately. HTTP exposes no caller-side deadline other than a cancellation that actually reaches the server, so there is nothing else to honour.
 - Dial and TLS-handshake timeouts can fail early enough to permit retry.
 - Expiry of the overall logical deadline is terminal and is never itself retried.
+- The two deadlines are not interchangeable and do not produce the same answer. The 60-second acquisition ceiling answers local 429 with `Retry-After`, because capacity is expected to return and the caller is being told when to come back. The ten-minute logical deadline answers local 504 before commitment, because the request itself expired. Client cancellation produces no response at all.
 - There is no separate two-minute stream-stall timeout. A reasoning model may legitimately remain silent, and the ten-minute logical deadline already bounds the resource. Adding a shorter idle timer would turn valid slow generations into false failures.
 - The server’s absolute `WriteTimeout` remains disabled because it is incompatible with valid long-lived streams.
 - `ReadTimeout` is two minutes and bounds receipt of the complete request body. `ReadHeaderTimeout` bounds only the headers, so without it a client that trickles a body holds a handler and its buffered body for as long as it likes: neither the logical context nor client cancellation interrupts a body read, because a slow client has not disconnected.
@@ -2008,7 +2014,8 @@ No startup failure triggers an upstream request.
 | Explicit account disabled | Immediate local 503 |
 | All flexible accounts saturated | Wait for any account, at most 60 seconds, then local 429 |
 | All flexible accounts disabled | Immediate local 503 |
-| Deadline during wait | Local 429 if capacity was temporary; otherwise cancellation/timeout |
+| Sixty-second acquisition ceiling reached during wait | Local 429 with `Retry-After`, because the capacity is expected back |
+| Ten-minute logical deadline reached during wait | Local 504, because the request ran out of time rather than the window |
 | Client cancellation during wait | Append the phase’s deduplicated skips and one terminal selection-failure row with outcome `client_canceled`; write no response |
 
 ### 24.4 Network and upstream failures
@@ -2500,6 +2507,10 @@ Verify:
 - A stripped header is counted on its attempt row and named in a debug event, and its value appears nowhere.
 - Hop-by-hop headers and the response state/routing strip list are removed.
 - Query strings are rejected locally.
+- A client that sends no `User-Agent` produces no synthesized default upstream.
+- Several `X-Session-ID` fields are rejected locally.
+- One dispatch cannot be transparently replayed by the transport.
+- A hostname, a wildcard, and a non-loopback literal each fail startup.
 - An upstream 3xx, 101, or `Alt-Svc` can redirect neither the proxy nor the client, and neither credential follows one.
 - Environment `HTTPS_PROXY` and `ALL_PROXY` do not affect upstream routing.
 - Upstream response headers past the configured bound fail the attempt before commitment.

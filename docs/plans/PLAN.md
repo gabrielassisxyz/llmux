@@ -540,7 +540,7 @@ Use manual constructor injection.
   - Append-only transaction writer
 - The composition root alone knows every concrete dependency.
 
-The clock abstraction must cover both `Now` and cancellable timer creation. Tests must not combine a fake `Now` with real timers, because that creates impossible scheduler states. Go 1.26 `testing/synctest` should be used where exercising the real timer/context machinery is clearer than a fully injected clock.
+The clock abstraction must cover UTC wall time, monotonic time and cancellable timer creation, and it must expose the two clocks as separate reads a test can advance independently. Every clock rule in §24.6 is a statement about the difference between them, so a boundary that moves them together can express none of the anomalies this document specifies against, and a test written against such a boundary cannot tell which clock the implementation read. Tests must not combine a fake `Now` with real timers, because that creates impossible scheduler states. Go 1.26 `testing/synctest` should be used where exercising the real timer/context machinery is clearer than a fully injected clock.
 
 ### 10.4 Core components
 
@@ -2310,6 +2310,8 @@ Tests are executable requirements, not merely coverage exercises.
 
 All time-dependent tests must use either the complete injected clock/timer boundary or Go 1.26 `testing/synctest`. They must not rely on long real sleeps. The one exception is a short black-box binary smoke test whose purpose is to validate real sockets, process signals, and flushing.
 
+The injected clock advances wall time and monotonic time independently, and a test that moves both together proves nothing about which one the code read. Every rule in §24.6 says that some quantity follows one clock and not the other, so the assertion that carries it is always an advance of one while the other is held. This is the shape of test the restart cases had been missing: they stepped the wall clock across a restart, which a new process recomputing its deadlines after the step survives regardless of the clock it chose.
+
 The scripted fake upstream must record the account by the bearer key it actually receives, dispatch start time, live concurrency, request bytes, and cancellation. Limiter invariants must be asserted at this external observation point as well as against coordinator state.
 
 The coordinator additionally carries model-based tests that generate random sequences of reservation, admission success and failure, dispatch, release, cooldown, cancellation, crash and recovery events against a reference model of the same state. Example-based tests cover the interleavings someone thought of, and the failures worth fearing in a component like this one are the interleavings nobody did.
@@ -2436,6 +2438,8 @@ Verify:
 - A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so 60 dispatches never fall inside one 60-second interval measured at that boundary.
 - No account admits a dispatch before one full rolling window has elapsed since process start, and the first admission after that instant succeeds.
 - A crash and restart straddling a saturated window cannot place more than 60 dispatches in any rolling 60-second interval, with the wall clock deliberately stepped forward and backward across the restart.
+- Inside one live process, stepping the wall clock forward and backward while monotonic time is held changes neither the contents of the rolling window nor the remaining blackout, so no eligibility decision moves.
+- Advancing monotonic time while the wall clock is held expires the window and the blackout at their exact monotonic instants, which is the half of the previous case that proves the implementation is reading a clock at all rather than ignoring both.
 
 ### 28.6 Concurrency stress tests
 
@@ -2674,6 +2678,7 @@ Verify:
 - No cost/currency columns.
 - Startup session recovery.
 - Process start and stop rows paired by instance identity, a `process_elapsed_us` that stays correct and non-negative across forward and backward wall steps inside the run, and the unmatched start row left by a killed subprocess whose successor starts and stops under an earlier wall time than the one that died.
+- With the two clocks advanced independently, every persisted instant follows UTC wall time and every persisted duration follows monotonic time and stays non-negative, which is what §24.6 states and what nothing previously could have failed on.
 - Startup reads no rate state from `dispatch_admission`, so a store seeded with recent admissions changes nothing about when the first dispatch may leave.
 - Admission rows survive a subprocess killed immediately after their commit.
 - Every named query recipe of §30.3 parses and runs against a seeded store and returns the shape its name promises, so a schema change that invalidates one fails here rather than in front of an operator.

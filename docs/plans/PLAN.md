@@ -878,7 +878,6 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `attempt_no` | Integer, nullable | 1-based dispatch count; null for skips |
 | `is_spill` | Boolean integer, non-null | Dispatch differs from valid initial pin |
 | `spill_from_account` | Text, nullable | Original pin for a spill |
-| `pin_effect` | Text, nullable | Stable final affinity effect of a dispatched attempt |
 | `started_at_us` | Integer, non-null | UTC Unix microseconds at reservation/skip |
 | `finished_at_us` | Integer, non-null | UTC Unix microseconds at terminal record |
 | `selection_wait_us` | Integer, nullable | Phase start through lease acquisition/failure; null for individual skips |
@@ -900,21 +899,10 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `limiter_in_flight` | Integer, nullable | Per-account post-reservation or skip snapshot |
 | `skip_reason` | Text, nullable | Local selection reason |
 | `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
-| `known_eligible_at_us` | Integer, nullable | Known RPM/cooldown reopening estimate at the last observation |
 
 The schema contains no body, message, completion, header, key, raw upstream error, upstream ID, cost, price, or currency column.
 
-`pin_effect` is one of:
-
-- `none`
-- `provisional_retained`
-- `confirmed_initial`
-- `refreshed`
-- `moved_after_spill`
-- `removed_after_auth`
-- `suppressed_stale`
-
-The sequence guard determines the final effect. For example, an otherwise successful spill whose request is older than a later completed turn records `suppressed_stale` rather than claiming that it moved the pin.
+The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_id`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
 
 ### 15.6 Outcome vocabulary
 
@@ -964,7 +952,6 @@ The schema enforces:
 - `skip_observation_count >= 1` only for skip records.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
-- `pin_effect` allowed only for dispatch records.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -2177,7 +2164,6 @@ Verify:
 - Selection and attempt numbering.
 - Aggregate skip counts.
 - Terminal capacity-failure rows.
-- Pin-effect vocabulary and stale-update recording.
 - One phase batch commits atomically.
 - A deliberate bad row rolls back its whole phase batch.
 - No prompt/completion columns.
@@ -2670,7 +2656,7 @@ Inspect SQLite to prove:
 - Spills are visible.
 - Retries and skip reasons are reconstructable.
 - Terminal capacity failures are explicit.
-- Session pin effects are reconstructable.
+- Session pin moves are reconstructable from spill source and serving account.
 - Latency and TTFT are present where observable.
 - Token counts are present only when upstream reports them.
 - No prompt/completion text or cost exists.

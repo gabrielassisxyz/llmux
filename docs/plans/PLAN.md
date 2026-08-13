@@ -27,6 +27,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 - Record enough attempt metadata to reconstruct account use, spills, retries, local skips, latency, and upstream-reported token counts.
 - Durably record every dispatch admission before the network call it authorizes, so a restarted process cannot exceed the rolling ceiling it claims to enforce.
 - Bound request, replay, and precommit memory in aggregate, not only one request at a time.
+- Return a proxy-owned request ID that correlates a client-visible result with its durable rows.
 - Ship as one cgo-free static Go binary with no runtime, framework, container, database server, or ORM.
 
 ## 3. Non-goals
@@ -241,6 +242,14 @@ Affinity needs stable equality, not the caller's string. The header is client-ch
 - Compressed requests cannot be patched and retried while preserving the raw body contract, so they return 415.
 - `Content-Type` is not used for capability validation.
 - The endpoint nevertheless parses the body as JSON because its wire contract is JSON.
+
+### 6.8 Response correlation
+
+- Every authenticated chat request is assigned its proxy logical request ID before any body processing.
+- Every authenticated chat response carries it as `X-LLMux-Request-ID`, whether the response came from upstream or was generated locally.
+- An upstream header of that name is removed before the proxy-owned value is set, so the value a client reads is always the proxy's.
+
+Without it, a consumer that saw a failure has a timestamp and nothing else to find the row with, and the one identifier both sides already share is the upstream response ID, which invariant 3 forbids using as a key and §13.3 forbids storing. A proxy-generated random ID gives the operator a direct key into SQLite while exposing nothing about upstream.
 
 ## 7. Request transformation contract
 
@@ -746,6 +755,7 @@ For the final upstream response:
 - Preserve application trailers when supported, declaring the allowed trailer names before commitment and filling their values only after upstream EOF.
 - Do not parse or rewrite completion JSON or SSE events.
 - Forward upstream-generated IDs but do not store them.
+- Replace any upstream `X-LLMux-Request-ID` with the proxy logical request ID.
 
 The strip list is short and closed for the same reason the request allowlist is narrow. Everything on it is a state or routing directive scoped to an origin that the proxy, not upstream, owns.
 
@@ -1617,6 +1627,8 @@ Messages are stable and sanitized.
 
 An upstream final response is never converted into one of these local errors. A 3xx or 101 is the one carve-out and is not an exception to the rule, because such a response is not a final result: it is an instruction to make a different request, addressed to a client that cannot act on it safely.
 
+Every authenticated chat response, local or upstream-derived, includes `X-LLMux-Request-ID`.
+
 Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known RPM/cooldown reopening among eligible accounts. If the only blockers are in-flight slots with unknowable release times, use one second. A disabled-only failure is 503 and has no fabricated reopening time.
 
 ## 23. User-visible workflows
@@ -2292,6 +2304,7 @@ Verify:
 - Header filtering.
 - Client authorization never reaches upstream.
 - Session header never reaches upstream.
+- `X-LLMux-Request-ID` is present on local and relayed responses alike, and an upstream header of that name never survives.
 - Account authorization does reach upstream.
 - Each allowlisted end-to-end header is preserved.
 - Cookies, forwarding headers, trace headers, and arbitrary custom headers are stripped.
@@ -2987,6 +3000,7 @@ The project is complete only when all of the following are true:
 - Local limiter/health skips are durably visible.
 - A no-dispatch capacity failure has an explicit terminal record.
 - All record IDs are proxy-generated.
+- Clients receive `X-LLMux-Request-ID` and can find their own request in SQLite with it.
 - Prompt and completion text are absent from durable and process logs.
 - Raw session identifiers are absent from both.
 - Currency and cost logic are absent.

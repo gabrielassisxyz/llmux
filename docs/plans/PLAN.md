@@ -2384,10 +2384,8 @@ Implementation is not complete without:
 - A README containing installation, configuration, service lifecycle, log inspection, backup, recovery, cutover, and rollback procedures.
 - A placeholder-only environment-file template.
 - A reference user-service definition that runs the static binary as the current user, restarts only on process failure, and does not contain health probes.
-- A release checklist recording the binary checksum, Go version, SQLite-driver version, schema version, and verification commands.
-- A manual acceptance record template for real Ollama Cloud cutover.
 
-These are documentation and launch aids, not a UI or additional runtime service.
+These are documentation and launch aids, not a UI or additional runtime service. The list stops where a document would start describing the process rather than the system: build identity is already recoverable from `go.mod`, `PRAGMA user_version` and the binary itself, so a checklist restating it would only be a second copy free to be wrong.
 
 ### 30.2 Installation
 
@@ -2460,7 +2458,7 @@ These checks are deliberately manual because they consume real account quota:
 9. Inspect SQLite for account, spill, retry, skip, latency, TTFT, and token facts.
 10. Run the privacy-marker inspection against the database, WAL, and process logs.
 
-Record pass/fail and timestamps in the acceptance record without copying prompts, completions, keys, or raw upstream error bodies.
+Record pass/fail and timestamps for each check without copying prompts, completions, keys, or raw upstream error bodies. The durable acceptance evidence is the attempt store itself, which holds one row per upstream attempt from the first real request onward; a parallel handwritten record competes with it and loses.
 
 ### 30.7 Cutover
 

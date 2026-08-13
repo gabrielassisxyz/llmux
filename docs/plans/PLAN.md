@@ -908,7 +908,7 @@ A downstream write error means the client is already gone. In that case, cancel 
 - `ReadTimeout` is two minutes and bounds receipt of the complete request body. `ReadHeaderTimeout` bounds only the headers, so without it a client that trickles a body holds a handler and its buffered body for as long as it likes: neither the logical context nor client cancellation interrupts a body read, because a slow client has not disconnected.
 - A downstream write deadline is armed immediately before each write or flush and cleared as soon as that call returns. It bounds the write, never the wait for upstream, so a model that produces nothing for five minutes is untouched by it while a consumer that has stopped reading is not.
 
-## 14. First-event and token observation
+## 14. Response observation
 
 ### 14.1 First-event definition
 
@@ -1418,15 +1418,16 @@ All account and session state is guarded by one coordinator mutex.
 For an account candidate:
 
 1. Read the monotonic clock.
-2. Remove dispatch timestamps at or before `now - 60 seconds`.
-3. Expire a gate deadline that has passed, returning an account the cooldown circuit had marked `cooling_down` to `enabled`.
-4. Reject a disabled account, or one whose gate deadline has not passed.
-5. Reject if in-flight is already 12.
-6. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
-7. Otherwise increment pending reservations.
-8. Increment in-flight.
-9. Return an immutable release-once pending lease.
-10. Unlock.
+2. Reject every candidate while the post-start dispatch blackout has not expired, recording `start_blackout`. This is the one place a slot is granted, so it is the one place the blackout has to hold, and putting it here is what stops three selection paths from each needing their own copy of the rule.
+3. Remove dispatch timestamps at or before `now - 60 seconds`.
+4. Expire a gate deadline that has passed, returning an account the cooldown circuit had marked `cooling_down` to `enabled`.
+5. Reject a disabled account, or one whose gate deadline has not passed.
+6. Reject if in-flight is already 12.
+7. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
+8. Otherwise increment pending reservations.
+9. Increment in-flight.
+10. Return an immutable release-once pending lease.
+11. Unlock.
 
 The rate check and both mutations are one critical section. Concurrent goroutines cannot claim the same final slot.
 
@@ -2717,6 +2718,7 @@ Verify:
 - Active stream can complete within grace.
 - First signal is graceful.
 - Second signal forces cancellation.
+- A handler admitted an instant before the first signal, running to its full logical deadline, still lands its terminal row before the shutdown grace expires.
 - Waiting account acquisition exits.
 - Retry backoff exits.
 - Leases release.
@@ -3282,6 +3284,7 @@ The project is complete only when all of the following are true:
 
 - One static cgo-free binary starts with the required five secrets and the SQLite path.
 - It listens on the configured loopback address and refuses any other.
+- A second process pointed at the same store refuses to start while the first is alive, so the ceilings are enforced by one counter set and not by two.
 - Both endpoints enforce the shared bearer key by digest comparison, and startup rejects a key that is too short or shared with an account.
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
 - Every alias resolves to its fixed upstream model and eligible account set.

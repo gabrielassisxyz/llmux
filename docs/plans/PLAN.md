@@ -1,14 +1,14 @@
-The workspace is read-only, so I could not create `IMPLEMENTATION_PLAN.md`. Below is the complete standalone document intended for that file.
-
 # llmux implementation plan
 
 ## 1. Purpose and implementation contract
 
-This document is the implementation contract for `llmux`. Implementation work should follow it without reopening the closed decisions in [IDEA.md](/tmp/cleanroom/room-codex/IDEA.md).
+This document is the implementation contract for `llmux`. Implementation work should follow it without reopening the closed decisions in [`IDEA.md`](../../local/plans/IDEA.md).
 
 `llmux` is a single-user, single-machine OpenAI-compatible routing proxy. It exposes two HTTP resources, routes seven logical model aliases across three Ollama Cloud accounts, preserves conversation-to-account affinity, enforces account-wide ceilings, relays streaming and non-streaming responses, and writes append-only attempt records to one embedded SQLite store.
 
 Where the existing deployment’s exact upstream model strings differ from the provisional mapping in this document, implementation must transcribe those fixed strings into the source catalog. This is deployment inventory, not runtime backend configurability.
+
+When two sections appear to pull in different directions, the non-negotiable invariants take precedence, followed by the external HTTP contract, the routing and retry state machines, and finally implementation convenience. Tests must encode that same precedence.
 
 ## 2. Goals
 
@@ -18,8 +18,8 @@ Where the existing deployment’s exact upstream model strings differ from the p
 - Preserve the complete raw top-level `messages` value without changing any field inside it.
 - Keep a conversation on one account for a sliding hour whenever possible.
 - Enforce exactly:
-  - 25 dispatched upstream attempts in any rolling 60-second window per account.
-  - 3 live upstream attempts per account.
+  - 60 dispatched upstream attempts in any rolling 60-second window per account.
+  - 12 live upstream attempts per account.
 - Apply those ceilings across every alias, model, session, and retry that reaches the same account.
 - Retry only failures for which retry can plausibly change the result.
 - Disable revoked/lapsed credentials immediately and cool repeatedly rate-limited accounts.
@@ -59,6 +59,11 @@ Where the existing deployment’s exact upstream model strings differ from the p
 13. No retry occurs after the downstream response is committed.
 14. Coordinator state is never locked while performing network, database, logging, or downstream I/O.
 15. All request-owned resources are bounded by a deadline, size limit, permit, or explicit lifecycle.
+16. Every untouched top-level JSON member retains its original raw value bytes and relative order, including unknown members and duplicate unknown members. Only the routing-owned top-level values may differ.
+17. The proxy never injects `stream_options.include_usage`, never alters `stream`, and never changes the response stream to improve observability. Missing usage remains missing.
+18. Every account-acquisition phase ends in either one atomically reserved dispatch or one explicit terminal selection-failure record. It cannot wait indefinitely.
+19. A committed response that later breaks is aborted as a transport failure; the proxy must not make a truncated upstream body look like a cleanly completed HTTP response.
+20. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
 
 ## 5. Fixed design decisions
 
@@ -72,13 +77,18 @@ Where the existing deployment’s exact upstream model strings differ from the p
 | Dependency injection | Manual constructor injection |
 | Internal structure | Small cohesive internal packages; no clean-architecture or DDD ceremony |
 | Request replay | Bounded in-memory buffering |
-| Maximum body | 64 MiB |
+| Maximum request body | 64 MiB |
+| Non-streaming response precommit buffer | 8 MiB, followed by unchanged progressive relay if exceeded |
 | Rate algorithm | Exact rolling timestamp window and in-flight counter |
 | Scheduler synchronization | One coordinator mutex covering all account and session state |
-| Pinned saturation | Wait up to five seconds, then allow spill |
+| Account-acquisition ceiling | 60 seconds or the remaining logical deadline, whichever is shorter |
+| Pinned saturation | Reopen-aware wait of at most five seconds, then spill |
 | Session TTL | Sliding one hour, refreshed on successful completion |
 | Retry limit | At most four dispatched attempts per logical request |
-| Logging | Synchronous terminal inserts; no asynchronous writer |
+| Retry placement | 429 and processing timeouts prefer another account; an initial 5xx/408/transient-network retry prefers the same account to retain cache |
+| Request headers | Fixed end-to-end allowlist; all proxy-internal and hop-by-hop headers are removed |
+| Logging | One synchronous SQLite transaction per terminal routing phase; pending skips and its dispatch/failure are committed together |
+| Disabled-account recovery | Restart only |
 | Process model | One proxy process |
 | Backend definition | Fixed source catalog |
 | Upstream base | `https://ollama.com/v1` |
@@ -243,10 +253,12 @@ The rewriter copies the original document in its original order and:
 In particular:
 
 - The complete raw `messages` value is byte-identical.
-- Top-level unknown fields retain their original order and raw values.
+- Top-level unknown fields retain their original order and raw values, including duplicate unknown keys.
 - Whitespace inside untouched values is preserved.
 - Duplicate route-owned keys are rejected rather than partially rewritten.
 - `messages` can never be a configured injected key.
+- Untouched numbers never transit through `float64`; forms such as large integers, exponent notation, and negative zero retain their exact spelling.
+- Untouched strings retain their exact escape spelling rather than merely decoding to an equivalent Unicode value.
 
 ### 7.3 Fixed route-owned injections
 
@@ -260,6 +272,14 @@ Other aliases do not inject parameters.
 All account-pinned variants inherit their base alias’s model and injection.
 
 If the client supplied the route-owned field, the preset overrides it because the alias itself names that preset.
+
+This override is routing resolution, not general parameter validation. The proxy neither checks whether the selected upstream supports the stamped value nor rejects any unrelated reasoning field.
+
+The injection set is closed:
+
+- No alias injects `messages`, `stream`, `stream_options`, `tools`, or any response-shaping field.
+- The proxy does not add `stream_options.include_usage`; clients that want streaming usage must request it themselves.
+- A missing usage object therefore produces nullable token fields rather than a mutated request or response.
 
 ## 8. Fixed route catalog
 
@@ -292,6 +312,9 @@ Each variant:
 - Has exactly one eligible account.
 - Is returned by `/v1/models`.
 - Uses the same real account limiter as every other route to that account.
+- Never spills to a different account.
+- Overrides a conflicting session pin for that request.
+- Updates a supplied session pin only after a completely successful response, preserving future cache locality on the explicitly selected account.
 
 Arbitrary `-kN` suffix parsing is not allowed. Only exact generated catalog entries resolve.
 
@@ -335,12 +358,14 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Concern | Value |
 | --- | ---: |
 | Logical request deadline | 10 minutes |
+| Maximum account-acquisition time per attempt | 60 seconds |
 | Maximum request body | 64 MiB |
+| Non-streaming precommit response buffer | 8 MiB |
 | Session affinity TTL | 1 hour |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
-| Dispatches per window/account | 25 |
-| In-flight attempts/account | 3 |
+| Dispatches per window/account | 60 |
+| In-flight attempts/account | 12 |
 | Maximum dispatches/logical request | 4 |
 | Intermediate response drain cap | 64 KiB |
 | SSE observer line cap | 1 MiB |
@@ -353,6 +378,26 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Upstream idle-connection timeout | 90 seconds |
 
 These are implementation constants, not a generic tuning surface.
+
+The two per-account ceilings are the exception, and the reason is worth stating because it changes what they are for. Neither 60 nor 12 is a published Ollama Cloud limit; no such limit is documented. They are self-imposed guards, and the earlier pair of 25 and 3 was a guess that had hardened into a specification. A guard set below the real ceiling is indistinguishable from the real ceiling, so it can never be measured, and the proxy spends capacity it has already paid for.
+
+Upstream 429 is the only authoritative statement of the real limit. The design therefore reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log. The ceilings above are set high enough to stop being the binding constraint, so that the log records upstream’s answer instead of the proxy’s assumption. They are expected to be re-derived from that log after real traffic, which is the one tuning this document invites.
+
+The in-flight ceiling keeps a second job that survives the change: it bounds concurrent resource use, since every live attempt holds its rewritten replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses.
+
+### 9.3 Secret delivery and process launch
+
+The binary reads configuration from the environment, but the operating documentation must define a safe way to supply that environment:
+
+- Do not put proxy or account keys in command-line flags, checked-in unit files, shell history, or example files.
+- For a service manager, use an owner-readable environment file outside the repository, mode `0600`, referenced by the user service.
+- The example environment file committed to the repository contains names and placeholders only.
+- The log directory should be owned by the user and should not grant write access to other users.
+- Startup messages may name a missing variable but must never print its value.
+- Diagnostic commands in the runbook must not dump the process environment.
+- Key changes require restart. Restart is the only key-reload mechanism.
+
+The repository should include a reference user-service definition and an environment-file template, but the binary must not depend on systemd or any particular supervisor.
 
 ## 10. Architecture
 
@@ -377,7 +422,8 @@ Lower-level components do not import the application or command package.
 | `internal/route` | Account limiter, health, session affinity, account selection, leases |
 | `internal/logstore` | SQLite configuration, migrations, inserts, startup recovery queries |
 | `internal/idgen` | Proxy-owned random identifiers |
-| `internal/testsupport` | Test-only fake clock, scripted upstream, deterministic shuffler |
+| `internal/testsupport` | Test-only clock/timer control, scripted upstream, deterministic shuffler, raw HTTP client helpers |
+| `deploy` | Reference user-service definition and placeholder-only environment template |
 
 There is no `pkg`, `utils`, `helpers`, provider registry, plugin directory, generated router, or ORM model layer.
 
@@ -390,11 +436,13 @@ Use manual constructor injection.
 - Constructors return concrete types.
 - Small interfaces are defined where consumed only when needed for tests.
 - Likely test boundaries:
-  - Clock
+  - Clock and timer creation
   - Permutation source
   - Upstream HTTP executor
-  - Append-only record writer
+  - Append-only transaction writer
 - The composition root alone knows every concrete dependency.
+
+The clock abstraction must cover both `Now` and cancellable timer creation. Tests must not combine a fake `Now` with real timers, because that creates impossible scheduler states. Go 1.26 `testing/synctest` should be used where exercising the real timer/context machinery is clearer than a fully injected clock.
 
 ### 10.4 Core components
 
@@ -419,6 +467,9 @@ Owns:
 - Body reading and rewriting.
 - Account lease acquisition.
 - Retry state machine.
+- Staged response headers that remain uncommitted until relay policy permits commitment.
+- Streaming first-read priming and non-streaming bounded precommit buffering.
+- Explicit committed-stream abort semantics.
 - Final response commitment and relay.
 - Attempt-record construction.
 
@@ -453,7 +504,8 @@ Properties:
 
 - One SQLite database connection.
 - Parameterized handwritten SQL.
-- Synchronous inserts.
+- Synchronous transactional batch inserts.
+- One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
 - Startup-only recovery queries.
 - No ORM or database server.
 
@@ -513,28 +565,36 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 6. Scan and rewrite the top-level routing fields.
 7. Resolve the route catalog entry.
 8. Read the optional session ID.
-9. Ask the route coordinator for an account lease.
-10. Record any distinct local account skips after releasing the coordinator lock.
-11. Build a fresh upstream request from the rewritten bytes.
-12. Dispatch through the selected account.
-13. Classify transport errors or HTTP status before writing downstream.
-14. If retrying:
+9. Build and validate the immutable upstream request template before reserving account capacity. This includes the fixed URL, rewritten body, and allowed client headers, but not the account credential.
+10. Start an account-selection phase whose deadline is the earlier of 60 seconds and the logical request deadline.
+11. Ask the coordinator for an account lease. Collect distinct skip observations in bounded request memory after releasing the coordinator lock; do not write SQLite while selection is still changing.
+12. If selection terminates without a lease:
+    - Compute `Retry-After` when at least one account has temporary capacity state.
+    - Transactionally append the deduplicated skip rows and one `selection_failure` row.
+    - Return local 429 for temporary capacity exhaustion or local 503 when no flexible account is usable.
+13. If selection succeeds, install release cleanup immediately. The reservation and `http.Client.Do` must be adjacent; only account authorization and request-context binding remain between them.
+14. Dispatch through the selected account. Once reservation succeeds, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send.
+15. Classify transport errors and upstream status before writing any downstream status or headers.
+16. If retrying:
     - Drain and close the intermediate response within bounds.
     - Release the lease.
     - Update account health.
-    - Append the attempt row.
+    - Transactionally append the selection skips and attempt row.
     - Wait using context-aware backoff.
-    - Acquire a new lease.
-15. If final:
-    - Commit upstream status and end-to-end headers once.
-    - Release the buffered request bytes for garbage collection after upstream has consumed them.
-    - Relay the response body.
+    - Begin the next selection phase with the next prospective attempt number.
+17. If final:
+    - Stage filtered upstream headers without committing them.
+    - For SSE, successfully read the first non-empty upstream body chunk before downstream commitment.
+    - For non-streaming 2xx, buffer up to 8 MiB before commitment; complete small bodies in memory and transition larger bodies to progressive relay.
+    - Commit status and headers exactly once.
+    - Relay the exact staged and subsequent response bytes.
     - Observe usage and TTFT without retaining content.
     - Close the response.
     - Release the account lease.
     - Update health and session state.
-    - Append the final attempt row.
-16. Return only after the terminal append has been attempted.
+    - Transactionally append the selection skips and final attempt row.
+18. Drop references to the original body immediately after rewrite, and to the rewritten replay body as soon as no future retry can occur. No body is written to disk.
+19. Return only after the terminal transaction has been attempted.
 
 ## 13. Upstream request and response handling
 
@@ -542,31 +602,38 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 
 A fresh upstream request is built for each attempt.
 
-Remove or replace:
+Copy only this fixed end-to-end request-header allowlist when present:
 
-- Incoming `Authorization`.
-- `Host`.
-- `Content-Length`.
-- `X-Session-ID`.
-- `Connection`.
-- `Keep-Alive`.
-- Proxy authentication headers.
-- Transfer framing headers.
-- Other hop-by-hop headers named by `Connection`.
-
-Set:
-
-- Upstream bearer credential for the selected account.
-- Correct `Content-Length` for the rewritten bytes.
-- Fixed target host and path.
-
-Preserve other end-to-end headers, including:
-
-- `Accept`
 - `Content-Type`
+- `Accept`
+- `Accept-Encoding`
 - `User-Agent`
-- Caller correlation headers
-- Explicit `Accept-Encoding`
+
+Set or derive:
+
+- `Authorization: Bearer <selected account key>`.
+- Correct `Content-Length` for the rewritten bytes.
+- The fixed upstream host and chat-completions path.
+
+Never forward:
+
+- The client’s proxy `Authorization`.
+- `X-Session-ID`.
+- `Host`.
+- `Cookie`.
+- `X-Forwarded-*` or proxy headers.
+- Trace/correlation headers not in the allowlist.
+- `Content-Encoding`, because compressed request bodies are rejected before rewrite.
+- `Connection`, `Keep-Alive`, `Transfer-Encoding`, upgrade headers, or any header named by `Connection`.
+
+The narrow allowlist is deliberate. The fixed consumers need body compatibility, not an arbitrary-header tunnel, and it prevents accidental credential or machine-metadata leakage.
+
+A drop is never silent. Each attempt records the count of request headers the allowlist removed, and a debug-level structured event names them:
+
+- Only header names are emitted, never values, because a value is where a cookie or a credential lives.
+- Names are emitted to the process log, never to the attempt store, whose schema has no header column.
+- The count alone is enough to notice that a consumer began sending something; the names are what identify it.
+- A consumer that turns out to need a dropped header changes this list, which is a deliberate edit, rather than discovering the loss as unexplained upstream behavior.
 
 The incoming raw query string is preserved.
 
@@ -603,26 +670,47 @@ Streaming is recognized primarily from upstream `Content-Type: text/event-stream
 
 For SSE:
 
-- Write status and headers before relaying the first final body bytes.
+- Stage status and filtered headers without writing them to the downstream connection.
+- Perform a first-read primer against the upstream body.
+- Zero-length reads with no error are retried without committing.
+- EOF or a read failure before any body byte is available remains uncommitted and is eligible for the response-read retry policy.
+- Once a non-empty chunk is available, commit the staged status and headers, write that exact chunk, and flush.
 - Flush after each successfully written upstream chunk.
 - Never buffer the complete response.
 - Preserve comments, event fields, blank lines, `[DONE]`, ordering, and whitespace.
 - Backpressure from the client naturally slows upstream reads.
 - A downstream write failure cancels the upstream request and closes its body.
-- A partial response is never followed by a retry.
+- An upstream read failure after commitment is never followed by a retry.
+- If upstream reading fails after commitment while the client is still connected, terminate the downstream HTTP response with the server’s abort sentinel rather than returning a clean EOF.
+- A normal EOF after a chunk is relayed unchanged. Absence of `[DONE]` may be recorded as truncation metadata, but the proxy does not fabricate the marker.
 
 ### 13.5 Non-streaming responses
 
-Non-streaming bodies are also relayed incrementally.
+For a final non-streaming 2xx response:
 
-- The proxy does not buffer the complete completion.
-- Status and headers are committed before body relay.
-- Once committed, a later read error is terminal and cannot become a fresh response.
-- Usage observation operates incrementally and independently of relay.
+1. Stage status and filtered headers without committing them.
+2. Read into a bounded 8 MiB precommit buffer.
+3. If EOF arrives within the bound:
+   - Treat the response as complete.
+   - Extract a complete usage object from the buffered bytes.
+   - Commit the upstream status and headers.
+   - Write the original buffered bytes exactly once.
+4. If the body exceeds 8 MiB:
+   - Commit status and headers.
+   - Write the already-read prefix exactly.
+   - Continue progressive unchanged relay through the bounded usage observer.
+5. If reading fails before commitment, classify the failure and retry when its budget allows.
+6. If reading fails after commitment, record truncation and abort the response.
+
+This buffering does not persist completion text. It is request-lifetime process memory and is released immediately after relay. It is bounded independently of the request-body buffer.
+
+Final non-retryable 3xx/4xx responses and exhausted 5xx responses may be committed and relayed without waiting for a complete 8 MiB precommit read; their upstream status is already the final client-visible result. A later body failure is recorded and the response is aborted rather than rewritten.
 
 ### 13.6 Response commitment
 
 The response is considered committed once its status has been written or body bytes have caused an implicit status write.
+
+Copying headers into an in-memory staged header set is not commitment. The downstream `ResponseWriter` must not be mutated until the handler has irrevocably chosen that upstream response.
 
 After commitment:
 
@@ -631,8 +719,29 @@ After commitment:
 - No second status.
 - No concatenated response body.
 - No attempt to hide truncation.
+- No synthetic SSE error or `[DONE]` event.
 
 The terminal attempt row records whether commitment occurred.
+
+For an upstream read failure after commitment:
+
+- Release the lease and build the terminal attempt record.
+- Attempt the synchronous log transaction.
+- Abort the HTTP response using `http.ErrAbortHandler` or the equivalent protocol-aware server mechanism.
+- The top-level panic recovery boundary must recognize and re-propagate the abort sentinel. It must not turn it into a local 500 or emit a misleading stack trace.
+- Under HTTP/1.x the client must observe a closed/truncated response; under HTTP/2 it must observe a stream error/reset.
+
+A downstream write error means the client is already gone. In that case, cancel upstream, release and log, then return without a second abort.
+
+### 13.7 Timeout semantics
+
+- Ten minutes is a hard deadline for the complete logical request, including account acquisition, upstream attempts, backoff, and relay.
+- Every retry inherits the same logical context and only the remaining time. No retry receives a fresh ten-minute budget.
+- The inbound client deadline wins when it is shorter.
+- Dial and TLS-handshake timeouts can fail early enough to permit retry.
+- Expiry of the overall logical deadline is terminal and is never itself retried.
+- There is no separate two-minute stream-stall timeout. A reasoning model may legitimately remain silent, and the ten-minute logical deadline already bounds the resource. Adding a shorter idle timer would turn valid slow generations into false failures.
+- The server’s absolute `WriteTimeout` remains disabled because it is incompatible with valid long-lived streams.
 
 ## 14. Time-to-first-token and token observation
 
@@ -672,13 +781,18 @@ Rules:
 - If several complete usage objects appear, the last complete one wins.
 - Partial usage data is not persisted as if complete.
 - A disconnect or truncated stream generally leaves counts `NULL`.
+- The proxy never modifies the request to force usage reporting.
+- A streaming client may explicitly request usage; that client-owned field crosses unchanged.
 
 ### 14.3 Observer bounds
 
-The observer must not retain full response text.
+The observer must not retain unbounded response text.
 
-- It consumes chunks after or alongside successful downstream writes.
-- JSON strings and unrelated values are skipped rather than accumulated.
+- A complete non-streaming body within the 8 MiB precommit bound is parsed from that already-required buffer using a narrow usage projection, then discarded.
+- A larger non-streaming body is observed incrementally after transition to progressive relay.
+- SSE frames are observed incrementally while the original bytes are relayed.
+- Under progressive relay, whether SSE or oversized non-streaming, the observer consumes chunks after or alongside successful downstream writes, so observation can never delay or reorder relay.
+- JSON strings and unrelated values are skipped rather than copied into a second response-sized structure.
 - SSE parsing keeps at most a 1 MiB line buffer.
 - If a line exceeds the cap, relay continues unchanged and semantic observation for that line is abandoned.
 - Observer failure never changes response bytes.
@@ -690,8 +804,11 @@ The observer must not retain full response text.
 
 Use SQLite through the cgo-free `modernc.org/sqlite` driver.
 
+The decisive property is that the proxy reads its own log. Startup recovers session affinity and the rolling rate windows from recent history, so the store must answer a query with a predicate and an ordering before the listener binds, not merely accept an append.
+
 Rationale:
 
+- Recovery queries over recent history, which is what affinity and rate restoration are.
 - Typed nullable fields.
 - Transactional append.
 - Unique IDs and constraints.
@@ -709,9 +826,11 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Require an absolute path.
 - Require the parent directory to exist.
 - Do not silently fall back to another path or memory.
-- Create a new database with owner read/write permissions.
+- If the database is absent, pre-create it atomically with `O_CREATE|O_EXCL` and mode `0600`, close it, then let the SQLite driver open it.
+- Reject an existing symbolic link using `Lstat`.
 - Reject an existing path that is not a regular file.
 - Reject group/other-readable existing files.
+- Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
 - Use full synchronous durability.
 - Use a five-second busy timeout.
@@ -721,6 +840,8 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 
 SQLite-managed `-wal` and `-shm` files are part of the one embedded store, not separate services or application logs.
 
+If initial migration fails after a new file was created, preserve the file for diagnosis and fail startup. Do not delete or replace an existing store automatically.
+
 ### 15.3 Record granularity
 
 The sole durable event table is `attempt_log`.
@@ -729,6 +850,7 @@ Record kinds:
 
 - `dispatch`: one actual call to the upstream HTTP client.
 - `selection_skip`: one distinct local candidate rejection due to rate or account health.
+- `selection_failure`: one account-acquisition phase that ended without any dispatch.
 
 There is no separate logical-request summary table.
 
@@ -737,8 +859,11 @@ A logical request may therefore contain:
 - Several selection-skip rows.
 - Several dispatched retry rows.
 - One final dispatched row.
+- Or, if no account can be acquired, several selection-skip rows followed by one selection-failure row.
 
 Pre-routing local failures do not produce attempt rows.
+
+Within one account-selection phase, repeated observations of the same `(account, reason)` pair are aggregated into one skip record with an observation count. A changed reason is a new skip fact. This prevents wake/recheck loops from amplifying the log while preserving every distinct reason an account was passed over.
 
 ### 15.4 IDs
 
@@ -757,18 +882,20 @@ Pre-routing local failures do not produce attempt rows.
 | `record_id` | Text, primary key | Proxy-generated row ID |
 | `logical_request_id` | Text, non-null | Groups one client request’s rows |
 | `sequence_no` | Integer, non-null | Foreground event order within the logical request |
-| `record_kind` | Text, non-null | `dispatch` or `selection_skip` |
+| `selection_no` | Integer, non-null | 1-based account-acquisition phase; normally the prospective attempt number |
+| `record_kind` | Text, non-null | `dispatch`, `selection_skip`, or `selection_failure` |
 | `requested_alias` | Text, non-null | Exact client alias |
 | `base_alias` | Text, non-null | Resolved base alias |
 | `upstream_model` | Text, non-null | Fixed resolved upstream model |
 | `session_id` | Text, nullable | Exact non-empty session header |
 | `pin_account_at_start` | Text, nullable | Session pin before routing |
-| `account_label` | Text, non-null | `k1`, `k2`, or `k3` |
+| `account_label` | Text, nullable | `k1`, `k2`, or `k3`; null only for terminal selection failure |
 | `attempt_no` | Integer, nullable | 1-based dispatch count; null for skips |
 | `is_spill` | Boolean integer, non-null | Dispatch differs from valid initial pin |
 | `spill_from_account` | Text, nullable | Original pin for a spill |
 | `started_at_us` | Integer, non-null | UTC Unix microseconds at reservation/skip |
 | `finished_at_us` | Integer, non-null | UTC Unix microseconds at terminal record |
+| `selection_wait_us` | Integer, nullable | Phase start through lease acquisition/failure; null for individual skips |
 | `attempt_duration_us` | Integer, nullable | Monotonic dispatch duration |
 | `logical_elapsed_us` | Integer, non-null | Handler start through this row |
 | `time_to_first_token_us` | Integer, nullable | Streaming TTFT |
@@ -777,6 +904,7 @@ Pre-routing local failures do not produce attempt rows.
 | `error_class` | Text, nullable | Stable low-cardinality classifier |
 | `retry_disposition` | Text, non-null | Retry/finality decision |
 | `retry_delay_ms` | Integer, nullable | Selected next delay |
+| `retry_after_s` | Integer, nullable | Local capacity response’s advertised retry delay |
 | `response_committed` | Boolean integer, non-null | Downstream response had begun |
 | `request_streaming` | Boolean integer, nullable | Raw top-level stream was exactly true |
 | `prompt_tokens` | Integer, nullable | Upstream-reported count |
@@ -785,8 +913,12 @@ Pre-routing local failures do not produce attempt rows.
 | `limiter_rpm_used` | Integer, nullable | Per-account post-reservation or skip snapshot |
 | `limiter_in_flight` | Integer, nullable | Per-account post-reservation or skip snapshot |
 | `skip_reason` | Text, nullable | Local selection reason |
+| `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
+| `dropped_header_count` | Integer, nullable | Request headers removed by the allowlist; null for skips |
 
 The schema contains no body, message, completion, header, key, raw upstream error, upstream ID, cost, price, or currency column.
+
+The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_id`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
 
 ### 15.6 Outcome vocabulary
 
@@ -798,6 +930,8 @@ The schema contains no body, message, completion, header, key, raw upstream erro
 - `response_read_error`
 - `response_write_error`
 - `selection_skipped`
+- `capacity_timeout`
+- `no_account_available`
 - `internal_error`
 
 ### 15.7 Error-class vocabulary
@@ -826,9 +960,15 @@ The schema enforces:
 - Unique `record_id`.
 - Unique `(logical_request_id, sequence_no)`.
 - Fixed record kinds and enums.
-- Account labels restricted to three values.
+- Positive `selection_no` for every row.
+- Account labels restricted to three values when present.
+- Account label required for dispatch and skip rows, and null for selection-failure rows.
 - `attempt_no` required only for dispatch records.
 - `skip_reason` required only for skip records.
+- `skip_observation_count >= 1` only for skip records.
+- `dropped_header_count` non-negative, and present only for dispatch records.
+- `selection_wait_us` required for dispatch and selection-failure rows.
+- `retry_after_s` allowed only for capacity failures.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -857,18 +997,28 @@ Create indexes for:
 
 ### 15.11 Commit timing and crash behavior
 
-Each row is assembled in memory and inserted once its event is terminal.
+Each selection phase accumulates a bounded set of skip facts in memory. When that phase’s dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
 
 This means:
 
 - One dispatched attempt has one complete immutable row.
+- A terminal capacity failure is explicit rather than inferable from the last skip.
+- A phase normally incurs one SQLite commit rather than one commit per account recheck.
 - Status, token counts, retry decision, and durations coexist in that row.
-- A process crash during an active attempt can lose that unfinished attempt.
+- A process crash during an active attempt can lose that unfinished attempt and its pending skip rows.
 - A separate start row followed by an update is deliberately not used.
 - A streaming success may reach the client before its final log insert fails.
 - A logging failure cannot retroactively replace an upstream success.
 - Runtime log failures produce sanitized stderr events and do not stop serving.
 - Database failure at startup is fatal.
+
+The synchronous transaction is attempted:
+
+- Before beginning a retry, so earlier attempt evidence is not intentionally deferred behind later network work.
+- Before returning a local capacity error.
+- After final response relay, because the final usage and duration are not known earlier.
+
+The bounded phase batch contains at most one aggregate row per account/reason combination plus one terminal row. There is no unbounded logging queue and no background log-writer goroutine.
 
 ## 16. Account coordinator
 
@@ -941,8 +1091,8 @@ For an account candidate:
 2. Remove timestamps at or before `now - 60 seconds`.
 3. Expire a completed cooldown.
 4. Reject disabled or cooling accounts.
-5. Reject if in-flight is already 3.
-6. Reject if 25 timestamps remain.
+5. Reject if in-flight is already 12.
+6. Reject if 60 timestamps remain.
 7. Otherwise append `now`.
 8. Increment in-flight.
 9. Return an immutable release-once lease.
@@ -955,7 +1105,8 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | Event | RPM slot | In-flight slot |
 | --- | --- | --- |
 | Candidate inspected and skipped | No | No |
-| Successful `Do` invocation | Yes | Until body closes |
+| Dispatch reservation immediately preceding `Do` | Yes, never refunded | Held immediately |
+| Successful `Do` invocation | Already consumed | Until body closes |
 | `Do` transport failure | Yes | Until `Do` returns |
 | Upstream 4xx/5xx | Yes | Until body closes |
 | Retry dispatch | Another slot | Another lease |
@@ -963,14 +1114,14 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | `/v1/models` | No | No |
 | Local pre-routing rejection | No | No |
 
-Every `http.Client.Do` invocation is counted because the proxy cannot prove that a request failing locally was unseen by upstream.
+Every committed dispatch reservation is counted because the proxy cannot prove that a request failing at the send boundary was unseen by upstream. All body rewriting, URL construction, and header filtering occur before reservation so that reservation-to-`Do` contains no ordinary fallible preparation.
 
 ### 17.3 Wait and wake
 
 The coordinator uses a replace-on-notify channel:
 
 - State changes close the current channel and replace it under lock.
-- Rejected callers receive that channel and the earliest known timed eligibility.
+- Rejected callers receive that channel, the rejection reason, limiter snapshots, and the account’s earliest known timed eligibility.
 - They unlock before waiting.
 - They wait on:
   - Request cancellation.
@@ -978,19 +1129,20 @@ The coordinator uses a replace-on-notify channel:
   - A reusable timer.
 - Eligibility is always rechecked under the mutex.
 - Rolling-window expiry requires no refill goroutine.
-- Skip rows are written only after the lock is released.
+- Skip observations are accumulated only after the lock is released.
+- A single account-selection phase never waits longer than 60 seconds.
 
 ### 17.4 Rationale
 
-An exact rolling deque directly enforces “25 in any 60 seconds.”
+An exact rolling deque directly enforces “60 in any 60 seconds.”
 
 It avoids:
 
-- Token-bucket bursts beyond 25 starts in a sliding minute.
+- Token-bucket bursts beyond 60 starts in a sliding minute.
 - Fixed-minute counters permitting 50 adjacent starts across a boundary.
 - Per-alias buckets that multiply real-account capacity.
 
-Each account retains at most 25 rate timestamps, so the memory cost is trivial.
+Each account retains at most 60 rate timestamps, so the memory cost is trivial.
 
 ### 17.5 Multi-process limitation
 
@@ -1013,7 +1165,8 @@ Correctness is process-local.
 6. If none is currently eligible but some may recover, wait.
 7. Reshuffle after waking.
 8. If every account is disabled, return local 503 immediately.
-9. If the logical deadline expires while waiting, return local capacity failure.
+9. Stop waiting after 60 seconds even when the logical request has more time remaining.
+10. On temporary capacity exhaustion, append a terminal selection failure and return local 429 with `Retry-After`.
 
 Shuffle is for fairness, not security. Tests inject deterministic permutations.
 
@@ -1022,12 +1175,13 @@ Shuffle is for fairness, not security. Tests inject deterministic permutations.
 - Selection follows the unpinned base flow.
 - Account acquisition and provisional session pin installation occur atomically.
 - Concurrent new-session requests therefore cannot independently choose different initial accounts.
+- The provisional pin expires one hour after reservation unless a successful completion refreshes it.
 
 ### 18.3 Existing session
 
 - Try the live pin first.
 - If it has capacity, use it without shuffling.
-- If disabled, remove the pin and choose a new account immediately.
+- If disabled, remove the pin, record the skip, and choose a new account immediately.
 - If temporarily saturated or cooling, use the bounded stall/spill policy.
 - An explicit account alias overrides the session pin.
 
@@ -1035,8 +1189,10 @@ Shuffle is for fairness, not security. Tests inject deterministic permutations.
 
 - Only the named account is eligible.
 - It never spills.
-- It waits for temporary capacity or cooldown until the request deadline.
-- It fails immediately if the account is disabled.
+- It waits for temporary rate, in-flight, or cooldown capacity for at most 60 seconds.
+- It still respects RPM, in-flight, cooldown, logical-deadline, and retry limits.
+- If no capacity is acquired, it returns local 429 with `Retry-After`.
+- It fails immediately with local 503 if the account is disabled.
 - On success, it updates the session pin if a session ID was supplied.
 
 ### 18.5 Lease lifecycle
@@ -1062,28 +1218,31 @@ Rules:
 
 ### 19.1 Chosen behavior
 
-Use bounded stall followed by spill.
+Use a reopen-aware bounded stall followed by spill.
 
-1. Record a distinct selection-skip row for the pinned account.
-2. Wait up to five seconds for that account.
-3. Wake early on:
-   - In-flight release.
-   - Rolling timestamp expiry.
-   - Cooldown expiry.
-   - Request cancellation.
-4. If the pin becomes eligible, use it.
-5. After five seconds, consider other accounts.
-6. Continue preferring the original pin if it becomes eligible first.
-7. Otherwise acquire the first shuffled eligible alternative.
-8. Mark an alternative dispatch as a spill.
-9. If all accounts remain unavailable, keep waiting for any account until the logical deadline.
-10. Re-pin only after the spilled response is 2xx and fully relayed.
+1. Set the pin deadline to the earlier of five seconds, the 60-second acquisition deadline, and the logical request deadline.
+2. Inspect the pinned account atomically and record its rejection reason and any known reopening time.
+3. If the pin is disabled, do not wait; proceed to alternatives immediately.
+4. For deterministic blockers:
+   - RPM reopening is the oldest retained admission plus 60 seconds.
+   - Cooldown reopening is `cooldown_until`.
+   - If several deterministic blockers apply, use the latest reopening time because all must clear.
+5. If the deterministic reopening time is later than the pin deadline, do not burn the five-second grace pointlessly; proceed to alternatives immediately.
+6. If deterministic reopening falls within the grace, wait exactly until that time or an earlier coordinator notification, then retry the pin.
+7. For in-flight saturation, whose release time is unknowable, wait on notification until the pin deadline.
+8. If deterministic and in-flight blockers coexist, a deterministic blocker beyond the grace still makes waiting pointless. Otherwise wait on both notification and the known timer.
+9. If the pin becomes eligible during grace, reserve it and preserve the cache.
+10. When grace ends or is provably pointless, consider all accounts with the original pin first and the alternatives in a fresh shuffled order.
+11. If an alternative wins, mark the dispatch as a spill from the original pin.
+12. If every account remains temporarily unavailable, wait for any account only until the 60-second acquisition deadline.
+13. If acquisition expires, return local 429 with a computed `Retry-After`.
+14. Re-pin only after the spilled response is 2xx and fully relayed.
 
 ### 19.2 Rationale
 
 A pure stall could block an interactive request behind three unrelated calls that each last several minutes. Immediate spill would discard useful prefix caching even when a request is about to finish.
 
-Five seconds is a bounded latency cost that captures short overlaps without allowing affinity to consume the request’s entire deadline.
+Five seconds is a maximum, not a mandatory delay. Known RPM and cooldown timing lets the proxy wait only when preservation can plausibly succeed inside that budget.
 
 After a successful spill, the new account has processed the newest complete conversation prefix. Re-pinning therefore maximizes cache continuity for the next turn.
 
@@ -1093,6 +1252,8 @@ After a successful spill, the new account has processed the newest complete conv
 - The proxy records the spill but attaches no currency value.
 - Failed and partial spills do not move affinity.
 - Explicit account aliases never spill.
+- An RPM window known to reopen in four seconds waits approximately four seconds; one known to reopen in 45 seconds spills immediately.
+- When all accounts are saturated, the proxy waits no more than 60 seconds before giving the client an actionable 429.
 - Concurrent requests using one session cannot guarantee conversational ordering, though sequence guards prevent stale pin overwrites.
 
 ## 20. Account health
@@ -1111,7 +1272,7 @@ Actions:
 - Exclude the account from subsequent base-alias requests.
 - Explicit aliases targeting it return local 503 on later requests.
 
-The account remains disabled for the process lifetime. Correcting the key requires restart.
+The account remains disabled for the process lifetime. Correcting the key requires restart, which is also how a renewed subscription on an unchanged key is put back into rotation. Nothing inside the process re-tests a disabled account, on a timer or on a request.
 
 ### 20.2 Rate-limit failures
 
@@ -1141,6 +1302,8 @@ Cooldown duration:
 
 This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window.
 
+With the local ceilings raised above any rate upstream is expected to accept, this path becomes the primary rate control rather than a fallback behind it. Upstream 429 responses are therefore expected in normal operation, not treated as anomalies, and the cooldown threshold and duration are the first constants to re-derive from the attempt log once real traffic exists.
+
 ### 20.3 Server and transport failures
 
 5xx, timeouts, and transient network failures do not globally disable an account.
@@ -1166,27 +1329,32 @@ Reason:
 - Maximum four dispatched attempts per logical request.
 - Selection skips do not count as attempts.
 - Queueing and backoff consume the same ten-minute logical deadline.
+- Each account-selection phase has its own 60-second ceiling but never extends the logical deadline.
 - No retry begins unless enough deadline remains to acquire and dispatch.
+- Expiration of the ten-minute logical deadline is terminal; it is not treated as a fresh retryable attempt timeout.
 
 ### 21.2 Classification table
 
-| Failure | Retry | Per-class budget | Account health |
-| --- | --- | ---: | --- |
-| Upstream 429 | Yes | Up to 3 retries | Count toward cooldown |
-| Upstream 5xx | Yes | Up to 2 retries | No global disable |
-| Upstream 408 | Yes | Up to 2 retries | No global disable |
-| Transport timeout | Yes | Up to 2 retries | No global disable |
-| Connection reset/EOF before response | Yes | Up to 2 retries | No global disable |
-| Temporary DNS/dial failure | Yes | Up to 2 retries | No global disable |
-| Upstream 401/403 | No | 0 | Disable immediately |
-| Other upstream 4xx | No | 0 | No change |
-| Invalid URL/protocol/TLS certificate | No | 0 | No account change |
-| Client cancellation/disconnect | No | 0 | No account change |
-| Local deadline | No | 0 | No account change |
-| Body read failure after commitment | No | 0 | No account change |
-| Downstream response already committed | No | 0 | Based on originating failure only |
+| Failure | Retry | Per-class budget | Next-account preference | Account health |
+| --- | --- | ---: | --- | --- |
+| Upstream 429 | Yes | Up to 3 retries | Different eligible account first | Count toward cooldown |
+| Upstream 5xx | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Upstream 408 | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Temporary DNS/dial/reset before response | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Dial or TLS-handshake timeout | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Precommit response-body read failure | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
+| Processing/response-header timeout before logical deadline | Yes | Up to 2 retries | Different eligible account first | No global disable |
+| Upstream 401/403 | No | 0 | None | Disable immediately |
+| Other upstream 4xx | No | 0 | None | No change |
+| Invalid URL/protocol/TLS certificate | No | 0 | None | No account change |
+| Client cancellation/disconnect | No | 0 | None | No account change |
+| Overall logical deadline | No | 0 | None | No account change |
+| Body read failure after commitment | No | 0 | None | No account change |
+| Downstream response already committed | No | 0 | None | Based on originating failure only |
 
 Mixed failures remain subject to both their class counters and the global maximum of four dispatches.
+
+The same-account first retry for an isolated 5xx/408/transient connection failure preserves account-local prefix cache when the failure is a short blip. It is a preference, not a forced route: if that account is cooling or lacks capacity, another eligible account may proceed. A 429 explicitly says the account is saturated, so it prefers another account immediately.
 
 ### 21.3 Backoff
 
@@ -1214,8 +1382,10 @@ All waiting:
 
 For a base alias:
 
-- Prefer an eligible account other than the immediately failed account.
-- If none is eligible, the failed account may be reconsidered after backoff.
+- Apply the class-specific preference in the table above.
+- Same account is a preference that still passes through normal atomic admission.
+- Different account means visiting other eligible accounts before reconsidering the failed account.
+- If no preferred account is eligible, normal capacity waiting and the 60-second acquisition ceiling apply.
 - A different account is logged as a spill when a live session pin existed.
 - Successful alternative completion re-pins the session.
 
@@ -1245,8 +1415,21 @@ The final exhausted response is relayed unchanged, including its entire body.
 If an upstream response is accepted but fails while reading:
 
 - Before downstream commitment: classify and retry if the failure budget permits.
-- After downstream commitment: log truncation and stop.
+- After downstream commitment: log truncation and abort the HTTP response.
 - Never concatenate a replacement response to partial data.
+
+### 21.7 Ambiguous-send retries
+
+A transport failure can occur after upstream received and began processing a request but before the proxy received a usable response. Retrying may therefore duplicate upstream generation work.
+
+The proxy accepts this tradeoff because:
+
+- Chat completion generation itself has no proxy-side external side effect.
+- The proxy never executes returned tool calls; the client sees and may act on only the final relayed response.
+- Availability after an ambiguous transport failure is more valuable than avoiding duplicate flat-rate upstream computation.
+- Every dispatch is independently rate-accounted and logged.
+
+The proxy neither invents nor forwards an idempotency key. One supplied by a client is dropped like any other header outside the allowlist, and is recorded as a drop. Nothing in the fixed consumer set sends one, so carrying it would be a forwarding rule written for a caller that does not exist.
 
 ## 22. Proxy-generated errors
 
@@ -1268,13 +1451,16 @@ Messages are stable and sanitized.
 | Compressed body | 415 | `invalid_request_error` / `unsupported_content_encoding` |
 | Invalid routing envelope | 400 | `invalid_request_error` / `invalid_request` |
 | Unknown alias | 404 | `invalid_request_error` / `model_not_found` |
+| Temporary account-capacity timeout | 429 | `rate_limit_error` / `account_capacity_timeout` |
 | Explicit account disabled | 503 | `server_error` / `account_unavailable` |
-| Capacity deadline | 503 | `server_error` / `account_capacity_timeout` |
+| Every flexible account disabled | 503 | `server_error` / `account_unavailable` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
 | Overall timeout before commit | 504 | `server_error` / `upstream_timeout` |
 | Recovered panic before commit | 500 | `server_error` / `internal_error` |
 
 An upstream final response is never converted into one of these local errors.
+
+Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known RPM/cooldown reopening among eligible accounts. If the only blockers are in-flight slots with unknowable release times, use one second. A disabled-only failure is 503 and has no fabricated reopening time.
 
 ## 23. User-visible workflows
 
@@ -1329,7 +1515,7 @@ Visible result: stable base and pinned aliases.
 
 1. Client asks for an exact `-k2` alias.
 2. Only `k2` is considered.
-3. Temporary saturation causes waiting.
+3. Temporary saturation causes waiting for at most 60 seconds, then local 429 with `Retry-After`.
 4. Disabled `k2` causes local 503.
 5. No spill is permitted.
 6. Successful completion updates any supplied session pin to `k2`.
@@ -1339,20 +1525,23 @@ Visible result: stable base and pinned aliases.
 1. Session is pinned to `k1`.
 2. `k1` is at RPM, in-flight, or cooldown capacity.
 3. A skip row records the reason.
-4. Proxy waits up to five seconds for `k1`.
-5. `k1` remains unavailable.
-6. Proxy acquires `k2` or `k3`.
-7. The dispatch is logged as a spill from `k1`.
-8. On fully successful completion, session affinity moves to the spill account.
+4. If reopening is known within five seconds, the proxy waits exactly for it.
+5. If reopening is known to be later, the proxy scans alternatives immediately.
+6. For in-flight-only saturation, it waits at most five seconds.
+7. If `k1` remains unavailable, the proxy acquires `k2` or `k3`.
+8. The dispatch is logged as a spill from `k1`.
+9. On fully successful completion, session affinity moves to the spill account.
 
 ### 23.8 Every account saturated
 
 1. All eligible accounts are locally unavailable.
-2. Distinct skip facts are appended.
+2. Distinct skip facts are accumulated.
 3. The request waits on state notification or the earliest known expiry.
 4. No local rate slot is consumed while waiting.
 5. First newly eligible account wins atomic admission.
-6. If the logical deadline expires, return local 503.
+6. Waiting stops after 60 seconds or the earlier logical deadline.
+7. The skip facts and terminal selection failure are appended in one transaction.
+8. The proxy returns local 429 with `Retry-After`.
 
 ### 23.9 Upstream 429
 
@@ -1371,9 +1560,11 @@ Visible result: stable base and pinned aliases.
 2. No downstream response is committed.
 3. Attempt row records the failure and retry decision.
 4. Lease is released.
-5. Retry occurs within class/global budgets.
-6. Exhausted HTTP response is relayed unchanged.
-7. Exhausted transport failure becomes local 502 or 504.
+5. An initial 5xx/408/transient-network retry prefers the same account to retain cache.
+6. A processing timeout prefers a different account.
+7. Retry occurs within class/global budgets and the original logical deadline.
+8. Exhausted HTTP response is relayed unchanged.
+9. Exhausted transport failure becomes local 502 or 504.
 
 ### 23.11 Upstream authentication failure
 
@@ -1402,6 +1593,7 @@ Visible result: stable base and pinned aliases.
 5. No retry occurs.
 6. Attempt records commitment and truncation/disconnect.
 7. Token counts remain null unless a complete usage object was already observed.
+8. For upstream read failure with a live downstream client, the proxy aborts the HTTP response so the client observes a transport-level incomplete response rather than a clean EOF.
 
 ### 23.14 Client cancellation
 
@@ -1469,11 +1661,14 @@ No startup failure triggers an upstream request.
 
 | Failure | Behavior |
 | --- | --- |
-| Pinned account temporarily saturated | Five-second grace, then spill |
-| Explicit account saturated | Wait only for that account |
-| All accounts saturated | Wait for any account |
-| All accounts disabled | Immediate local 503 |
-| Deadline during wait | Local 503 |
+| Pinned account with known reopening inside grace | Wait exactly until reopening or notification |
+| Pinned account with known reopening after grace | Spill scan immediately |
+| Pinned account blocked only by in-flight work | Wait at most five seconds, then spill scan |
+| Explicit account saturated | Wait only for that account, at most 60 seconds |
+| Explicit account disabled | Immediate local 503 |
+| All flexible accounts saturated | Wait for any account, at most 60 seconds, then local 429 |
+| All flexible accounts disabled | Immediate local 503 |
+| Deadline during wait | Local 429 if capacity was temporary; otherwise cancellation/timeout |
 | Client cancellation during wait | Stop silently |
 
 ### 24.4 Network and upstream failures
@@ -1492,7 +1687,7 @@ No startup failure triggers an upstream request.
 | Other 4xx | No retry |
 | 3xx | No redirect; relay final |
 | Read error before commitment | Retry if budget permits |
-| Read error after commitment | Stop and log truncation |
+| Read error after commitment | Log truncation and abort the downstream response |
 
 ### 24.5 Persistence failures
 
@@ -1503,8 +1698,9 @@ No startup failure triggers an upstream request.
 | Disk full | Sanitized stderr error; continue serving |
 | Runtime corruption error | Sanitized high-severity log; continue only where connection remains usable |
 | Store becomes unusable | Repeated append failures remain visible; no in-memory unbounded queue |
-| Crash before terminal insert | Active row may be absent |
+| Crash before terminal phase transaction | Active attempt and pending skip rows may be absent |
 | Crash after commit | Committed row remains durable |
+| One row in a phase batch violates a constraint | Roll back the entire phase transaction; emit one sanitized error |
 
 There is no fallback JSONL file, alternate database, or memory log.
 
@@ -1525,9 +1721,10 @@ A top-level handler recovery boundary:
 - Releases account leases.
 - Cancels upstream work.
 - Returns local 500 only if the response is uncommitted.
-- Closes the connection/stream if already committed.
+- Aborts the connection/stream if already committed.
 - Emits a stack only to sanitized local stderr.
 - Does not include bodies or headers in the panic event.
+- Recognizes `http.ErrAbortHandler` as an intentional transport abort and re-propagates it without converting it to a 500 or logging a defect stack.
 
 Panics remain defects and must fail tests; recovery only protects process availability.
 
@@ -1539,8 +1736,8 @@ The implementation must document and test these invariants:
 2. Every shared-state read or write occurs under the coordinator mutex.
 3. No I/O occurs while holding it.
 4. Every acquired lease is released exactly once.
-5. In-flight never becomes negative or exceeds three.
-6. No account has more than 25 admitted starts in a rolling 60-second interval.
+5. In-flight never becomes negative or exceeds twelve.
+6. No account has more than 60 admitted starts in a rolling 60-second interval.
 7. Retries acquire fresh leases.
 8. Waiting and backoff hold no leases.
 9. Selection skips consume no rate capacity.
@@ -1555,6 +1752,12 @@ The implementation must document and test these invariants:
 18. Process logs and SQLite writes occur after coordinator unlock.
 19. Observer errors cannot affect response relay.
 20. Client cancellation propagates through waiting, backoff, upstream I/O, and database calls where applicable.
+21. Every selection phase is bounded by 60 seconds and records one terminal dispatch or selection failure.
+22. The first same-session request cannot split its provisional pin across accounts under concurrent arrival.
+23. No response header reaches the downstream writer until the final-response state machine commits.
+24. A post-commit upstream read failure cannot return normally through the HTTP handler.
+25. Pending skip facts are bounded by the fixed account/reason vocabulary and cannot form an unbounded per-request queue.
+26. No admission path grants an account an exception to disabled health state.
 
 ## 26. Security and privacy
 
@@ -1572,10 +1775,13 @@ The implementation must document and test these invariants:
 - Keep them only in process memory.
 - Never include them in formatted errors.
 - Replace client authorization before upstream dispatch.
-- Strip proxy/session-specific headers.
+- Forward only the fixed request-header allowlist.
+- Strip proxy/session-specific, cookie, trace, forwarding, and hop-by-hop headers.
 - Disable redirects.
 - Never serialize configuration structs containing secrets.
 - Do not expose environment diagnostics through HTTP.
+- Do not pass secrets as command-line arguments.
+- Require owner-only permissions on the service environment file and SQLite store.
 
 ### 26.3 Fixed upstream and SSRF prevention
 
@@ -1605,6 +1811,7 @@ Process logs may contain:
 - Status code.
 - Duration.
 - Retry decision.
+- Names of request headers removed by the allowlist.
 
 They must not contain:
 
@@ -1614,7 +1821,7 @@ They must not contain:
 - Authorization headers.
 - Account keys.
 - Raw upstream error bodies.
-- Complete arbitrary headers.
+- Any request or response header value, including those of headers named in a drop event.
 - Session IDs in stderr by default.
 - Upstream-generated IDs.
 - Currency or cost.
@@ -1622,13 +1829,16 @@ They must not contain:
 ### 26.6 Resource denial controls
 
 - 64 MiB request-body limit.
+- 8 MiB non-streaming precommit buffer, after which relay becomes progressive.
 - 64 KiB header limit.
 - Ten-minute logical request deadline.
-- Three in-flight attempts per account.
+- 60-second account-acquisition ceiling.
+- Twelve in-flight attempts per account.
 - Exact account RPM ceiling.
 - Bounded SSE observer.
 - Bounded retry drain.
 - Maximum four dispatches.
+- Bounded deduplicated skip collection.
 - No unbounded log queue.
 - No per-request unbounded goroutine creation.
 
@@ -1645,6 +1855,7 @@ Events include:
 - Fatal configuration/database/listener errors.
 - Account disabled.
 - Account cooldown entered/expired.
+- Request headers removed by the allowlist, at debug level, by name only.
 - Runtime attempt-log insert failure.
 - Recovered handler panic.
 - Forced shutdown.
@@ -1670,6 +1881,10 @@ The durable SQLite attempt log and stderr lifecycle logs are sufficient for this
 ## 28. Testing obligations
 
 Tests are executable requirements, not merely coverage exercises.
+
+All time-dependent tests must use either the complete injected clock/timer boundary or Go 1.26 `testing/synctest`. They must not rely on long real sleeps. The one exception is a short black-box binary smoke test whose purpose is to validate real sockets, process signals, and flushing.
+
+The scripted fake upstream must record the account by the bearer key it actually receives, dispatch start time, live concurrency, request bytes, and cancellation. Limiter invariants must be asserted at this external observation point as well as against coordinator state.
 
 ### 28.1 Catalog tests
 
@@ -1716,9 +1931,12 @@ For every successful rewrite:
 
 - Parse the original and output only for test comparison.
 - Assert output model and route-owned values.
-- Assert all other top-level values are semantically unchanged.
+- Assert every untouched top-level raw value span is byte-identical, not merely semantically equivalent.
+- Assert the relative order of untouched top-level members is unchanged.
+- Assert duplicate unknown top-level keys survive unchanged.
 - Assert the raw `messages` byte span is exactly identical.
 - Assert no message field order changed.
+- Assert no `stream_options` or usage-requesting field appears unless the client supplied it.
 
 ### 28.3 Body-rewriter fuzzing
 
@@ -1759,8 +1977,8 @@ Use a fake monotonic clock.
 
 Verify:
 
-- First 25 starts in 60 seconds are admitted.
-- The 26th is rejected.
+- First 60 starts in 60 seconds are admitted.
+- The 61st is rejected.
 - Exact boundary expiration admits correctly.
 - Failed dispatches remain counted.
 - Retries consume another timestamp.
@@ -1768,7 +1986,7 @@ Verify:
 - Separate aliases share the same account count.
 - Base and pinned aliases share the same account count.
 - Different accounts remain independent.
-- In-flight never exceeds three.
+- In-flight never exceeds twelve.
 - Release makes in-flight capacity available.
 - RPM expiry requires no background goroutine.
 - Cooldown expiry is lazy and correct.
@@ -1776,12 +1994,15 @@ Verify:
 
 ### 28.6 Concurrency stress tests
 
-Run hundreds or thousands of goroutines against one coordinator.
+Run both coordinator-only stress and full-stack stress through the HTTP handler into the scripted upstream. Coordinator-only stress uses hundreds or thousands of goroutines against one coordinator.
 
 Assert:
 
-- At most three leases per account at every observation point.
-- No rolling interval exceeds 25 admissions.
+- At most twelve leases per account at every observation point.
+- No rolling interval exceeds 60 admissions.
+- The fake upstream itself never observes more than twelve live requests for one account key.
+- The fake upstream’s dispatch-start timestamps never contain more than 60 starts for one account in any rolling 60-second interval.
+- Requests arriving through different aliases, pinned aliases, sessions, and retries still share those upstream-observed ceilings.
 - Concurrent final-slot claims admit only one caller.
 - No races under `go test -race`.
 - No deadlocks.
@@ -1797,6 +2018,10 @@ Cover:
 
 - Pin available immediately.
 - Pin frees inside five seconds.
+- RPM reopening in four seconds waits approximately four synthetic seconds and remains pinned.
+- RPM reopening after 45 seconds scans alternatives immediately instead of waiting five seconds.
+- Cooldown reopening inside and outside the pin grace follows the same rule.
+- Combined deterministic and in-flight blockers use the correct all-blockers-must-clear time.
 - Pin remains blocked and alternative is available.
 - Pin and alternatives all blocked.
 - Pin disabled.
@@ -1809,6 +2034,9 @@ Cover:
 - Older concurrent completion cannot overwrite a newer pin.
 - Deadline during grace.
 - Deadline after spill becomes allowed.
+- Sixty-second account-acquisition expiry returns 429.
+- `Retry-After` is the rounded-up earliest known reopening, and falls back to one for in-flight-only saturation.
+- Selection failure transaction contains deduplicated skips and one terminal failure row.
 
 ### 28.8 Health-state tests
 
@@ -1820,6 +2048,7 @@ Verify:
 - Current auth failure is not retried.
 - Subsequent base requests skip disabled account.
 - Explicit route fails locally.
+- No code path re-enables a disabled account within one process lifetime.
 - One or two 429 responses do not enter cooldown.
 - Third 429 in 60 seconds enters cooldown.
 - Old 429 timestamps expire.
@@ -1838,20 +2067,26 @@ Cover:
 
 - 429 then success.
 - Three 429 retries then final 429.
-- 500 then success.
-- Two transient failures then success.
+- 500 then same-account success.
+- Two 5xx failures move from same-account preference to another account.
+- Same-account retry falls back to another when the preferred account lacks capacity.
+- Processing timeout prefers another account.
+- Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
 - 401 with no retry.
 - TLS permanent error with no retry.
 - Client cancellation during backoff.
 - Deadline during backoff.
+- Overall ten-minute logical deadline is never renewed or retried.
 - Retry account preference.
 - Explicit alias retry remains on one account.
 - Every retry acquires a new limiter slot.
 - No lease is held during backoff.
 - Intermediate response bodies are boundedly drained and closed.
 - Final exhausted upstream body is relayed unchanged.
+- An ambiguous transport failure followed by retry creates two independently rate-accounted attempt rows.
+- A client-supplied idempotency header is dropped and counted like any other unlisted header, and the proxy never invents one.
 
 ### 28.10 HTTP handler tests
 
@@ -1865,7 +2100,9 @@ Verify:
 - Client authorization never reaches upstream.
 - Session header never reaches upstream.
 - Account authorization does reach upstream.
-- End-to-end custom headers are preserved.
+- Each allowlisted end-to-end header is preserved.
+- Cookies, forwarding headers, trace headers, and arbitrary custom headers are stripped.
+- A stripped header is counted on its attempt row and named in a debug event, and its value appears nowhere.
 - Hop-by-hop headers are stripped.
 - Raw query string is preserved.
 - Redirects are not followed.
@@ -1893,11 +2130,18 @@ Test:
 - Slow downstream.
 - Client disconnect.
 - Upstream truncation.
+- EOF before the first body byte remains uncommitted and retries when eligible.
+- Read error before the first body byte remains uncommitted and retries.
+- The first non-empty chunk is relayed exactly after commitment.
 - First-event TTFT.
 - Final usage extraction.
 - No usage.
 - Malformed usage.
+- No proxy-injected `stream_options`.
 - No retry after first committed byte.
+- Post-commit upstream read failure produces a raw-client transport error rather than a clean completed response.
+- HTTP/1.x and HTTP/2 abort behavior are tested where the platform permits both.
+- Recovery middleware re-propagates `http.ErrAbortHandler`.
 - Exact output bytes despite observer failure.
 
 Timing assertions must use synchronization points rather than fragile sleeps.
@@ -1907,7 +2151,9 @@ Timing assertions must use synchronization points rather than fragile sleeps.
 Cover:
 
 - Successful JSON response.
-- Large response streamed without complete buffering.
+- Response below 8 MiB remains uncommitted until complete.
+- Response exactly at the precommit boundary.
+- Response above 8 MiB transitions to progressive relay without byte changes.
 - Usage at different object positions.
 - Unknown response fields.
 - Malformed response JSON relayed unchanged.
@@ -1915,6 +2161,7 @@ Cover:
 - Response read error after commitment.
 - Client disconnect during write.
 - Exact status/header/body preservation.
+- Precommit buffers are released after response completion and do not scale with total over-threshold body size.
 
 ### 28.13 SQLite tests
 
@@ -1923,6 +2170,8 @@ Use real temporary SQLite files.
 Verify:
 
 - Empty-database creation.
+- New database is pre-created with mode `0600`.
+- Existing symlink and insecure file modes are rejected.
 - Every migration path.
 - Future-version refusal.
 - Correct schema constraints.
@@ -1933,6 +2182,12 @@ Verify:
 - Null token counts.
 - Full token counts.
 - Session ID fidelity.
+- All three record kinds.
+- Selection and attempt numbering.
+- Aggregate skip counts.
+- Terminal capacity-failure rows.
+- One phase batch commits atomically.
+- A deliberate bad row rolls back its whole phase batch.
 - No prompt/completion columns.
 - No cost/currency columns.
 - Startup session recovery.
@@ -1953,6 +2208,7 @@ Representative requests and responses must contain unique marker strings in:
 - Assistant completion.
 - Upstream error body.
 - Authorization headers.
+- Cookies, custom trace headers, and forwarding headers.
 
 After requests:
 
@@ -1960,6 +2216,9 @@ After requests:
 - Assert none of the marker text exists.
 - Assert account keys and proxy key do not exist.
 - Assert token counts and allowed metadata do exist.
+- Assert stripped header markers never reach the upstream.
+- Assert a dropped header’s name may appear in a debug event while its marker value appears in no log and no database file.
+- Assert JSON parse errors and panic logs contain positions/classifiers but not nearby body excerpts.
 
 No test may create temporary prompt spool files.
 
@@ -2011,6 +2270,9 @@ Every release must pass:
 - Search proving no prompt/completion logging calls.
 - Search proving no cost/currency implementation.
 - Search proving no background upstream-probe loop.
+- A black-box test that observes zero upstream requests while the binary is idle.
+- A black-box test that `/v1/models`, startup, recovery, SQLite migration, and shutdown produce zero upstream requests.
+- A schema inspection proving no body/header/cost columns were introduced.
 
 Suppressions must name the exact linter and include a reason. Security-related warnings cannot be blanket-suppressed.
 
@@ -2019,10 +2281,12 @@ Suppressions must name the exact linter and include a reason. Security-related w
 Benchmarks and load checks must establish:
 
 - Rewrite work is linear in body size.
-- Memory is bounded by approximately the request body, rewritten body, and small relay buffers.
+- Memory is bounded by the request body, rewritten replay body, 8 MiB non-streaming precommit buffer, and small relay/observer buffers.
 - SSE relay does not accumulate total stream size.
+- Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
 - SQLite inserts do not hold coordinator state.
+- Selection rechecks produce bounded aggregated skip state.
 - 28 catalog entries and tens of thousands of rows do not materially affect startup.
 - `/v1/models` requires no I/O beyond response writing.
 - Idle process traffic to upstream is exactly zero.
@@ -2034,7 +2298,13 @@ No performance optimization is accepted if it weakens message preservation, rate
 
 ### 29.1 SQLite over JSONL
 
-Chosen because indexing, constraints, crash-safe commits, recovery queries, and concurrent local reading are central requirements. The additional driver dependency and binary size are acceptable.
+The argument that settles this is not durability, indexing, or the cost of the dependency. It is that this attempt log has a reader inside the proxy.
+
+Session affinity survives a restart only if startup can answer "which account most recently served this session id, within the last hour", and the rolling windows survive only if it can answer "which dispatches started in the last 60 seconds, per account". Both run before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
+
+The rest is real but follows from the choice rather than driving it: typed nullable columns that keep a missing token count distinct from a zero, constraints that fail a malformed row at the write instead of at a read months later, crash-safe transactional commits, and safe concurrent reading by a local analysis tool while the proxy is serving.
+
+The additional driver dependency and binary size are acceptable.
 
 ### 29.2 Manual dependency injection
 
@@ -2056,7 +2326,7 @@ Consequences:
 
 ### 29.5 Synchronous terminal inserts
 
-Synchronous writes make completion visibility deterministic and avoid an unbounded queue or background writer. The cost is one SQLite commit per attempt/skip and the possibility that streaming response bytes reach the client before final persistence.
+Synchronous writes make completion visibility deterministic and avoid an unbounded queue or background writer. Grouping a phase’s skips and terminal record in one transaction avoids one commit per recheck while retaining append-only rows. The accepted costs are that retry progression can wait for an earlier attempt’s transaction and that final streaming bytes may reach the client before final persistence.
 
 ### 29.6 Terminal-only attempt rows
 
@@ -2064,7 +2334,9 @@ A single immutable terminal row satisfies append-only logging without updates. T
 
 ### 29.7 Exact rolling window
 
-It matches the specified account ceiling without boundary bursts. A deque is more exact than a token bucket and trivial at 25 timestamps per account.
+It matches the configured account ceiling without boundary bursts. A deque is more exact than a token bucket and trivial at 60 timestamps per account.
+
+Exactness still matters after the ceilings were raised, and arguably matters more. The ceiling is now a bound whose correct value is unknown and will be re-derived from the attempt log, and a limiter that admits boundary bursts would make that log measure the limiter’s own imprecision rather than upstream’s behavior.
 
 ### 29.8 One coordinator mutex
 
@@ -2072,11 +2344,11 @@ Account admission and new-session pin creation must be atomic. With three accoun
 
 ### 29.9 No strict waiter FIFO
 
-A channel notification and recheck design is cancellation-friendly and simple. Strict FIFO would require considerably more queue state. Shuffle and a bounded request deadline limit starvation, but do not mathematically eliminate it.
+A channel notification and recheck design is cancellation-friendly and simple. Strict FIFO would require considerably more queue state. Shuffle, a 60-second acquisition ceiling, and the logical request deadline limit starvation, but do not mathematically eliminate it.
 
 ### 29.10 Five-second stall before spill
 
-This preserves cache across short overlaps without letting a pinned account block an interactive request for minutes.
+Five seconds is the maximum wait for an unknowable in-flight release. RPM and cooldown waits use their exact known reopening time and skip the grace entirely when reopening falls outside it. This preserves cache across short overlaps without charging every spill a mandatory five-second delay.
 
 ### 29.11 Re-pin only on complete success
 
@@ -2084,11 +2356,11 @@ The alternative account has the most recent complete prefix only after a success
 
 ### 29.12 Stop retries after commitment
 
-This can expose a truncated response rather than transparently recovering, but retrying would create invalid concatenated output or duplicate tokens. Protocol correctness takes precedence.
+This can expose a transport-level truncated response rather than transparently recovering, but retrying would create invalid concatenated output or duplicate tokens. Aborting rather than returning cleanly ensures clients can distinguish incomplete transport from a successful completion. Protocol correctness takes precedence.
 
 ### 29.13 In-memory health state
 
-Credential disablement and cooldown are process-local. This keeps recovery simple and makes restart the explicit key-rotation mechanism. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
+Credential disablement and cooldown are process-local, and restart is the entire recovery mechanism for both a rotated key and a renewed subscription on an unchanged key. A faster path was considered and rejected: letting an explicit account alias re-test a disabled account would buy back a restart that already costs one command on this machine, and would charge for it the only exception to the rule that a disabled account stays disabled, placed inside the admission path. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
 
 ### 29.14 Stable model list despite health
 
@@ -2098,11 +2370,171 @@ The model picker represents configured capabilities. Removing aliases based on t
 
 SQLite and structured stderr cover the stated operational need. A metrics/debug endpoint would add an unsupported user-visible surface.
 
-### 29.16 Usage observation without response buffering
+### 29.16 Bounded response observation
 
-Incremental selective parsing protects privacy and memory. The tradeoff is that malformed, oversized, or missing usage remains null rather than being recovered by retaining the whole completion.
+Small non-streaming bodies are buffered up to 8 MiB to make body-read failures retryable before commitment and make usage extraction reliable. Larger bodies and SSE remain incremental. The tradeoff is a bounded per-request memory allocation and delayed header/body delivery for non-streaming calls, whose clients ordinarily cannot use the completion until EOF anyway.
 
-## 30. Implementation sequence
+### 29.17 Request-header allowlist
+
+A narrow allowlist may omit an exotic client header that a generic reverse proxy would forward. The fixed consumers do not require arbitrary header tunneling, and preventing accidental cookie, trace, forwarding, or machine-metadata leakage is more valuable.
+
+### 29.18 Sixty-second account-acquisition ceiling
+
+Waiting for all capacity until the full ten-minute logical deadline would convert local saturation into apparent service failure. Sixty seconds covers a complete RPM window while bounding interactive delay. Returning 429 with `Retry-After` gives the caller an accurate, retryable result.
+
+### 29.19 Precommit streaming primer
+
+Delaying downstream headers until one upstream body chunk is successfully read does not delay the first visible token, because the client could not consume a body before that chunk existed, and it preserves the ability to retry an upstream that closes immediately after headers.
+
+### 29.20 Ambiguous-send duplication
+
+Retrying a connection that failed after send may duplicate upstream generation. The proxy accepts duplicate flat-rate computation because it executes no tool side effects itself and because every dispatch remains independently limited and logged.
+
+### 29.21 Same-account first retry for isolated server failures
+
+An isolated 5xx/408/transient connection failure does not prove the account is unusable. Preferring it once preserves prompt cache; a repeated failure then prefers another account. Rate limits and processing timeouts still move away immediately because they are stronger account-specific signals.
+
+## 30. Operations, cutover, and rollback
+
+### 30.1 Required operational artifacts
+
+Implementation is not complete without:
+
+- A README containing installation, configuration, service lifecycle, log inspection, backup, recovery, cutover, and rollback procedures.
+- A placeholder-only environment-file template.
+- A reference user-service definition that runs the static binary as the current user, restarts only on process failure, and does not contain health probes.
+
+These are documentation and launch aids, not a UI or additional runtime service. The list stops where a document would start describing the process rather than the system: build identity is already recoverable from `go.mod`, `PRAGMA user_version` and the binary itself, so a checklist restating it would only be a second copy free to be wrong.
+
+### 30.2 Installation
+
+The runbook must instruct the operator to:
+
+1. Place the static binary in an owner-controlled executable location.
+2. Create the SQLite parent directory before first launch.
+3. Create the owner-only environment file outside the repository.
+4. Set the four secrets and the absolute SQLite path.
+5. Verify that the three account credentials are distinct without printing them.
+6. Start the process and confirm that it binds only the expected address.
+7. Call authenticated `/v1/models`.
+8. Confirm that startup and the models call produced no upstream traffic.
+
+The binary must never create a missing parent directory implicitly; a path typo must fail rather than create a new unintended log location.
+
+### 30.3 Routine log inspection
+
+The README must provide SQLite query recipes, described and tested against the actual schema, for:
+
+- Dispatch count by account and time range.
+- Current/recent RPM pressure by account.
+- Upstream 429 responses against dispatch volume per account, which is what reveals the real ceiling the local one is standing in for.
+- In-flight and RPM selection skips by account.
+- Spill pivots with source and destination.
+- Retry chains grouped by logical request.
+- Authentication failures and the account disablement they caused.
+- Attempt and logical-request latency distributions.
+- TTFT distributions for streaming calls.
+- Prompt, completion, and total token sums with nulls kept distinct from zeros.
+- Session continuity and pin moves.
+- Terminal capacity failures and their advertised retry time.
+- Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
+- Sessionless calls in the expected `eod` execution window.
+
+No built-in query, README recipe, or report computes currency cost.
+
+### 30.4 Database backup and archival
+
+- There is no automatic rotation or retention.
+- For a live backup, use SQLite’s own consistent backup mechanism rather than copying only the main file while WAL is active.
+- For a cold backup, stop the service cleanly, verify shutdown completed, then copy the database.
+- Preserve schema version with every archive.
+- Never delete or truncate the active attempt table as part of normal service startup.
+- Test restore by opening a copied database with a compatible binary and running read-only integrity/recovery queries.
+- A backup or archive operation must not make any upstream request.
+
+### 30.5 Disabled-account recovery
+
+An upstream 401 or 403 disables an account for the rest of the process lifetime, and nothing inside the process puts it back:
+
+1. Confirm from the attempt log which account was disabled and when.
+2. If the credential itself changed, update the owner-only environment file.
+3. Restart the service.
+4. Confirm a later flexible request can use the account.
+
+Restart is the whole procedure, for a rotated key and for a renewed subscription on an unchanged key alike. Do not add reload or probe machinery.
+
+### 30.6 Pre-cutover acceptance against real upstream
+
+These checks are deliberately manual because they consume real account quota:
+
+1. Call `/v1/models` and confirm all 28 exact aliases.
+2. Make one small exact-account request through each of `k1`, `k2`, and `k3`.
+3. Run a multi-turn `pi` conversation containing at least one complete tool-call/tool-result loop.
+4. Confirm every turn’s raw `messages` value arrives upstream unchanged using the approved diagnostic fixture, not production prompt logging.
+5. Run one representative `kernl` non-streaming job.
+6. Run one `eod` dry run without a session file.
+7. Exercise one controlled spill scenario.
+8. Exercise one retryable error against a test upstream, not by intentionally wasting real upstream requests.
+9. Inspect SQLite for account, spill, retry, skip, latency, TTFT, and token facts.
+10. Run the privacy-marker inspection against the database, WAL, and process logs.
+
+Record pass/fail and timestamps for each check without copying prompts, completions, keys, or raw upstream error bodies. The durable acceptance evidence is the attempt store itself, which holds one row per upstream attempt from the first real request onward; a parallel handwritten record competes with it and loses.
+
+### 30.7 Consumer preconditions
+
+Bounding account acquisition at 60 seconds introduces a result the replaced proxy never produced: a local 429 with `Retry-After`, meaning this proxy declined to keep queueing, not that upstream refused the request. A caller that does not retry a 429 turns local saturation into a lost result.
+
+That is a change in the callers, and it stays there. The proxy holds no model of who calls it and gains none; it answers with a retry delay and the caller decides what to do with it. Widening the wait inside the proxy to accommodate a caller that cannot retry would reintroduce the ten-minute hang the ceiling exists to remove.
+
+Before cutover:
+
+- Confirm each caller retries a local 429 and honours `Retry-After`.
+- The once-a-day `eod` summariser is the one to change first. It runs with no session file and no operator watching, so a lost result there is invisible until someone notices a missing day. It needs retry in its own codebase before cutover.
+- A caller that cannot be changed is recorded as accepting the loss, rather than answered by relaxing the ceiling here.
+
+### 30.8 Cutover
+
+1. Preserve the existing proxy binary and configuration for rollback.
+2. Stop the old listener cleanly.
+3. Start `llmux` on `127.0.0.1:4000`.
+4. Verify authenticated `/v1/models`.
+5. Run one small exact-account request.
+6. Run the `pi` multi-turn tool-loop check.
+7. Run representative `kernl` and `eod` checks.
+8. Confirm all three consumers still use only the documented base URL, proxy key, model aliases, and session header.
+9. Inspect the first attempt rows before declaring cutover complete.
+
+No traffic shadowing is used: duplicating real prompts to both proxies would spend quota, duplicate sensitive content in flight, and complicate comparison.
+
+### 30.9 Rollback
+
+Rollback must be reversible and must preserve evidence:
+
+1. Stop `llmux` cleanly.
+2. Preserve its SQLite file and process logs; do not delete or rewrite them.
+3. Restart the previous proxy on port 4000.
+4. Confirm the previous proxy’s normal liveness behavior.
+5. Record the rollback reason and the last `llmux` logical request timestamp.
+
+The old proxy does not read or migrate the `llmux` database. A rollback therefore cannot corrupt the new attempt log.
+
+### 30.10 Post-cutover observation
+
+For the first week of real traffic, inspect the attempt store at least daily for:
+
+- Any account exceeding the designed local ceilings.
+- Upstream 429 rate against dispatch rate per account, which is the measurement the raised ceilings exist to obtain. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists.
+- Repeated authentication failures.
+- Spill frequency and pin-move correctness.
+- Retries after response commitment, which must remain zero.
+- Response truncations or client disconnects.
+- Attempt-log write failures.
+- Missing `eod` execution evidence in its expected window.
+- Prompt/completion/key marker leakage, which must remain zero.
+
+This is human log review, not a background health checker. Any discovered defect becomes a reproducible automated test before correction.
+
+## 31. Implementation sequence
 
 ### Phase 1: Project skeleton and fixed catalog
 
@@ -2114,6 +2546,7 @@ Deliver:
 - Fixed route catalog.
 - Generated account variants.
 - Deterministic `/v1/models` projection.
+- Placeholder-only environment template and reference user-service definition.
 
 Gate:
 
@@ -2127,13 +2560,15 @@ Deliver:
 - Pinned cgo-free driver.
 - Embedded initial migration.
 - Append-only triggers.
-- Insert API.
+- Secure file pre-creation and permission checks.
+- Transactional phase-batch insert API.
+- Dispatch, selection-skip, and selection-failure records.
 - Recovery queries.
 - Permission and schema checks.
 
 Gate:
 
-- Empty/upgrade/concurrency/append-only tests pass.
+- Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
 - Static cgo-free test build succeeds.
 
 ### Phase 3: Request scanner and rewriter
@@ -2161,14 +2596,15 @@ Deliver:
 - Session pins.
 - Notification waits.
 - Shuffle selection.
-- Spill behavior.
+- Reopen-aware bounded wait and spill behavior.
+- Sixty-second acquisition ceiling and `Retry-After`.
 - Health transitions.
 - Startup state loading.
 
 Gate:
 
 - Fake-clock tests pass.
-- High-concurrency race tests prove the account ceilings.
+- Coordinator and fake-upstream stress tests prove account ceilings at the true dispatch boundary.
 - No goroutine leaks.
 
 ### Phase 5: Upstream execution and retry
@@ -2176,12 +2612,13 @@ Gate:
 Deliver:
 
 - Shared HTTP transport.
-- Header filtering.
+- Fixed request-header allowlist and response hop-by-hop filtering.
 - Attempt classification.
 - Retry budgets/backoff.
-- Account-choice behavior.
+- Class-specific account-choice behavior.
 - Intermediate response drain.
 - Final response commitment rules.
+- Ambiguous-send accounting.
 
 Gate:
 
@@ -2194,8 +2631,11 @@ Gate:
 Deliver:
 
 - Streaming and non-streaming relay.
+- Streaming first-read primer.
+- 8 MiB non-streaming precommit buffer and progressive fallback.
 - SSE flushing.
 - Client cancellation.
+- Committed-response abort handling.
 - TTFT observation.
 - Selective token extraction.
 - Exact final response preservation.
@@ -2203,6 +2643,7 @@ Deliver:
 Gate:
 
 - Byte-for-byte response tests pass.
+- Precommit failures retry and post-commit failures abort.
 - Large/slow/truncated streams remain bounded.
 - Privacy-marker tests pass.
 
@@ -2223,7 +2664,23 @@ Gate:
 - Shutdown/restart/failure-injection tests pass.
 - No background upstream request occurs while idle.
 
-### Phase 8: Consumer acceptance
+### Phase 8: Operations and black-box acceptance
+
+Deliver:
+
+- Installation and environment documentation.
+- SQLite query, backup, restore, and archive runbooks.
+- Disabled-account recovery procedure.
+- Cutover and rollback procedures.
+- Real-binary socket/signal/flush smoke test.
+
+Gate:
+
+- The compiled binary passes black-box lifecycle tests.
+- Startup, models listing, idle operation, recovery, and shutdown make zero unsolicited upstream requests.
+- Rollback can be completed without modifying the SQLite store.
+
+### Phase 9: Consumer acceptance
 
 Run representative requests for:
 
@@ -2241,11 +2698,13 @@ Inspect SQLite to prove:
 - Serving account is visible.
 - Spills are visible.
 - Retries and skip reasons are reconstructable.
+- Terminal capacity failures are explicit.
+- Session pin moves are reconstructable from spill source and serving account.
 - Latency and TTFT are present where observable.
 - Token counts are present only when upstream reports them.
 - No prompt/completion text or cost exists.
 
-## 31. Definition of done
+## 32. Definition of done
 
 The project is complete only when all of the following are true:
 
@@ -2255,25 +2714,36 @@ The project is complete only when all of the following are true:
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
 - Every alias resolves to its fixed upstream model and eligible account set.
 - The raw `messages` value is byte-identical at upstream.
+- Every untouched top-level field retains its raw bytes and relative order.
 - Unsupported parameters are forwarded.
 - The two reasoning presets are injected only at top level.
+- No usage-requesting field is injected.
 - Streaming and non-streaming final responses preserve status, headers, and body bytes.
+- Streaming responses remain retryable until the first upstream body byte is committed.
+- Non-streaming responses remain retryable through the bounded precommit phase.
+- Post-commit upstream read failures abort rather than ending as clean responses.
 - Session affinity remains account-wide for one sliding hour.
-- Saturated pins wait five seconds and then spill when possible.
+- Saturated pins wait only when reopening can plausibly occur within five seconds, then spill when possible.
+- Every account-acquisition phase ends within 60 seconds.
+- Temporary local capacity exhaustion returns 429 with `Retry-After`.
 - Successful spill updates affinity; failed/partial spill does not.
-- No account exceeds 25 dispatch starts in a rolling minute.
-- No account exceeds three in-flight attempts.
+- No account exceeds 60 dispatch starts in a rolling minute.
+- No account exceeds twelve in-flight attempts.
+- Those ceilings are proven from the fake upstream’s observations, not only coordinator counters.
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.
-- Upstream authentication disables an account on its first failure.
+- Upstream authentication disables an account on its first failure and nothing but restart re-enables it.
 - Repeated 429 responses cause bounded cooldown.
 - No background health or model probes exist.
-- Each dispatch has at most one append-only terminal row.
+- Each dispatch has exactly one append-only terminal row when its transaction succeeds.
 - Local limiter/health skips are durably visible.
+- A no-dispatch capacity failure has an explicit terminal record.
 - All record IDs are proxy-generated.
 - Prompt and completion text are absent from durable and process logs.
 - Currency and cost logic are absent.
 - Startup recovers recent rate timestamps and successful session pins.
 - Graceful shutdown releases permits and closes SQLite last.
+- Installation, backup, recovery, cutover, and rollback runbooks are complete and tested.
+- Real Ollama Cloud acceptance includes a multi-turn tool-call/tool-result loop.
 - Unit, integration, race, fuzz, privacy, failure-injection, restart, and static-build gates pass.

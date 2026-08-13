@@ -253,6 +253,7 @@ Affinity needs stable equality, not the caller’s string. The header is client-
 - Every authenticated chat request is assigned its proxy logical request ID before any body processing.
 - Every authenticated chat response carries it as `X-LLMux-Request-ID`, whether the response came from upstream or was generated locally.
 - An upstream header of that name is removed before the proxy-owned value is set, so the value a client reads is always the proxy’s.
+- A request that ends with a local response before any account-selection phase begins is the one case that produces no attempt row, so it appends one `unrouted_request` row instead, and the identifier resolves in exactly one of the two tables.
 
 Without it, a consumer that saw a failure has a timestamp and nothing else to find the row with, and the one identifier both sides already share is the upstream response ID, which invariant 3 forbids using as a key and §13.3 forbids storing. A proxy-generated random ID gives the operator a direct key into SQLite while exposing nothing about upstream.
 
@@ -605,6 +606,7 @@ Properties:
 - Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
 - One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
+- One row per authenticated chat request that ends before account selection begins.
 - One lifecycle row at startup and one at shutdown.
 - Startup-only recovery queries.
 - No ORM or database server.
@@ -705,8 +707,9 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Transactionally append the selection skips and final attempt row.
 23. Release the body buffer and its memory charge as soon as no further replay can occur, which is the point at which the last attempt becomes terminal. There is no separate rewritten body to release, and no body is written to disk.
 24. Release the global handler slot and any remaining memory charge on every exit path, including panic and cancellation.
-25. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
-26. Return only after the terminal transaction has been attempted.
+25. A request that ended before step 13 began writes its local result to the client and then appends one `unrouted_request` row, which is the only durable record such a request produces.
+26. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
+27. Return only after the terminal transaction has been attempted.
 
 ## 13. Upstream request and response handling
 
@@ -992,7 +995,7 @@ If initial migration fails after a new file was created, preserve the file for d
 
 ### 15.3 Record granularity
 
-Three append-only tables exist, and the split is by commit point rather than by subject.
+Four append-only tables exist, and the split is by commit point rather than by subject.
 
 `dispatch_admission` holds the evidence a dispatch was authorized, and one row is committed synchronously before every possible upstream dispatch:
 
@@ -1047,6 +1050,24 @@ Within one account-selection phase, repeated observations of the same `(account,
 A start row is appended once migration and recovery have succeeded and before readiness is announced, and failing to append it is a fatal startup like every other write failure at that point. A stop row is appended by every shutdown the process survives to perform, orderly or forced, after handlers drain and before the store closes; failing to append that one is a sanitized stderr event and does not change the exit status, because by then there is nothing left to protect. The absence of a stop row therefore means one thing only: the process died without reaching its shutdown path. Whether a shutdown was orderly or forced is deliberately not encoded here, because the process log already carries it and a stored vocabulary with no reader is exactly what §15.5 refuses.
 
 This table passes the test the summary table failed, and the difference is worth stating because the two look alike from a distance. Every field here is a fact no attempt row contains. An idle proxy and a stopped proxy produce identical row sets, so uptime is not derivable from the attempt log at all, and nothing in that log records which binary wrote a given span of rows or which schema version was in force at the time. There is one writer, the lifecycle path, so there is no second copy of a fact to drift from. Stderr already carries the same information, but stderr is ephemeral and cannot be queried alongside the rows, which is the whole reason this store holds its own history. The cost is two inserts per process lifetime, and what it buys is the difference between a missing `eod` row meaning the consumer failed and it meaning the proxy was not running.
+
+`unrouted_request` holds one row per authenticated chat request that received a local response before any account-selection phase began:
+
+| Field | Type/nullability | Meaning |
+| --- | --- | --- |
+| `record_id` | Text, primary key | Proxy-generated row ID |
+| `logical_request_id` | Text, unique, non-null | The value the client received as `X-LLMux-Request-ID` |
+| `started_at_us` | Integer, non-null | UTC Unix microseconds at handler start |
+| `finished_at_us` | Integer, non-null | UTC Unix microseconds at the local response |
+| `session_key` | Text, nullable | Versioned keyed digest, present only when the header was read and validated before the rejection |
+| `downstream_status` | Integer, non-null | Status written to the client |
+| `local_error_code` | Text, non-null | The `error.code` this request answered with, from the fixed vocabulary of §22 |
+
+Membership is exactly the set of requests that reach no account-selection phase: a malformed or oversized body, a compressed body, a non-empty query string, an oversized session header, an unknown alias, a rejected nesting depth, a handler or memory overload, and a panic recovered before routing. Everything past that point already writes to `attempt_log`, including a phase that acquires no account at all, a cancellation during a selection wait, and an admission-store failure, whose phase ends without dispatch and appends its skips and a terminal selection failure like any other.
+
+This is not the logical-request summary table declined above, and the test that separates them is the one that table failed and the lifecycle table passed. A summary was refused because every fact in it already exists in the terminal attempt row of its `logical_request_id`, so it would hold a second copy of a derivable fact and give two writers a way to disagree. These rows are defined by the absence of that terminal row. A request appears here only when it appears nowhere else, so across the two tables there is exactly one writer per logical request, and no fact exists in both. What it closes is a hole this document opened itself: it promises every authenticated chat response an `X-LLMux-Request-ID`, and §32 claims a client can find its own request in SQLite with that identifier, which for a malformed body, an unknown alias, or a memory overload was not true, because those requests wrote nothing anywhere.
+
+The row stops at the outcome and holds no client string the proxy did not validate. The requested alias is deliberately absent: by definition it either failed to resolve or was never read, and persisting it would let an authenticated caller turn an arbitrary `model` value into durable data, which is the same objection §6.6 raises against storing raw session identifiers. A request whose client vanished before any status was written appears in neither table, which is a decision rather than an omission: the row exists so that an identifier a client is holding can be resolved, and a client that never received one is holding nothing.
 
 ### 15.4 IDs
 
@@ -1167,6 +1188,8 @@ The schema enforces:
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
 - Boolean values restricted to zero/one.
+- Unique `logical_request_id` in `unrouted_request`, with `local_error_code` restricted to the fixed vocabulary of §22.
+- A `logical_request_id` appears in `unrouted_request` or in `attempt_log` and never in both. That one is an application rule asserted by tests rather than a trigger, because enforcing it in the schema means a cross-table query on every insert to buy a guarantee that a single writer per request already provides.
 
 ### 15.9 Indexes
 
@@ -1180,11 +1203,12 @@ Create indexes for:
 - `(requested_alias, started_at_us)`.
 - `(outcome, started_at_us)`.
 - `(error_class, started_at_us)`.
+- `unrouted_request(finished_at_us)`.
 
 ### 15.10 Append-only enforcement
 
 - The application exposes no update or delete method.
-- SQLite triggers reject `UPDATE` and `DELETE` on all three durable tables.
+- SQLite triggers reject `UPDATE` and `DELETE` on all four durable tables.
 - Schema metadata uses `PRAGMA user_version`.
 - Migrations are numbered, embedded, forward-only, and transactional.
 - A database newer than the binary understands causes fatal startup.
@@ -1197,6 +1221,7 @@ Correctness evidence and analytics have different commit points, because they an
 1. `dispatch_admission` commits synchronously after the in-memory reservation and before `http.Client.Do`.
 2. Each selection phase accumulates a bounded set of skip facts in memory. When that phase’s dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
 3. `process_event` commits once at startup and once at shutdown. It is the only durable write that belongs to no request, which is why its failure modes are read against the lifecycle rather than against a client result.
+4. `unrouted_request` commits once, in its own transaction, and only for a request that never reached account selection. It is appended after the local response has been written, so a slow or failing store can neither delay nor alter a local rejection, and it uses the same bounded store context as the others so that a client cancellation or an expired deadline cannot suppress the record of exactly that.
 
 This means:
 
@@ -1962,6 +1987,7 @@ No startup failure triggers an upstream request.
 | Disk full during an admission write | Local 503 for every new dispatch; already-admitted attempts finish |
 | Lifecycle start row cannot be appended | Fatal startup |
 | Lifecycle stop row cannot be appended | Sanitized stderr error; exit status unchanged |
+| Local rejection row cannot be appended | Sanitized stderr error; the client result was already written and is unchanged |
 | Runtime corruption error | Sanitized high-severity log; continue only where connection remains usable |
 | Store becomes unusable | Repeated append failures remain visible; no in-memory unbounded queue |
 | Crash before terminal phase transaction | Active attempt result and pending skip rows may be absent; its admission row is not |
@@ -2505,6 +2531,8 @@ Verify:
 - Full token counts.
 - Session digest stability across restart, and absence of the raw header.
 - All three record kinds.
+- One `unrouted_request` row for each envelope rejection, overload, and unknown alias, carrying the identifier the client was given.
+- No `logical_request_id` present in both `unrouted_request` and `attempt_log`, across the full matrix of local rejections, selection failures, and dispatched requests.
 - Selection and attempt numbering.
 - Aggregate skip counts.
 - Upstream retry delay persisted on 429 dispatch rows, in both the delta and the HTTP-date form, and absent everywhere else.
@@ -2780,6 +2808,8 @@ The README must provide SQLite query recipes, described and tested against the a
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request, and the dispatch amplification they represent.
 - Authentication failures and the account disablement they caused.
+- The lookup of any `X-LLMux-Request-ID` a consumer reports, which resolves in `attempt_log` for a request that reached account selection and in `unrouted_request` for one rejected before it, and in exactly one of the two.
+- Local rejections by error code and time range, which is what a consumer suddenly sending bodies the envelope refuses looks like from here.
 - Client-visible outcome per logical request, which is the terminal row of each `logical_request_id` and not the union of its attempts.
 - Final-response token counts per logical request, taken from that terminal row. Summing token columns across attempt rows counts a retried request several times, which is the one arithmetic mistake this schema invites.
 - Attempt and logical-request latency distributions, the second being handler start through the terminal row rather than the sum of attempt durations.
@@ -2938,7 +2968,7 @@ Deliver:
 
 - Pinned cgo-free driver.
 - Embedded initial migration.
-- Append-only `dispatch_admission`, `attempt_log`, and `process_event` tables with their triggers.
+- Append-only `dispatch_admission`, `attempt_log`, `process_event`, and `unrouted_request` tables with their triggers.
 - Secure file pre-creation and permission checks.
 - Synchronous fail-closed admission insert API.
 - Transactional phase-batch insert API.
@@ -3137,7 +3167,7 @@ The project is complete only when all of the following are true:
 - Local limiter/health skips are durably visible.
 - A no-dispatch capacity failure has an explicit terminal record.
 - All record IDs are proxy-generated.
-- Clients receive `X-LLMux-Request-ID` and can find their own request in SQLite with it.
+- Clients receive `X-LLMux-Request-ID` and can find their own request in SQLite with it, including a request the envelope rejected before routing, and it resolves in exactly one table.
 - Prompt and completion text are absent from durable and process logs.
 - Raw session identifiers are absent from both.
 - Currency and cost logic are absent.

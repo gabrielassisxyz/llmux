@@ -2580,6 +2580,9 @@ Verify:
 - Unknown parameters reach upstream.
 - Message arrays are byte-identical at upstream.
 - No `/v1/models` request reaches upstream.
+- A staged timing fixture advances the monotonic clock by a distinct nonzero amount in each phase of one request: pre-selection handler work, the selection wait, the admission commit, the upstream call before its first event, the remainder of the response, and the terminal relay. It asserts that `selection_wait_us` runs from phase start to lease acquisition, `attempt_duration_us` from `Do` to response close, `time_to_first_event_us` from `Do` to the first qualifying event, `logical_elapsed_us` from handler start to the row's own terminal boundary, and `event_at_us` at the wall instant of `Do` rather than of the reservation before it. The admission commit's own duration appears in none of the upstream-call figures.
+
+Every phase of that fixture is a different number on purpose, and it is what the rest of this section cannot do. A timing test whose intervening phases take no synthetic time passes just as happily against an implementation that starts `attempt_duration_us` at the reservation, starts `logical_elapsed_us` at selection, folds the admission commit into upstream latency, or fills `selection_wait_us` from handler start, because every one of those wrong anchors returns the same value as the right one when nothing happens between them. With a five-second admission commit and a first event 100 ms after `Do`, the regressed implementation reports 5.1 seconds and the generic assertion still holds. Distinct nonzero phases are what turn each of those into a different number instead of the same one.
 
 ### 28.11 Streaming integration tests
 

@@ -4,7 +4,7 @@ The workspace is read-only, so I could not create `IMPLEMENTATION_PLAN.md`. Belo
 
 ## 1. Purpose and implementation contract
 
-This document is the implementation contract for `llmux`. Implementation work should follow it without reopening the closed decisions in [IDEA.md](/tmp/flywheel-cleanroom/room-codex/IDEA.md).
+This document is the implementation contract for `llmux`. Implementation work should follow it without reopening the closed decisions in [IDEA.md](/tmp/cleanroom/room-codex/IDEA.md).
 
 `llmux` is a single-user, single-machine OpenAI-compatible routing proxy. It exposes two HTTP resources, routes seven logical model aliases across three Ollama Cloud accounts, preserves conversation-to-account affinity, enforces account-wide ceilings, relays streaming and non-streaming responses, and writes append-only attempt records to one embedded SQLite store.
 

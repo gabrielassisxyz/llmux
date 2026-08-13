@@ -941,6 +941,7 @@ The observer must not retain unbounded response text.
 - SSE frames are observed incrementally while the original bytes are relayed.
 - The relayed bytes are never decompressed, re-encoded, or altered by observation, and automatic transport decompression stays off. Whatever encoding upstream chose reaches the client exactly as it arrived.
 - For a response whose `Content-Encoding` is exactly `gzip`, the observer feeds a copy of the relayed bytes through a bounded streaming decoder from the standard library and reads the decoded output exactly as it reads an identity body. Decoded output carries the same caps as identity observation plus a cumulative decoded-output cap, which is what bounds the work a degenerate or hostile response can demand. Exceeding any cap abandons observation for that response and never touches relay.
+- The decoder pulls and the relay pushes, so the copy crosses a bounded buffer between them. The observer never delays a downstream write: when that buffer is full the bytes that would have entered it are dropped and observation is abandoned for the response. Whatever bridges the two is created with the request and torn down with it, and abandoning is an ordinary outcome of that path rather than a failure.
 - Any other content encoding, including a multi-valued one, and any decoder error, disables semantic observation for that response. Exact relay continues either way, and both token counts and first-event timing are `NULL`.
 - Under progressive relay, whether SSE or oversized non-streaming, the observer consumes chunks after or alongside successful downstream writes, so observation can never delay or reorder relay.
 - JSON strings and unrelated values are skipped rather than copied into a second response-sized structure.
@@ -950,6 +951,8 @@ The observer must not retain unbounded response text.
 - Parser panics are prohibited and fuzz-tested.
 
 The decoder exists because without it the evidence the whole of §30 rests on can quietly go to zero. `Accept-Encoding` crosses to upstream in the request allowlist, and mainstream HTTP stacks advertise compression by default, so if upstream honours what a consumer sends then token counts, usage and first-event timing are `NULL` for every request that consumer makes, and the weekly ceiling re-derivation loses its volume and latency signal without anything reporting a failure. Dropping `Accept-Encoding` from the allowlist is the cheaper fix and is rejected: it spends real bandwidth on every completion to solve a problem on the observer’s side of the process, and it mutates upstream-visible negotiation on behalf of a client that asked for something else. Whether the decoder is needed at all is a question about upstream rather than a question of design, so the Phase 0 gate measures which encoding upstream actually selects for each consumer’s real `Accept-Encoding`, and that measurement decides whether the decoder ships. Timing observed through the decoder inherits upstream’s own flush boundaries, which are the boundaries the client sees too, so a first-event figure stays comparable across encodings.
+
+Forcing `Accept-Encoding: identity` upstream and dropping the header from the request allowlist would delete the decoder, its bridge, and the decompression-bomb path in one move, and it remains rejected. It alters what the client asked for so that the proxy can read the answer more easily, which §30.7 states as a general principle in the other direction: the proxy will not alter a request or a response to improve its own observability, and what the callers send is therefore what decides what the log can hold. It also spends real bandwidth on every completion, permanently, to solve something on the observer’s side of the process. What it removes is conditional, since the decoder ships only if the Phase 0 gate finds upstream selecting a compressed encoding at all, so the trade is a bounded buffer and one lifecycle against a stated principle and a standing cost.
 
 ## 15. Durable data model
 
@@ -1133,6 +1136,7 @@ The row stops at the outcome and holds no client string the proxy did not valida
 | `prompt_tokens` | Integer, nullable | Upstream-reported count |
 | `completion_tokens` | Integer, nullable | Upstream-reported count |
 | `total_tokens` | Integer, nullable | Upstream-reported count |
+| `usage_observation` | Text, nullable | Why the token columns hold what they hold: `not_applicable`, `absent`, `complete`, `malformed`, `truncated`, `unsupported_encoding`, or `limit_exceeded`; null for skips and selection failures |
 | `limiter_rpm_used` | Integer, nullable | Per-account snapshot at a skip; null on dispatch rows, which carry it on their admission row |
 | `limiter_in_flight` | Integer, nullable | Per-account snapshot at a skip; null on dispatch rows, which carry it on their admission row |
 | `skip_reason` | Text, nullable | Local selection reason |
@@ -1142,6 +1146,8 @@ The row stops at the outcome and holds no client string the proxy did not valida
 The schema contains no body, message, completion, raw session identifier, header value, credential, raw upstream error, upstream ID, cost, price, or currency column.
 
 The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_key`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
+
+`usage_observation` is the exception that proves the rule above rather than a breach of it, and it earns its place on the test `upstream_retry_after_s` passed: a named reader on the day it is written. A null token count means any of upstream sending no usage object, a streaming client never asking for one, a response encoding the observer could not decode, a line past the observer’s cap, or a truncated stream, and today nothing separates them. §30.3 tells the operator to notice a run of nulls and then go and work out which, and §30.10 re-derives the per-account ceilings from a signal that can quietly fall to zero for one of those reasons without anything reporting it. Seven closed values with a single writer replace a heuristic that whoever reads the runbook next has to re-derive.
 
 A validated consumer label, supplied by the caller in a fixed header, was considered on the same rule and rejected by it. It would be evidence rather than tenancy, since nothing would authenticate, route, or throttle on it, and a closed lowercase vocabulary rejected on mismatch would not reopen the question §6.6 settles for session identifiers. What it lacks is a reader the existing columns cannot serve. With three consumers, one of which is the only sessionless caller, `session_key`, `requested_alias`, and `request_streaming` already separate them, and the header would have to be added to all three callers as one more cutover precondition to buy that. It earns its cost at a fourth consumer, or at a second sessionless one, which is the point at which the attribution in §30.3 stops working; adding the column then is a migration, and a migration is the direction this schema treats as cheap.
 
@@ -1198,6 +1204,7 @@ The schema enforces:
 - `skip_reason` required only for skip records.
 - `skip_observation_count >= 1` only for skip records.
 - `dropped_header_count` non-negative, and present only for dispatch records.
+- `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
 - `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429.
@@ -2501,7 +2508,8 @@ Test:
 - A nested value named `usage` that is not the top-level object.
 - A request marked `"stream": true` whose upstream content type says otherwise still relays progressively.
 - A gzip response relays byte-identically while usage and first-event timing are observed through the bounded decoder.
-- A response in an encoding the observer cannot decode, and one that trips the decoded-output cap, relay byte-identically with observation disabled and null counts.
+- A response in an encoding the observer cannot decode, and one that trips the decoded-output cap, relay byte-identically with null counts, and record `unsupported_encoding` and `limit_exceeded` respectively.
+- An observer that falls behind the relay abandons observation at its bounded buffer rather than delaying a downstream write.
 - A decompression bomb abandons observation at the output cap without slowing or altering relay.
 - No proxy-injected `stream_options`.
 - No retry after first committed byte.
@@ -2553,6 +2561,7 @@ Verify:
 - WAL growth and its warning under a deliberately held external reader.
 - Null token counts.
 - Full token counts.
+- Every value of the `usage_observation` vocabulary, and its absence on skip and selection-failure rows.
 - Session digest stability across restart, and absence of the raw header.
 - All three record kinds.
 - One `unrouted_request` row for each envelope rejection, overload, and unknown alias, carrying the identifier the client was given.
@@ -2842,7 +2851,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Final-response token counts per logical request, taken from that terminal row. Summing token columns across attempt rows counts a retried request several times, which is the one arithmetic mistake this schema invites.
 - Attempt and logical-request latency distributions, the second being handler start through the terminal row rather than the sum of attempt durations.
 - First-data-event distributions for streaming calls.
-- Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began advertising a response encoding the bounded observer cannot decode, which disables observation by design.
+- Prompt, completion, and total token sums with nulls kept distinct from zeros. Where counts are absent, `usage_observation` says which reason applies instead of leaving it to be inferred, and a run of `unsupported_encoding` is a consumer that started advertising an encoding the bounded observer cannot decode.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
 - Process uptime spans and unclean stops, which is what turns a missing `eod` row into either a consumer failure or proxy downtime.

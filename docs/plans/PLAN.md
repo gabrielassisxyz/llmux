@@ -105,9 +105,10 @@ The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s offic
 ### 6.1 Listen address
 
 - Default: `127.0.0.1:4000`.
-- `LLMUX_LISTEN_ADDR` may replace it.
-- Startup emits a warning if the configured address is not loopback.
-- TLS is not added because all specified consumers are local.
+- `LLMUX_LISTEN_ADDR` may change the loopback address or the port.
+- A wildcard address, a hostname that resolves outside loopback, or any non-loopback IP is a fatal configuration error. Remote exposure belongs behind a separately configured reverse proxy that terminates TLS and authenticates, not behind a flag on this process.
+- TLS is not added because all specified consumers are local, which is the same decision as the rule above rather than a second one: a shared bearer key in cleartext on a wildcard bind is the failure that rule prevents.
+- The local server speaks HTTP/1.x only. Cleartext HTTP/2 requires prior knowledge that none of the three consumers use, and restricting it makes the committed-response abort semantics one path instead of two, the second of which could never be exercised here.
 - No CORS behavior is added.
 
 ### 6.2 Routes
@@ -801,7 +802,7 @@ For an upstream read failure after commitment:
 - Attempt the synchronous log transaction.
 - Abort the HTTP response using `http.ErrAbortHandler` or the equivalent protocol-aware server mechanism.
 - The top-level panic recovery boundary must recognize and re-propagate the abort sentinel. It must not turn it into a local 500 or emit a misleading stack trace.
-- Under HTTP/1.x the client must observe a closed/truncated response; under HTTP/2 it must observe a stream error/reset.
+- The client must observe a closed and truncated HTTP/1.x response. That is the only case, because the local server speaks HTTP/1.x only.
 
 A downstream write error means the client is already gone. In that case, cancel upstream, release and log, then return without a second abort.
 
@@ -1746,6 +1747,7 @@ Visible result: stable base and pinned aliases.
 | Missing account key | Fatal startup |
 | Duplicate account keys | Fatal startup |
 | Invalid listen address | Fatal startup |
+| Non-loopback listen address | Fatal startup |
 | Invalid catalog | Fatal startup |
 | Relative log path | Fatal startup |
 | Missing log directory | Fatal startup |
@@ -1919,8 +1921,7 @@ The implementation must document and test these invariants:
 
 ### 26.4 Local exposure
 
-- Default bind is loopback.
-- Non-loopback bind produces a warning.
+- Binding is loopback only, enforced at startup.
 - Every endpoint requires authentication.
 - No debug, pprof, expvar, metrics, or admin listener is enabled.
 - SQLite file permissions are restricted.
@@ -1991,7 +1992,6 @@ Events include:
 - Runtime attempt-log insert failure.
 - Recovered handler panic.
 - Forced shutdown.
-- Non-loopback listen warning.
 - Recovery clock skew.
 
 Normal successful attempts need not produce duplicate process-log events because SQLite is the durable attempt record.
@@ -2000,7 +2000,7 @@ Normal successful attempts need not produce duplicate process-log events because
 
 - Debug: foreground routing decisions during explicit troubleshooting.
 - Info: startup, readiness, shutdown.
-- Warn: account cooldown, non-loopback bind, recoverable persistence problem.
+- Warn: account cooldown, recoverable persistence problem.
 - Error: account disablement, repeated store failure, panic, forced shutdown.
 - Fatal behavior is implemented by returning an error to `main`, which logs once and exits nonzero.
 
@@ -2284,7 +2284,7 @@ Test:
 - No proxy-injected `stream_options`.
 - No retry after first committed byte.
 - Post-commit upstream read failure produces a raw-client transport error rather than a clean completed response.
-- HTTP/1.x and HTTP/2 abort behavior are tested where the platform permits both.
+- Raw HTTP/1.x abort behavior is tested against the one protocol the local server enables.
 - Recovery middleware re-propagates `http.ErrAbortHandler`.
 - Exact output bytes despite observer failure.
 
@@ -2884,7 +2884,7 @@ Inspect SQLite to prove:
 The project is complete only when all of the following are true:
 
 - One static cgo-free binary starts with the required five secrets/path settings.
-- It listens on the configured local address.
+- It listens on the configured loopback address and refuses any other.
 - Both endpoints enforce the shared bearer key.
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
 - Every alias resolves to its fixed upstream model and eligible account set.

@@ -425,6 +425,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Dispatches per window/account | 60 |
 | In-flight attempts/account | 12 |
 | Maximum dispatches/logical request | 4 |
+| Minimum deadline runway before a retry dispatch | 5 seconds |
 | Intermediate response drain cap | 64 KiB |
 | SSE observer line cap | 1 MiB |
 | SQLite busy timeout | 5 seconds |
@@ -1498,7 +1499,7 @@ Reason:
 - Selection skips do not count as attempts.
 - Queueing and backoff consume the same ten-minute logical deadline.
 - Each account-selection phase has its own 60-second ceiling but never extends the logical deadline.
-- No retry begins unless enough deadline remains to acquire and dispatch.
+- No retry begins unless enough deadline remains to acquire and dispatch. "Enough" is five seconds: after the selection delay and the backoff are subtracted, at least that much logical deadline must remain before another dispatch is admitted. An unstated threshold is a decision made silently at the keyboard, and the failure it produces is a dispatch that spends an RPM slot on a request certain to expire mid-flight.
 - Expiration of the ten-minute logical deadline is terminal; it is not treated as a fresh retryable attempt timeout.
 
 ### 21.2 Classification table

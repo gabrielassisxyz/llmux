@@ -595,6 +595,7 @@ Properties:
 - Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
 - One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
+- One lifecycle row at startup and one at shutdown.
 - Startup-only recovery queries.
 - No ORM or database server.
 
@@ -611,11 +612,12 @@ Properties:
 7. Verify append permissions using a transaction that is rolled back.
 8. Recover recent rate timestamps from `dispatch_admission`, never from terminal attempt rows.
 9. Recover unexpired successful session pins.
-10. Construct the route coordinator.
-11. Construct the upstream transport and HTTP handlers.
-12. Bind the configured socket.
-13. Announce readiness only after the socket is bound.
-14. Serve until termination or fatal server failure.
+10. Append a `process_start` row.
+11. Construct the route coordinator.
+12. Construct the upstream transport and HTTP handlers.
+13. Bind the configured socket.
+14. Announce readiness only after the socket is bound.
+15. Serve until termination or fatal server failure.
 
 Startup fails if:
 
@@ -638,9 +640,10 @@ There is no degraded startup mode.
 5. Handler cleanup releases account leases.
 6. Handler cleanup appends terminal rows where possible.
 7. Close idle upstream connections.
-8. Close SQLite last.
-9. Return zero for orderly signal-driven shutdown.
-10. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
+8. Append a `process_stop` row.
+9. Close SQLite last.
+10. Return zero for orderly signal-driven shutdown.
+11. Return nonzero for startup failure, unexpected serve failure, or forced incomplete shutdown.
 
 No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is added. The passive checkpoint attempts in §15.2 run in the foreground of a terminal commit that is already happening, which is why they are not one.
 
@@ -975,7 +978,7 @@ If initial migration fails after a new file was created, preserve the file for d
 
 ### 15.3 Record granularity
 
-Two append-only tables exist, and the split is by commit point rather than by subject.
+Three append-only tables exist, and the split is by commit point rather than by subject.
 
 `dispatch_admission` holds the evidence a dispatch was authorized, and one row is committed synchronously before every possible upstream dispatch:
 
@@ -1001,7 +1004,7 @@ Record kinds:
 - `selection_skip`: one distinct local candidate rejection due to rate or account health.
 - `selection_failure`: one account-acquisition phase that ended without any dispatch.
 
-There is still no separate logical-request summary table. Client-visible outcome, final token counts, retry amplification, and end-to-end latency are all reconstructable from the attempt rows of one `logical_request_id`: the highest `sequence_no` row is what the client saw, its token counts are the final response’s, and counting `dispatch` rows is the amplification. A summary table would store no fact that is not already there, and would introduce the one failure the derived query cannot have, which is the two copies disagreeing. §30.3 therefore owes a tested recipe for each of those questions instead. The rule is the one applied to the omitted columns in §15.5: a table is cheaper to add in a later migration than two writers of one fact are to keep in agreement.
+There is still no separate logical-request summary table. Client-visible outcome, final token counts, retry amplification, and end-to-end latency are all reconstructable from the attempt rows of one `logical_request_id`: the highest `sequence_no` row is what the client saw, its token counts are the final response’s, and counting `dispatch` rows is the amplification. A summary table would store no fact that is not already there, and would introduce the one failure the derived query cannot have, which is the two copies disagreeing. §30.3 therefore owes a tested recipe for each of those questions instead. The rule is the one applied to the omitted columns in §15.5: a table is cheaper to add in a later migration than two writers of one fact are to keep in agreement. The lifecycle table below is not that case, and what separates them is the test rather than the subject, which is why the argument is written out where it is defined.
 
 A logical request may therefore contain:
 
@@ -1013,6 +1016,21 @@ A logical request may therefore contain:
 Pre-routing local failures do not produce attempt rows.
 
 Within one account-selection phase, repeated observations of the same `(account, reason)` pair are aggregated into one skip record with an observation count. A changed reason is a new skip fact. This prevents wake/recheck loops from amplifying the log while preserving every distinct reason an account was passed over.
+
+`process_event` holds one row per lifecycle edge of the proxy process itself:
+
+| Field | Type/nullability | Meaning |
+| --- | --- | --- |
+| `record_id` | Text, primary key | Proxy-generated row ID |
+| `event_kind` | Text, non-null | `process_start` or `process_stop` |
+| `at_us` | Integer, non-null | UTC Unix microseconds |
+| `version` | Text, non-null | Binary version, derived from build info the way §30.1 derives it |
+| `revision` | Text, non-null | VCS revision from build info |
+| `schema_version` | Integer, non-null | `PRAGMA user_version` after migration |
+
+A start row is appended once migration and recovery have succeeded and before readiness is announced, and failing to append it is a fatal startup like every other write failure at that point. A stop row is appended by every shutdown the process survives to perform, orderly or forced, after handlers drain and before the store closes; failing to append that one is a sanitized stderr event and does not change the exit status, because by then there is nothing left to protect. The absence of a stop row therefore means one thing only: the process died without reaching its shutdown path. Whether a shutdown was orderly or forced is deliberately not encoded here, because the process log already carries it and a stored vocabulary with no reader is exactly what §15.5 refuses.
+
+This table passes the test the summary table failed, and the difference is worth stating because the two look alike from a distance. Every field here is a fact no attempt row contains. An idle proxy and a stopped proxy produce identical row sets, so uptime is not derivable from the attempt log at all, and nothing in that log records which binary wrote a given span of rows or which schema version was in force at the time. There is one writer, the lifecycle path, so there is no second copy of a fact to drift from. Stderr already carries the same information, but stderr is ephemeral and cannot be queried alongside the rows, which is the whole reason this store holds its own history. The cost is two inserts per process lifetime, and what it buys is the difference between a missing `eod` row meaning the consumer failed and it meaning the proxy was not running.
 
 ### 15.4 IDs
 
@@ -1144,7 +1162,7 @@ Create indexes for:
 ### 15.10 Append-only enforcement
 
 - The application exposes no update or delete method.
-- SQLite triggers reject `UPDATE` and `DELETE` on both durable tables.
+- SQLite triggers reject `UPDATE` and `DELETE` on all three durable tables.
 - Schema metadata uses `PRAGMA user_version`.
 - Migrations are numbered, embedded, forward-only, and transactional.
 - A database newer than the binary understands causes fatal startup.
@@ -1156,6 +1174,7 @@ Correctness evidence and analytics have different commit points, because they an
 
 1. `dispatch_admission` commits synchronously after the in-memory reservation and before `http.Client.Do`.
 2. Each selection phase accumulates a bounded set of skip facts in memory. When that phase’s dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
+3. `process_event` commits once at startup and once at shutdown. It is the only durable write that belongs to no request, which is why its failure modes are read against the lifecycle rather than against a client result.
 
 This means:
 
@@ -1902,6 +1921,8 @@ No startup failure triggers an upstream request.
 | SQLite remains busy for an admission write | Cancel the reservation; local 503; no dispatch |
 | Disk full during a terminal write | Sanitized stderr error; continue serving |
 | Disk full during an admission write | Local 503 for every new dispatch; already-admitted attempts finish |
+| Lifecycle start row cannot be appended | Fatal startup |
+| Lifecycle stop row cannot be appended | Sanitized stderr error; exit status unchanged |
 | Runtime corruption error | Sanitized high-severity log; continue only where connection remains usable |
 | Store becomes unusable | Repeated append failures remain visible; no in-memory unbounded queue |
 | Crash before terminal phase transaction | Active attempt result and pending skip rows may be absent; its admission row is not |
@@ -2443,6 +2464,7 @@ Verify:
 - No prompt/completion columns.
 - No cost/currency columns.
 - Startup session recovery.
+- Process start and stop rows, and the absent stop row after a killed subprocess.
 - Startup rate recovery, driven by admission rows and not by terminal attempts.
 - Admission rows survive a subprocess killed immediately after their commit.
 - Busy timeout behavior.
@@ -2713,6 +2735,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began advertising a response encoding the bounded observer cannot decode, which disables observation by design.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
+- Process uptime spans and unclean stops, which is what turns a missing `eod` row into either a consumer failure or proxy downtime.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Sessionless calls in the expected `eod` execution window.
 
@@ -2859,7 +2882,7 @@ Deliver:
 
 - Pinned cgo-free driver.
 - Embedded initial migration.
-- Append-only `dispatch_admission` and `attempt_log` tables with their triggers.
+- Append-only `dispatch_admission`, `attempt_log`, and `process_event` tables with their triggers.
 - Secure file pre-creation and permission checks.
 - Synchronous fail-closed admission insert API.
 - Transactional phase-batch insert API.
@@ -2962,6 +2985,7 @@ Deliver:
 - Graceful and forced shutdown.
 - Panic recovery.
 - Structured lifecycle logging.
+- Durable process start and stop rows.
 - Secure file checks.
 - Static build automation with `-trimpath` and published checksums.
 - `llmux version`, deriving its output rather than restating it.
@@ -3061,6 +3085,7 @@ The project is complete only when all of the following are true:
 - Raw session identifiers are absent from both.
 - Currency and cost logic are absent.
 - Startup recovers recent rate timestamps and successful session pins.
+- Every process start, and every shutdown the process survives to perform, is a row in the durable store.
 - Graceful shutdown releases permits and closes SQLite last.
 - Request bodies, account acquisition, retries, downstream writes, and store cleanup each have an independently enforceable bound.
 - Installation, backup, recovery, cutover, and rollback runbooks are complete and tested.

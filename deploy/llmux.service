@@ -1,2 +1,34 @@
 [Unit]
-Description=llmux proxy
+Description=llmux OpenAI-compatible routing proxy
+After=network.target
+
+[Service]
+Type=simple
+# Run as the current user, adjust as needed for the specific deployment
+User=%i
+Group=%i
+
+# The environment file should be placed outside the repository, e.g., in ~/.config/llmux/
+# and must have 0600 permissions.
+EnvironmentFile=%h/.config/llmux/llmux.env
+
+# Set GOMEMLIMIT above the aggregate memory budget (512 MiB) with room to spare.
+# This prevents the Go runtime from using too much memory, but leaves headroom for
+# SQLite and goroutines.
+Environment=GOMEMLIMIT=800MiB
+
+# Provide the path to the static binary.
+ExecStart=%h/bin/llmux
+
+# Restarts only on process failure
+Restart=on-failure
+RestartSec=5s
+
+# Security: Disable core dumps to prevent leaking credentials or prompt text
+LimitCORE=0
+
+# Security: Set owner-only umask
+UMask=0077
+
+[Install]
+WantedBy=default.target

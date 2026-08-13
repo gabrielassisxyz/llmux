@@ -965,7 +965,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Reject group/other-readable existing files.
 - Recheck database and SQLite sidecar permissions after enabling WAL.
 - Use WAL journal mode.
-- Use full synchronous durability.
+- Use full synchronous durability, unless and until the measurement §28.18 owes shows its cost is material. The alternative and the condition that would settle it are stated below.
 - Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite's automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
 - Attempt a passive checkpoint in the foreground after a bounded number of terminal commits, and again when a terminal commit finds the WAL past its warning threshold. A checkpoint never runs in the foreground of an admission commit: that commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw, while the same work behind a terminal commit runs after the response was relayed and is invisible to every client.
 - Never block request handling on a restart or truncate checkpoint.
@@ -974,6 +974,10 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Set maximum open and idle database connections to one.
 - Use parameterized SQL only.
 - Check every database error.
+
+`synchronous=NORMAL` is the alternative, and it is deliberately not taken yet. Under WAL it loses nothing to a process crash, because a committed WAL write is visible to a restarted process whether or not it was ever synced, so every crash-boundary property the admission ledger exists for survives it. What it surrenders is the newest commits across an operating-system crash or power loss, and that exposure is genuinely small: rate recovery reads only the last 60 seconds of admissions, so a lost admission matters only if the machine loses power, boots, and resumes dispatching inside one rolling window while an account sits at its ceiling, and the thing overrun then is the self-imposed guard of §9.2 rather than an upstream contract.
+
+What it costs is a promise. §2 states without qualification that a restarted process cannot exceed the ceiling it claims to enforce, and under NORMAL that sentence needs an exception written into it. What full durability costs is one fsync per dispatch, on a path whose other component is an upstream call measured in seconds, plus whatever queueing that fsync creates against every other statement on the single connection. Neither number has been measured on the filesystem this store will live on, and trading a stated guarantee for an unmeasured saving is the wrong order to work in. §28.18 owes that measurement and the bullet above is where the answer lands. The first-event metric is no longer an argument in either direction, because §14.1 anchors it at the `Do` invocation and the admission commit therefore sits outside the number it would otherwise have polluted.
 
 SQLite-managed `-wal` and `-shm` files are part of the one embedded store, not separate services or application logs.
 
@@ -2575,6 +2579,7 @@ Benchmarks and load checks must establish:
 - SSE relay does not accumulate total stream size.
 - Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
+- The admission commit's own latency, measured on the filesystem the store will live on and at the concurrency the in-flight ceilings permit, reported against total dispatch latency. It is the only durable write on a request's critical path, and the synchronous level chosen in §15.2 is answerable from this number rather than from argument.
 - SQLite inserts do not hold coordinator state.
 - Selection rechecks produce bounded aggregated skip state.
 - 28 catalog entries and tens of thousands of rows do not materially affect startup.
@@ -2625,7 +2630,7 @@ Consequences:
 
 Synchronous writes make completion visibility deterministic and avoid an unbounded queue or background writer. Grouping a phase’s skips and terminal record in one transaction avoids one commit per recheck while retaining append-only rows. The accepted costs are that retry progression can wait for an earlier attempt’s transaction and that final streaming bytes may reach the client before final persistence.
 
-The admission write is synchronous for a different reason: it is not analytics, it is the input to a correctness decision the next process makes. Its costs are stated plainly because they are real. Every dispatch now pays one durable commit before the send, all such commits serialize through the single database connection, and a store that cannot accept them makes the proxy refuse to originate traffic rather than serve it unrecorded. Against an upstream call measured in seconds, one commit is not the expensive part of a dispatch, and the alternative is a ceiling that quietly means something weaker than what §2 promises.
+The admission write is synchronous for a different reason: it is not analytics, it is the input to a correctness decision the next process makes. Its costs are stated plainly because they are real. Every dispatch now pays one durable commit before the send, all such commits serialize through the single database connection, and a store that cannot accept them makes the proxy refuse to originate traffic rather than serve it unrecorded. Against an upstream call measured in seconds, one commit is not the expensive part of a dispatch, and the alternative is a ceiling that quietly means something weaker than what §2 promises. The number missing from that sentence is how long the commit actually takes on the filesystem this store will live on, at the concurrency the in-flight ceilings permit, where each commit also queues behind every other statement on the single connection. §28.18 measures it, and §15.2 records what a material answer would change.
 
 ### 29.6 Admission rows plus terminal attempt rows
 
@@ -2906,6 +2911,7 @@ Gate:
 
 - Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
 - An admission insert that fails is reported to its caller as a failure and never as a partial success.
+- The admission commit's latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it.
 - Static cgo-free test build succeeds.
 
 ### Phase 3: Request scanner and rewriter

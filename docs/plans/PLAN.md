@@ -866,7 +866,7 @@ The lease goes back at upstream EOF and not after the downstream write, because 
 
 This buffering does not persist completion text. It is request-lifetime process memory and is released immediately after relay. It is bounded independently of the request-body buffer.
 
-Final non-retryable 3xx/4xx responses and exhausted 5xx responses may be committed and relayed without waiting for a complete 8 MiB precommit read; their upstream status is already the final client-visible result. A later body failure is recorded and the response is aborted rather than rewritten.
+Final non-authentication 4xx responses and exhausted 5xx responses may be committed and relayed without waiting for a complete 8 MiB precommit read; their upstream status is already the final client-visible result. An upstream 3xx or 101 never reaches this path, because §13.2 turns it into a local 502 before commitment, and neither does a 401, because §20.1 fails the request over to another eligible account or answers a local 502 rather than relaying one. A later body failure is recorded and the response is aborted rather than rewritten.
 
 ### 13.6 Response commitment
 

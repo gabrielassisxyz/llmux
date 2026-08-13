@@ -2761,6 +2761,8 @@ The service has a small fixed dependency graph. Manual construction is explicit,
 
 A single file would entangle JSON rewriting, HTTP commitment, rate state, and persistence. A large layered architecture would add indirection without additional domains. Cohesive internal packages provide the useful middle ground.
 
+Splitting relay out of `internal/proxy` into a package of its own, on the prediction that `internal/proxy` becomes the largest and highest-risk package here, is considered and not taken. `internal/rewrite` earned its extraction on a property relay does not share: it has no HTTP dependency at all, its contract is a byte-level guarantee that stands as a public API in its own right, and its fuzz targets build without any server plumbing. Relay is HTTP from end to end, and the coupling the split would leave behind is the worst one in this design to turn into a cross-package contract, because the rule that no retry follows commitment is held jointly by the retry loop and the commitment state machine and owned by neither. A seam is extracted from code that exists and has shown where it wants to divide, not designed against a prediction about code that does not, and the file-size guideline is what forces the question at the point where it can be answered.
+
 ### 29.4 Bounded in-memory request buffering
 
 Retries require a replayable request. Disk spooling would store prompt text, while unbounded buffering risks process exhaustion. A 64 MiB in-memory ceiling makes the resource cost explicit.

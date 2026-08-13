@@ -125,7 +125,7 @@ Sections 23, 29, and 32, and all of section 24 except §24.6, restate behavior t
 | Upstream base | `https://ollama.com/v1` |
 | Static build | `CGO_ENABLED=0` release build |
 
-The toolchain row names a patch release and not only a language version, because a language version in a module is a floor that the toolchain in front of it may sit above or below, and the patch releases are where the standard library’s own security fixes land. This document deliberately does not carry the number. The exact patch is chosen at Phase 1 from the then-current 1.26 release and advanced by reviewed updates afterwards, for the same reason §8.4 refuses to carry provisional model strings: a version written into prose rots between the writing and the building, and the one copy that is checkable is the module file the build actually reads.
+The toolchain row names a patch release and not only a language version, because a language version in a module is a floor that the toolchain in front of it may sit above or below, and the patch releases are where the standard library’s own security fixes land. This document deliberately does not carry the number. The exact patch is chosen at Phase 1 from the then-current 1.26 release and advanced by reviewed updates afterwards, for the same reason §8.4 refuses to carry provisional model strings: a version written into prose rots between the writing and the building, and the one copy that is checkable is the module file the build actually reads. Phase 1 owns that choice and §31 gates it there, so the pin exists before any code is written against it rather than being noticed at the first release, and §28.17 confirms on every build afterwards that the pinned toolchain is the one that ran.
 
 The fixed Ollama Cloud OpenAI-compatible base is documented by [Ollama’s official integration documentation](https://docs.ollama.com/integrations/droid). Which request fields and reasoning values that base accepts is documented separately, by [Ollama’s OpenAI compatibility documentation](https://docs.ollama.com/api/openai-compatibility).
 
@@ -492,6 +492,8 @@ The two per-account ceilings are the exception, and the reason is worth stating 
 Upstream 429 is the only authoritative statement of the real limit, and the design reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log.
 
 What that log can settle runs in one direction only. Sustained 429s under the local ceiling prove the ceiling is set too high and by roughly how much. Silence proves nothing: a ceiling of 60 cannot discover whether upstream would have accepted 100, because it is the thing preventing the dispatches that would answer the question. The ceilings are therefore safety and resource policy, chosen high enough to stop being the binding constraint at the traffic these three consumers produce, and revised downward from evidence rather than upward from hope. They are expected to be re-derived from success, latency, 429 and saturation data after real traffic, which is the one tuning this document invites.
+
+That invitation has an owner and a gate, because an invitation with neither is a constant nobody ever revisits. The owner is the post-cutover review of §30.10, which is also where the cooldown constants of §20.2 are re-derived, and the gate is stated there. Until that review has produced its decision, the two numbers above are what the implementation enforces and what its tests assert; they are not provisional in the sense §8.1 uses for the upstream model strings, which no implementation may be built on at all.
 
 The in-flight ceiling keeps a second job that survives the change: it bounds concurrent upstream work, since every live attempt holds its replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses. It does not bound memory on its own, because a request buffers its body long before it reaches an account; that is the aggregate gate’s job.
 
@@ -1000,6 +1002,8 @@ Forcing `Accept-Encoding: identity` upstream and dropping the header from the re
 
 Whether they exist is a question about upstream and not a design choice, so it is settled where the other such questions are. If the Phase 0 gate records upstream sending a stable numeric family of them, a migration adds two nullable integer columns to the terminal attempt row and Phase 5 fills them by parsing the exact header names Phase 0 recorded, never a body, leaving them null whenever a header is absent or does not parse. Nothing routes, throttles, retries, or waits on them; their only reader is the weekly re-derivation of §30.10, which today reads silence as evidence of nothing. If Phase 0 finds no such headers, nothing ships and the schema gains nothing, which is the same conditional the observation decoder above already carries.
 
+Phase 5 owns both halves of that, and neither belongs to Phase 2. The migration that adds the columns is a Phase 5 deliverable ordered before the projection that fills them, rather than a line in the initial migration Phase 2 delivers, so that a Phase 0 answer of no leaves the schema exactly as Phase 2 shipped it and a later yes is an ordinary forward migration. Phase 5’s gate is the three-place rule §0 states for any column: either the two columns are declared in §15.5, constrained in §15.8, and read by a recipe in §30.3 that §28.13 executes, or Phase 0 recorded no such header family and none of those three places changed.
+
 The columns are not declared in §15.5 ahead of that answer. A conditional behavior is cheap to describe and a conditional column is not, because the schema is the thing §15.10 forbids updating and a migration is the sanctioned way to add to it; the condition is recorded there instead, in the form that section already uses for a column it has declined.
 
 ## 15. Durable data model
@@ -1212,7 +1216,7 @@ A validated consumer label, supplied by the caller in a fixed header, was consid
 
 Request and response body-size columns were considered on the same rule and fail it in the ordinary direction. They would be content-free metadata of the same class as a token count, and nothing in this store can say today how often a real response passes the 8 MiB precommit bound or how close real traffic comes to the 64 MiB envelope and the aggregate budget. What they lack is a reader. §9.2 fixes those three constants and states that they are not a tuning surface, and the one re-derivation this document does invite is of the per-account ceilings, which reads none of them; a column added now would arrive with a recipe written to justify it. The condition that buys them is a precommit bound or a memory budget that starts binding in production, which the existing overload rejections and their error codes are what makes visible first, and adding the columns at that point is a migration.
 
-The rate-limit projection of §14.4 is recorded here on the same terms, read forward rather than backward. Its reader exists today in §30.10 and the fact it would hold is one no other column can produce, since nothing else in this store can bound the local ceiling from below. What is not established is that upstream sends the headers at all, and that is what the Phase 0 gate answers. So the condition is written down and the columns are not: if the gate finds a stable numeric header family, a migration adds `upstream_rl_limit` and `upstream_rl_remaining` as nullable integers before Phase 5 fills them, and if it does not, nothing was carried for a fact that never arrives.
+The rate-limit projection of §14.4 is recorded here on the same terms, read forward rather than backward. Its reader exists today in §30.10 and the fact it would hold is one no other column can produce, since nothing else in this store can bound the local ceiling from below. What is not established is that upstream sends the headers at all, and that is what the Phase 0 gate answers. So the condition is written down and the columns are not: if the gate finds a stable numeric header family, Phase 5 adds `upstream_rl_limit` and `upstream_rl_remaining` as nullable integers in a migration of its own before filling them, and if it does not, nothing was carried for a fact that never arrives.
 
 ### 15.6 Outcome vocabulary
 
@@ -1690,7 +1694,7 @@ A second, shorter deadline alongside the cooldown was the alternative and is not
 
 This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window, and it keeps a 429 from delaying a dispatch to an account that never sent one.
 
-A 429 is account-specific backpressure and an operational signal, not traffic the design goes looking for. Since the local ceilings are not known to sit below upstream’s, this path may turn out to be the binding rate control or may almost never fire, and which one it is will be visible in the log rather than decidable here. The cooldown threshold and duration are the first constants to re-derive from that log once real traffic exists.
+A 429 is account-specific backpressure and an operational signal, not traffic the design goes looking for. Since the local ceilings are not known to sit below upstream’s, this path may turn out to be the binding rate control or may almost never fire, and which one it is will be visible in the log rather than decidable here. The cooldown threshold and duration are the first constants to re-derive from that log once real traffic exists. They are re-derived by the same owner and under the same gate as the two per-account ceilings of §9.2, both of which are stated in §30.10, and a re-derivation that changes them is an edit to this section.
 
 ### 20.3 Server and transport failures
 
@@ -3128,6 +3132,8 @@ For the first week of real traffic, inspect the attempt store at least daily for
 
 This is human log review, not a background health checker. Any discovered defect becomes a reproducible automated test before correction.
 
+The ceiling re-derivation above is the one obligation this document carries that falls after the last phase of §31, which is why its gate is stated here rather than there. It is owned by whoever runs this review, and it is complete when a dated entry records one of exactly two outcomes for the two per-account ceilings of §9.2 and for the cooldown threshold and duration of §20.2: new values, written into those sections, or the existing values kept, with the week’s dispatch, 429, saturation and latency figures that support keeping them. Neither outcome is the absence of an entry. A constant that no review has either changed or confirmed is still the guess §9.2 admits it to be, while the evidence that would settle it accumulates in a store nothing deletes.
+
 ## 31. Implementation sequence
 
 ### Phase 0: Contract inventory
@@ -3167,6 +3173,7 @@ Gate:
 
 - Catalog and configuration unit tests pass.
 - No network or database behavior yet.
+- The module’s toolchain directive names one exact 1.26 patch release, and CI builds on that toolchain and no other. This phase owns the choice §5 declines to carry, and §28.17’s confirmation that a build used the pinned toolchain runs from here onward rather than at the first release, because a toolchain nobody pinned is whichever one the machine happened to have.
 
 ### Phase 2: SQLite durable store
 
@@ -3243,13 +3250,14 @@ Deliver:
 - Intermediate response drain.
 - Final response commitment rules.
 - Ambiguous-send accounting.
-- The bounded rate-limit header projection of §14.4, if Phase 0 recorded upstream sending one.
+- The bounded rate-limit header projection of §14.4, if Phase 0 recorded upstream sending one, together with the migration that adds the two columns it fills. Both are this phase’s, in that order; neither is part of the initial migration Phase 2 delivers.
 
 Gate:
 
 - Scripted upstream matrix passes.
 - No retry occurs after commitment.
 - Each dispatch maps to one record.
+- Either the rate-limit columns exist in §15.5, carry their constraint in §15.8, and are read by a §30.3 recipe that §28.13 executes, or Phase 0 recorded no such header family and none of those three places changed. A column that ships in a migration and in none of the three is the drift §0 rule 8 exists to prevent.
 
 ### Phase 6: Relay and usage observation
 

@@ -18,8 +18,8 @@ When two sections appear to pull in different directions, the non-negotiable inv
 - Preserve the complete raw top-level `messages` value without changing any field inside it.
 - Keep a conversation on one account for a sliding hour whenever possible.
 - Enforce exactly:
-  - 25 dispatched upstream attempts in any rolling 60-second window per account.
-  - 3 live upstream attempts per account.
+  - 60 dispatched upstream attempts in any rolling 60-second window per account.
+  - 12 live upstream attempts per account.
 - Apply those ceilings across every alias, model, session, and retry that reaches the same account.
 - Retry only failures for which retry can plausibly change the result.
 - Disable revoked/lapsed credentials immediately and cool repeatedly rate-limited accounts.
@@ -364,8 +364,8 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Session affinity TTL | 1 hour |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
-| Dispatches per window/account | 25 |
-| In-flight attempts/account | 3 |
+| Dispatches per window/account | 60 |
+| In-flight attempts/account | 12 |
 | Maximum dispatches/logical request | 4 |
 | Intermediate response drain cap | 64 KiB |
 | SSE observer line cap | 1 MiB |
@@ -378,6 +378,12 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Upstream idle-connection timeout | 90 seconds |
 
 These are implementation constants, not a generic tuning surface.
+
+The two per-account ceilings are the exception, and the reason is worth stating because it changes what they are for. Neither 60 nor 12 is a published Ollama Cloud limit; no such limit is documented. They are self-imposed guards, and the earlier pair of 25 and 3 was a guess that had hardened into a specification. A guard set below the real ceiling is indistinguishable from the real ceiling, so it can never be measured, and the proxy spends capacity it has already paid for.
+
+Upstream 429 is the only authoritative statement of the real limit. The design therefore reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log. The ceilings above are set high enough to stop being the binding constraint, so that the log records upstream’s answer instead of the proxy’s assumption. They are expected to be re-derived from that log after real traffic, which is the one tuning this document invites.
+
+The in-flight ceiling keeps a second job that survives the change: it bounds concurrent resource use, since every live attempt holds its rewritten replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses.
 
 ### 9.3 Secret delivery and process launch
 
@@ -1082,8 +1088,8 @@ For an account candidate:
 2. Remove timestamps at or before `now - 60 seconds`.
 3. Expire a completed cooldown.
 4. Reject disabled or cooling accounts.
-5. Reject if in-flight is already 3.
-6. Reject if 25 timestamps remain.
+5. Reject if in-flight is already 12.
+6. Reject if 60 timestamps remain.
 7. Otherwise append `now`.
 8. Increment in-flight.
 9. Return an immutable release-once lease.
@@ -1125,15 +1131,15 @@ The coordinator uses a replace-on-notify channel:
 
 ### 17.4 Rationale
 
-An exact rolling deque directly enforces “25 in any 60 seconds.”
+An exact rolling deque directly enforces “60 in any 60 seconds.”
 
 It avoids:
 
-- Token-bucket bursts beyond 25 starts in a sliding minute.
+- Token-bucket bursts beyond 60 starts in a sliding minute.
 - Fixed-minute counters permitting 50 adjacent starts across a boundary.
 - Per-alias buckets that multiply real-account capacity.
 
-Each account retains at most 25 rate timestamps, so the memory cost is trivial.
+Each account retains at most 60 rate timestamps, so the memory cost is trivial.
 
 ### 17.5 Multi-process limitation
 
@@ -1292,6 +1298,8 @@ Cooldown duration:
 - Clear the recent-429 history on cooldown expiry.
 
 This tolerates isolated upstream rate responses while preventing repeated pressure on a genuinely closed window.
+
+With the local ceilings raised above any rate upstream is expected to accept, this path becomes the primary rate control rather than a fallback behind it. Upstream 429 responses are therefore expected in normal operation, not treated as anomalies, and the cooldown threshold and duration are the first constants to re-derive from the attempt log once real traffic exists.
 
 ### 20.3 Server and transport failures
 
@@ -1725,8 +1733,8 @@ The implementation must document and test these invariants:
 2. Every shared-state read or write occurs under the coordinator mutex.
 3. No I/O occurs while holding it.
 4. Every acquired lease is released exactly once.
-5. In-flight never becomes negative or exceeds three.
-6. No account has more than 25 admitted starts in a rolling 60-second interval.
+5. In-flight never becomes negative or exceeds twelve.
+6. No account has more than 60 admitted starts in a rolling 60-second interval.
 7. Retries acquire fresh leases.
 8. Waiting and backoff hold no leases.
 9. Selection skips consume no rate capacity.
@@ -1822,7 +1830,7 @@ They must not contain:
 - 64 KiB header limit.
 - Ten-minute logical request deadline.
 - 60-second account-acquisition ceiling.
-- Three in-flight attempts per account.
+- Twelve in-flight attempts per account.
 - Exact account RPM ceiling.
 - Bounded SSE observer.
 - Bounded retry drain.
@@ -1966,8 +1974,8 @@ Use a fake monotonic clock.
 
 Verify:
 
-- First 25 starts in 60 seconds are admitted.
-- The 26th is rejected.
+- First 60 starts in 60 seconds are admitted.
+- The 61st is rejected.
 - Exact boundary expiration admits correctly.
 - Failed dispatches remain counted.
 - Retries consume another timestamp.
@@ -1975,7 +1983,7 @@ Verify:
 - Separate aliases share the same account count.
 - Base and pinned aliases share the same account count.
 - Different accounts remain independent.
-- In-flight never exceeds three.
+- In-flight never exceeds twelve.
 - Release makes in-flight capacity available.
 - RPM expiry requires no background goroutine.
 - Cooldown expiry is lazy and correct.
@@ -1987,10 +1995,10 @@ Run both coordinator-only stress and full-stack stress through the HTTP handler 
 
 Assert:
 
-- At most three leases per account at every observation point.
-- No rolling interval exceeds 25 admissions.
-- The fake upstream itself never observes more than three live requests for one account key.
-- The fake upstream’s dispatch-start timestamps never contain more than 25 starts for one account in any rolling 60-second interval.
+- At most twelve leases per account at every observation point.
+- No rolling interval exceeds 60 admissions.
+- The fake upstream itself never observes more than twelve live requests for one account key.
+- The fake upstream’s dispatch-start timestamps never contain more than 60 starts for one account in any rolling 60-second interval.
 - Requests arriving through different aliases, pinned aliases, sessions, and retries still share those upstream-observed ceilings.
 - Concurrent final-slot claims admit only one caller.
 - No races under `go test -race`.
@@ -2317,7 +2325,9 @@ A single immutable terminal row satisfies append-only logging without updates. T
 
 ### 29.7 Exact rolling window
 
-It matches the specified account ceiling without boundary bursts. A deque is more exact than a token bucket and trivial at 25 timestamps per account.
+It matches the configured account ceiling without boundary bursts. A deque is more exact than a token bucket and trivial at 60 timestamps per account.
+
+Exactness still matters after the ceilings were raised, and arguably matters more. The ceiling is now a bound whose correct value is unknown and will be re-derived from the attempt log, and a limiter that admits boundary bursts would make that log measure the limiter’s own imprecision rather than upstream’s behavior.
 
 ### 29.8 One coordinator mutex
 
@@ -2408,6 +2418,7 @@ The README must provide SQLite query recipes, described and tested against the a
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
+- Upstream 429 responses against dispatch volume per account, which is what reveals the real ceiling the local one is standing in for.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request.
@@ -2503,7 +2514,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Unexpected upstream 429 frequency.
+- Upstream 429 rate against dispatch rate per account, which is the measurement the raised ceilings exist to obtain. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
@@ -2707,8 +2718,8 @@ The project is complete only when all of the following are true:
 - Every account-acquisition phase ends within 60 seconds.
 - Temporary local capacity exhaustion returns 429 with `Retry-After`.
 - Successful spill updates affinity; failed/partial spill does not.
-- No account exceeds 25 dispatch starts in a rolling minute.
-- No account exceeds three in-flight attempts.
+- No account exceeds 60 dispatch starts in a rolling minute.
+- No account exceeds twelve in-flight attempts.
 - Those ceilings are proven from the fake upstream’s observations, not only coordinator counters.
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.

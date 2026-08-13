@@ -97,7 +97,7 @@ func TestRequireLogicalContext_Success(t *testing.T) {
 		if !ok || id != expectedID {
 			t.Errorf("expected request ID %q in context, got %q (ok=%v)", expectedID, id, ok)
 		}
-		
+
 		// check deadline is set
 		dl, ok := r.Context().Deadline()
 		if !ok {

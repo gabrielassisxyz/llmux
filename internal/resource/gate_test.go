@@ -54,7 +54,7 @@ func TestGate_HandlerCeiling(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected to acquire after release, got %v", err)
 	}
-	
+
 	// Release all to ensure no panic
 	for i := 0; i < policy.ConcurrentAdmittedChatRequests; i++ {
 		g.ReleaseHandlerSlot()
@@ -141,7 +141,7 @@ func TestGate_Middleware(t *testing.T) {
 	if handlerExecuted.Load() {
 		t.Errorf("handler should not have been executed")
 	}
-	
+
 	store.mu.Lock()
 	if len(store.records) != 1 {
 		t.Errorf("expected 1 unrouted request recorded, got %d", len(store.records))
@@ -170,7 +170,7 @@ func TestGate_Middleware(t *testing.T) {
 	if err != nil {
 		t.Errorf("handler slot was not released: %v", err)
 	}
-	
+
 	// If memory was released, we can acquire the full budget again
 	err = g.AcquireMemory(policy.AggregateMemoryBudgetBytes)
 	if err != nil {

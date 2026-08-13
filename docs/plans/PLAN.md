@@ -26,6 +26,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 - Relay final upstream responses without transforming JSON or SSE content.
 - Record enough attempt metadata to reconstruct account use, spills, retries, local skips, latency, and upstream-reported token counts.
 - Durably record every dispatch admission before the network call it authorizes, so a restarted process cannot exceed the rolling ceiling it claims to enforce.
+- Bound request, replay, and precommit memory in aggregate, not only one request at a time.
 - Ship as one cgo-free static Go binary with no runtime, framework, container, database server, or ORM.
 
 ## 3. Non-goals
@@ -60,7 +61,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 13. Local selection skips produce separate append-only rows and do not count as upstream attempts.
 14. No retry occurs after the downstream response is committed.
 15. Coordinator state is never locked while performing network, database, logging, or downstream I/O.
-16. All request-owned resources are bounded by a deadline, size limit, permit, or explicit lifecycle.
+16. All request-owned resources are bounded by a deadline, size limit, permit, or explicit lifecycle, and their sum across concurrent requests is bounded too.
 17. Every untouched top-level JSON member retains its original raw value bytes and relative order, including unknown members and duplicate unknown members. Only the routing-owned top-level values may differ.
 18. The proxy never injects `stream_options.include_usage`, never alters `stream`, and never changes the response stream to improve observability. Missing usage remains missing.
 19. Every account-acquisition phase ends in one atomically reserved and durably admitted dispatch, one explicit terminal selection-failure record, or one admission-store failure. It cannot wait indefinitely.
@@ -180,6 +181,8 @@ It locally interprets only the routing envelope:
 - Exactly one top-level `model` member must exist.
 - `model` must be a string.
 - It must name a fixed catalog alias.
+- At most one top-level `stream` member may exist, because the proxy reads it to select relay behavior.
+- Nesting depth must not exceed 256.
 
 Everything else is opaque, including:
 
@@ -203,11 +206,15 @@ Routing-envelope failures:
 | Non-object top level | Local 400 |
 | Missing/non-string `model` | Local 400 |
 | Duplicate top-level `model` | Local 400 |
+| Duplicate top-level `stream` | Local 400 |
+| Nesting depth over 256 | Local 400 |
 | Unknown model alias | Local 404 |
 | Body over 64 MiB | Local 413 |
 | Compressed request body | Local 415 |
 
-Duplicate `model` fields are rejected because routing would otherwise depend on which duplicate a parser chooses. This is an envelope ambiguity, not model-parameter validation.
+Duplicate `model` and `stream` fields are rejected because routing and relay selection would otherwise depend on which duplicate a parser chooses. This is an envelope ambiguity, not model-parameter validation: duplicate members the proxy does not read remain untouched and cross to upstream in their original order.
+
+The depth limit is a parser resource bound of the same kind as the 64 MiB body limit, not an opinion about the request. Nothing a real client sends approaches it, and it is what lets the scanner promise it cannot be driven into unbounded recursion by input.
 
 ### 6.6 Session header
 
@@ -241,17 +248,24 @@ A dedicated lexical top-level JSON scanner must:
 5. Avoid decoding nested message content.
 6. Return routing metadata and a rewrite plan.
 7. Reject malformed syntax and ambiguous route-owned duplicates without panicking.
+8. Track depth with an iterative state machine or an explicitly bounded stack, so input nesting cannot consume the Go call stack.
+9. Retain spans only for the members the proxy reads or replaces. A body with millions of unrelated top-level members must not produce a second body-sized metadata structure.
 
 The implementation must not unmarshal the request into a map and marshal it again.
 
 ### 7.2 Rewrite operation
 
-The rewriter copies the original document in its original order and:
+The rewrite plan describes the upstream body as an ordered list of immutable byte segments rather than as a second copy of the document:
 
-- Replaces only the raw top-level `model` value.
-- Replaces the value of a route-owned top-level injection if present.
-- Appends a missing route-owned injection immediately before the closing top-level brace.
-- Copies every other byte unchanged.
+- Untouched regions are spans into the original body buffer, referenced and never copied.
+- Only a replaced value or an appended route-owned member allocates a new segment, and those are small.
+- The raw top-level `model` value is replaced.
+- The value of a route-owned top-level injection is replaced if present.
+- A missing route-owned injection is appended immediately before the closing top-level brace.
+- `Content-Length` is the checked sum of the segment lengths.
+- Every attempt builds a fresh reader over the same immutable segments, so a retry replays the identical bytes without a new allocation.
+
+The original body buffer is therefore the only body-sized allocation, and it lives until no further replay is possible. There is no second rewritten body.
 
 In particular:
 
@@ -364,6 +378,10 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Maximum account-acquisition time per attempt | 60 seconds |
 | Maximum request body | 64 MiB |
 | Non-streaming precommit response buffer | 8 MiB |
+| Maximum JSON nesting depth | 256 |
+| Aggregate request/replay/precommit memory budget | 512 MiB |
+| Concurrent admitted chat requests | 128 |
+| Global request-admission wait | 1 second |
 | Session affinity TTL | 1 hour |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
@@ -382,11 +400,13 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 
 These are implementation constants, not a generic tuning surface.
 
+The aggregate budget and the concurrent-request ceiling stay constants for the same reason as the rest, even though a host-dependent number is the obvious candidate for an environment variable. This process runs on one known machine, `GOMEMLIMIT` is already the host-level control and the Go runtime reads it without help, and a second memory knob would only make it possible to configure the two into disagreement. The runbook recommends a budget no larger than 60% of `GOMEMLIMIT`, leaving headroom for the runtime, SQLite, goroutine stacks, and transport buffers.
+
 The two per-account ceilings are the exception, and the reason is worth stating because it changes what they are for. Neither 60 nor 12 is a published Ollama Cloud limit; no such limit is documented. They are self-imposed guards, and the earlier pair of 25 and 3 was a guess that had hardened into a specification. A guard set below the real ceiling is indistinguishable from the real ceiling, so it can never be measured, and the proxy spends capacity it has already paid for.
 
 Upstream 429 is the only authoritative statement of the real limit. The design therefore reacts to it rather than trying to prevent it: 429 is retried, `Retry-After` is honoured, repeated 429 within a window cools the account, and every one of those events is a row in the attempt log. The ceilings above are set high enough to stop being the binding constraint, so that the log records upstream’s answer instead of the proxy’s assumption. They are expected to be re-derived from that log after real traffic, which is the one tuning this document invites.
 
-The in-flight ceiling keeps a second job that survives the change: it bounds concurrent resource use, since every live attempt holds its rewritten replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses.
+The in-flight ceiling keeps a second job that survives the change: it bounds concurrent upstream work, since every live attempt holds its replay body and, for a non-streaming response, up to an 8 MiB precommit buffer. Twelve per account is also roughly the concurrency that 60 dispatches per minute implies at the latencies these callers see, so the two numbers are no longer independent guesses. It does not bound memory on its own, because a request buffers its body long before it reaches an account; that is the aggregate gate’s job.
 
 ### 9.3 Secret delivery and process launch
 
@@ -396,6 +416,7 @@ The binary reads configuration from the environment, but the operating documenta
 - For a service manager, use an owner-readable environment file outside the repository, mode `0600`, referenced by the user service.
 - The example environment file committed to the repository contains names and placeholders only.
 - The log directory should be owned by the user and should not grant write access to other users.
+- The service definition should set `GOMEMLIMIT` above the aggregate memory budget with room to spare, since the budget covers only request-owned buffers.
 - Startup messages may name a missing variable but must never print its value.
 - Diagnostic commands in the runbook must not dump the process environment.
 - Key changes require restart. Restart is the only key-reload mechanism.
@@ -423,6 +444,7 @@ Lower-level components do not import the application or command package.
 | `internal/catalog` | Fixed routes, generated pinned variants, model-list projection |
 | `internal/proxy` | Auth, handlers, body rewriting, retry loop, headers, relay, usage observation |
 | `internal/route` | Account limiter, health, session affinity, account selection, leases |
+| `internal/resource` | Global handler slots and the weighted aggregate-memory gate |
 | `internal/logstore` | SQLite configuration, migrations, inserts, startup recovery queries |
 | `internal/idgen` | Proxy-owned random identifiers |
 | `internal/testsupport` | Test-only clock/timer control, scripted upstream, deterministic shuffler, raw HTTP client helpers |
@@ -490,6 +512,16 @@ Owns:
 - Spill and re-pin decisions.
 
 It starts no background goroutine.
+
+#### Resource gate
+
+Owns the two process-wide admission bounds that no per-request limit can provide.
+
+- A counting semaphore over concurrent admitted chat handlers.
+- A weighted budget over request-owned memory, charged in bytes and released on every exit path.
+- One bounded acquisition wait, after which the caller receives local 429 rather than queueing.
+
+Both are acquired before the body is read and released by the same defer that releases the handler slot. The gate holds no coordinator state, makes no I/O, and knows nothing about accounts: it bounds what the process has allocated, while the coordinator bounds what upstream is asked to do. Neither substitutes for the other, because a request buffers its body long before it competes for an account and may never reach one at all.
 
 #### Upstream transport
 
@@ -565,33 +597,36 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 2. Authenticate.
 3. Generate a proxy logical-request ID.
 4. Create a context ending no later than ten minutes after admission.
-5. Read the body into bounded memory.
-6. Scan and rewrite the top-level routing fields.
-7. Resolve the route catalog entry.
-8. Read the optional session ID.
-9. Build and validate the immutable upstream request template before reserving account capacity. This includes the fixed URL, rewritten body, and allowed client headers, but not the account credential.
-10. Start an account-selection phase whose deadline is the earlier of 60 seconds and the logical request deadline.
-11. Ask the coordinator for an account lease. Collect distinct skip observations in bounded request memory after releasing the coordinator lock; do not write SQLite while selection is still changing.
-12. If selection terminates without a lease:
+5. Acquire a global handler slot within one second, or return local 429 `proxy_overloaded`.
+6. Charge the aggregate memory gate for the body before reading it: the rounded allowance implied by a valid `Content-Length`, or the full 64 MiB allowance when the body is chunked and its size is unknown. Charging after the read would bound nothing.
+7. Read the body into one bounded allocation.
+8. Scan the top-level routing fields and build the immutable segmented replay plan.
+9. Charge the gate for the 8 MiB precommit allowance, and release it as soon as response classification proves it unnecessary.
+10. Resolve the route catalog entry.
+11. Read the optional session ID.
+12. Build and validate the immutable upstream request template before reserving account capacity. This includes the fixed URL, the segmented replay plan, and allowed client headers, but not the account credential.
+13. Start an account-selection phase whose deadline is the earlier of 60 seconds and the logical request deadline.
+14. Ask the coordinator for an account lease. Collect distinct skip observations in bounded request memory after releasing the coordinator lock; do not write SQLite while selection is still changing.
+15. If selection terminates without a lease:
     - Compute `Retry-After` when at least one account has temporary capacity state.
     - Transactionally append the deduplicated skip rows and one `selection_failure` row.
     - Return local 429 for temporary capacity exhaustion or local 503 when no flexible account is usable.
-13. If selection succeeds, install release cleanup immediately. The lease is provisional until its admission row commits.
-14. Generate the attempt's `attempt_id` and synchronously commit its `dispatch_admission` row.
-15. If the admission commit fails:
+16. If selection succeeds, install release cleanup immediately. The lease is provisional until its admission row commits.
+17. Generate the attempt's `attempt_id` and synchronously commit its `dispatch_admission` row.
+18. If the admission commit fails:
     - Cancel the provisional lease, which removes its uncommitted RPM timestamp and releases its in-flight slot.
     - Append no dispatch row, because no dispatch occurred.
     - Return local 503 `admission_store_unavailable`.
-16. Mark the lease dispatchable and call `http.Client.Do` immediately. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
-17. Classify transport errors and upstream status before writing any downstream status or headers.
-18. If retrying:
+19. Mark the lease dispatchable and call `http.Client.Do` immediately. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
+20. Classify transport errors and upstream status before writing any downstream status or headers.
+21. If retrying:
     - Drain and close the intermediate response within bounds.
     - Release the lease.
     - Update account health.
     - Transactionally append the selection skips and attempt row.
     - Wait using context-aware backoff.
     - Begin the next selection phase with the next prospective attempt number.
-19. If final:
+22. If final:
     - Stage filtered upstream headers without committing them.
     - For SSE, successfully read the first non-empty upstream body chunk before downstream commitment.
     - For non-streaming 2xx, buffer up to 8 MiB before commitment; complete small bodies in memory and transition larger bodies to progressive relay.
@@ -602,9 +637,10 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Release the account lease.
     - Update health and session state.
     - Transactionally append the selection skips and final attempt row.
-20. Drop references to the original body immediately after rewrite, and to the rewritten replay body as soon as no future retry can occur. No body is written to disk.
-21. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
-22. Return only after the terminal transaction has been attempted.
+23. Release the body buffer and its memory charge as soon as no further replay can occur, which is the point at which the last attempt becomes terminal. There is no separate rewritten body to release, and no body is written to disk.
+24. Release the global handler slot and any remaining memory charge on every exit path, including panic and cancellation.
+25. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
+26. Return only after the terminal transaction has been attempted.
 
 ## 13. Upstream request and response handling
 
@@ -622,7 +658,7 @@ Copy only this fixed end-to-end request-header allowlist when present:
 Set or derive:
 
 - `Authorization: Bearer <selected account key>`.
-- Correct `Content-Length` for the rewritten bytes.
+- Correct `Content-Length` for the replayed segments.
 - The fixed upstream host and chat-completions path.
 
 Never forward:
@@ -1497,7 +1533,9 @@ Messages are stable and sanitized.
 | Body too large | 413 | `invalid_request_error` / `request_too_large` |
 | Compressed body | 415 | `invalid_request_error` / `unsupported_content_encoding` |
 | Invalid routing envelope | 400 | `invalid_request_error` / `invalid_request` |
+| Nesting depth exceeded | 400 | `invalid_request_error` / `json_depth_exceeded` |
 | Unknown alias | 404 | `invalid_request_error` / `model_not_found` |
+| Global request or memory overload | 429 | `rate_limit_error` / `proxy_overloaded` |
 | Temporary account-capacity timeout | 429 | `rate_limit_error` / `account_capacity_timeout` |
 | Dispatch-admission store unavailable | 503 | `server_error` / `admission_store_unavailable` |
 | Explicit account disabled | 503 | `server_error` / `account_unavailable` |
@@ -1812,6 +1850,7 @@ The implementation must document and test these invariants:
 26. No admission path grants an account an exception to disabled health state.
 27. No `http.Client.Do` occurs without a committed admission row, and no admission row is committed without a held reservation.
 28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
+29. Aggregate request-owned memory never exceeds the configured budget, and every charge is released exactly once.
 
 ## 26. Security and privacy
 
@@ -1884,7 +1923,11 @@ They must not contain:
 
 - 64 MiB request-body limit.
 - 8 MiB non-streaming precommit buffer, after which relay becomes progressive.
+- Global ceiling on concurrent admitted chat handlers.
+- Weighted aggregate budget over request, replay, and precommit memory.
+- One body-sized allocation per request, replayed from immutable segments.
 - 64 KiB header limit.
+- Bounded JSON nesting depth.
 - Ten-minute logical request deadline.
 - 60-second account-acquisition ceiling.
 - Twelve in-flight attempts per account.
@@ -1982,6 +2025,8 @@ Cover:
 - Trailing garbage.
 - Top-level arrays/scalars.
 - Exact 64 MiB boundary.
+- Maximum accepted nesting depth, and the first rejected one.
+- Replay from the immutable segments across all four attempts, with no second body-sized allocation.
 
 For every successful rewrite:
 
@@ -2001,14 +2046,16 @@ Fuzz targets must:
 - Generate nested objects and arrays.
 - Generate arbitrary valid strings and escapes.
 - Mutate valid bodies into malformed inputs.
+- Generate nesting at, below, and above the depth limit.
 - Seed real multi-turn tool-loop shapes.
-- Assert no panic.
-- Assert bounded memory behavior relative to input size.
+- Assert no panic and no stack exhaustion.
 - Assert successful outputs remain valid JSON.
 - Assert `messages` raw bytes remain identical.
 - Assert only permitted top-level values change.
 
 Persist minimized crashing inputs as test fixtures.
+
+Allocation behavior is asserted in the deterministic benchmarks and resource tests of §28.18, not here. A fuzz target has no stable per-iteration allocation accounting, so a memory assertion inside one either flakes or is written loose enough to prove nothing.
 
 ### 28.4 Authentication tests
 
@@ -2341,7 +2388,8 @@ Suppressions must name the exact linter and include a reason. Security-related w
 Benchmarks and load checks must establish:
 
 - Rewrite work is linear in body size.
-- Memory is bounded by the request body, rewritten replay body, 8 MiB non-streaming precommit buffer, and small relay/observer buffers.
+- Memory is bounded by one request-body allocation, bounded segment metadata, the 8 MiB non-streaming precommit buffer, and small relay/observer buffers.
+- A maximum-size body allocates once, and all four attempts replay from the same segments.
 - SSE relay does not accumulate total stream size.
 - Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
@@ -2351,8 +2399,11 @@ Benchmarks and load checks must establish:
 - `/v1/models` requires no I/O beyond response writing.
 - Idle process traffic to upstream is exactly zero.
 - Sustained concurrency never violates account ceilings.
+- Concurrent admitted handlers never exceed the global ceiling.
+- Charged request, replay, and precommit memory never exceeds the aggregate budget.
+- Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
 
-No performance optimization is accepted if it weakens message preservation, rate correctness, or append-only evidence.
+Benchmarks use `b.Loop`, run with `-benchmem`, and are compared across repeated runs with `benchstat` rather than by reading one number. No performance optimization is accepted if it weakens message preservation, rate correctness, or append-only evidence.
 
 ## 29. Tradeoffs and rationale
 
@@ -2381,8 +2432,9 @@ Retries require a replayable request. Disk spooling would store prompt text, whi
 Consequences:
 
 - A request larger than 64 MiB may be accepted by upstream but is rejected by this transport envelope.
-- The body may temporarily exist twice during rewriting.
+- The body exists once. Route-owned replacements are small immutable segments over it, so replay costs metadata rather than a second copy, and the untouched bytes are never copied at all, which is the byte-preservation contract expressed as an allocation.
 - References to the buffered body should be dropped once no retry is possible.
+- A per-request ceiling bounds one request only. Concurrency is what turns it into a process-wide number, so the aggregate gate is what actually bounds the resource, and the per-request limit is what makes each request's share explicit.
 
 ### 29.5 Synchronous admission and terminal inserts
 
@@ -2641,14 +2693,17 @@ Gate:
 Deliver:
 
 - Bounded body reader.
-- Top-level lexical scanner.
+- Top-level lexical scanner with a bounded depth.
 - Model resolution.
 - Fixed top-level injection.
+- Immutable segmented replay plan.
 - Exact raw-message preservation.
+- Global handler slots and the weighted memory gate.
 
 Gate:
 
 - Unit/property/fuzz tests pass.
+- Replay across four attempts allocates one body-sized buffer.
 - Representative multi-turn tool-loop fixtures remain byte-identical inside `messages`.
 
 ### Phase 4: Coordinator
@@ -2780,6 +2835,8 @@ The project is complete only when all of the following are true:
 - Every alias resolves to its fixed upstream model and eligible account set.
 - The raw `messages` value is byte-identical at upstream.
 - Every untouched top-level field retains its raw bytes and relative order.
+- Request replay uses one body-sized allocation plus bounded segment metadata.
+- Aggregate admitted-request memory stays within the configured budget.
 - Unsupported parameters are forwarded.
 - The two reasoning presets are injected only at top level.
 - No usage-requesting field is injected.

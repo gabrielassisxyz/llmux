@@ -407,7 +407,9 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | SSE observer line cap | 1 MiB |
 | SQLite busy timeout | 5 seconds |
 | Server header-read timeout | 5 seconds |
+| Server request-read timeout | 2 minutes |
 | Server idle timeout | 2 minutes |
+| Downstream write deadline, armed per write | 30 seconds |
 | Maximum request headers | 64 KiB |
 | Upstream dial timeout | 10 seconds |
 | Upstream TLS handshake timeout | 10 seconds |
@@ -740,6 +742,8 @@ For SSE:
 - Never buffer the complete response.
 - Preserve comments, event fields, blank lines, `[DONE]`, ordering, and whitespace.
 - Backpressure from the client naturally slows upstream reads.
+- Arm a 30-second write deadline through `http.ResponseController` before each write and flush, and clear it once the call returns. Backpressure is a healthy client reading slowly; a client that has stopped reading entirely is indistinguishable from it at the API and would otherwise block the handler, its lease, and its upstream connection until TCP gave up.
+- A downstream write that exceeds that deadline is a client-side transport failure, handled exactly like any other downstream write failure.
 - A downstream write failure cancels the upstream request and closes its body.
 - An upstream read failure after commitment is never followed by a retry.
 - If upstream reading fails after commitment while the client is still connected, terminate the downstream HTTP response with the server’s abort sentinel rather than returning a clean EOF.
@@ -798,11 +802,13 @@ A downstream write error means the client is already gone. In that case, cancel 
 
 - Ten minutes is a hard deadline for the complete logical request, including account acquisition, upstream attempts, backoff, and relay.
 - Every retry inherits the same logical context and only the remaining time. No retry receives a fresh ten-minute budget.
-- The inbound client deadline wins when it is shorter.
+- Client cancellation wins immediately. HTTP exposes no caller-side deadline other than a cancellation that actually reaches the server, so there is nothing else to honour.
 - Dial and TLS-handshake timeouts can fail early enough to permit retry.
 - Expiry of the overall logical deadline is terminal and is never itself retried.
 - There is no separate two-minute stream-stall timeout. A reasoning model may legitimately remain silent, and the ten-minute logical deadline already bounds the resource. Adding a shorter idle timer would turn valid slow generations into false failures.
 - The server’s absolute `WriteTimeout` remains disabled because it is incompatible with valid long-lived streams.
+- `ReadTimeout` is two minutes and bounds receipt of the complete request body. `ReadHeaderTimeout` bounds only the headers, so without it a client that trickles a body holds a handler and its buffered body for as long as it likes: neither the logical context nor client cancellation interrupts a body read, because a slow client has not disconnected.
+- A downstream write deadline is armed immediately before each write or flush and cleared as soon as that call returns. It bounds the write, never the wait for upstream, so a model that produces nothing for five minutes is untouched by it while a consumer that has stopped reading is not.
 
 ## 14. Time-to-first-token and token observation
 
@@ -1751,6 +1757,7 @@ No startup failure triggers an upstream request.
 | Unsupported method | No | 405 |
 | Unknown path | No | 404 |
 | Oversize headers | No | Standard bounded server failure |
+| Body slower than the read timeout | No | Standard bounded server failure |
 | Body read error | No | 400 unless client vanished |
 | Oversize body | No | 413 |
 | Compressed body | No | 415 |
@@ -1947,6 +1954,8 @@ They must not contain:
 - 60-second account-acquisition ceiling.
 - Twelve in-flight attempts per account.
 - Exact account RPM ceiling.
+- Two-minute request-body read timeout.
+- Per-write downstream deadline for a stalled consumer.
 - Bounded SSE observer.
 - Bounded retry drain.
 - Maximum four dispatches.
@@ -2247,8 +2256,9 @@ Test:
 - Several events in one read.
 - A line spanning many reads.
 - One line over the observation cap.
-- Slow upstream.
+- Slow upstream, including an idle period longer than the downstream write deadline, which must not end the stream.
 - Slow downstream.
+- A downstream consumer that stops reading entirely reaches the write deadline and releases its lease.
 - Client disconnect.
 - Upstream truncation.
 - EOF before the first body byte remains uncommitted and retries when eligible.

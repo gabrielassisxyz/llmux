@@ -68,6 +68,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 20. A committed response that later breaks is aborted as a transport failure; the proxy must not make a truncated upstream body look like a cleanly completed HTTP response.
 21. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
 22. No client-supplied query string is ever forwarded upstream.
+23. Raw session identifiers are never persisted or logged. Only keyed digests are stored.
 
 ## 5. Fixed design decisions
 
@@ -223,12 +224,14 @@ The depth limit is a parser resource bound of the same kind as the 64 MiB body l
 The fixed session header is `X-Session-ID`.
 
 - Missing or empty means no affinity.
-- A non-empty value is an opaque, case-sensitive session identifier.
+- A non-empty value is an opaque, case-sensitive session identifier of at most 256 bytes.
 - It is not interpreted or rewritten.
 - It is not forwarded upstream.
-- It is stored exactly as received in attempt rows.
-- General HTTP header-size limits bound its size.
-- Affinity is keyed only by session ID, not by alias or model.
+- It is reduced to `HMAC-SHA-256(LLMUX_AFFINITY_HMAC_KEY, sessionID)`, and only that versioned digest, named `session_key`, exists in memory or in SQLite.
+- Affinity is keyed only by `session_key`, not by alias or model.
+- A value over 256 bytes returns local 400.
+
+Affinity needs stable equality, not the caller's string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess.
 
 ### 6.7 Request content encoding and content type
 
@@ -379,11 +382,14 @@ The alternative is not free: a provisional string that survives into the catalog
 | `LLMUX_ACCOUNT_K1_KEY` | Yes | None | Account `k1` upstream key |
 | `LLMUX_ACCOUNT_K2_KEY` | Yes | None | Account `k2` upstream key |
 | `LLMUX_ACCOUNT_K3_KEY` | Yes | None | Account `k3` upstream key |
+| `LLMUX_AFFINITY_HMAC_KEY` | Yes | None | Independent key for durable session digests |
 | `LLMUX_LOG_PATH` | Yes | None | Absolute SQLite path |
 | `LLMUX_LISTEN_ADDR` | No | `127.0.0.1:4000` | HTTP listen address |
 | `LLMUX_LOG_LEVEL` | No | `info` | Process log threshold |
 
 The three account keys must be non-empty and distinct. Duplicate credentials would create separate limiter buckets for one real account and are therefore a fatal configuration error.
+
+The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
 
 Key changes require restart. There is no reload endpoint, signal-based reload, watcher, or mutable configuration file.
 
@@ -629,7 +635,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 8. Scan the top-level routing fields and build the immutable segmented replay plan.
 9. Charge the gate for the 8 MiB precommit allowance, and release it as soon as response classification proves it unnecessary.
 10. Resolve the route catalog entry.
-11. Read the optional session ID.
+11. Read the optional session ID, reject an oversized one, and reduce it to its digest.
 12. Build and validate the immutable upstream request template before reserving account capacity. This includes the fixed URL, the segmented replay plan, and allowed client headers, but not the account credential.
 13. Start an account-selection phase whose deadline is the earlier of 60 seconds and the logical request deadline.
 14. Ask the coordinator for an account lease. Collect distinct skip observations in bounded request memory after releasing the coordinator lock; do not write SQLite while selection is still changing.
@@ -986,7 +992,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `requested_alias` | Text, non-null | Exact client alias |
 | `base_alias` | Text, non-null | Resolved base alias |
 | `upstream_model` | Text, non-null | Fixed resolved upstream model |
-| `session_id` | Text, nullable | Exact non-empty session header |
+| `session_key` | Text, nullable | Versioned keyed digest of the non-empty session header |
 | `pin_account_at_start` | Text, nullable | Session pin before routing |
 | `account_label` | Text, nullable | `k1`, `k2`, or `k3`; null only for terminal selection failure |
 | `attempt_no` | Integer, nullable | 1-based dispatch count; null for skips |
@@ -1015,9 +1021,9 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
 | `dropped_header_count` | Integer, nullable | Request headers removed by the allowlist; null for skips |
 
-The schema contains no body, message, completion, header, key, raw upstream error, upstream ID, cost, price, or currency column.
+The schema contains no body, message, completion, raw session identifier, header value, credential, raw upstream error, upstream ID, cost, price, or currency column.
 
-The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_id`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
+The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_key`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
 
 ### 15.6 Outcome vocabulary
 
@@ -1084,7 +1090,7 @@ Create indexes for:
 - `attempt_log(started_at_us)`.
 - `attempt_log(account_label, started_at_us)`.
 - `(logical_request_id, sequence_no)`.
-- `(session_id, finished_at_us)`.
+- A partial successful-completion index on `(session_key, finished_at_us DESC)`, which is the session recovery query.
 - `(requested_alias, started_at_us)`.
 - `(outcome, started_at_us)`.
 - `(error_class, started_at_us)`.
@@ -1155,7 +1161,7 @@ Health states:
 
 ### 16.2 Session state
 
-Each non-empty session ID maps to:
+Each session key maps to:
 
 - Pinned account.
 - Expiry.
@@ -1180,7 +1186,7 @@ Rules:
 
 Before listening:
 
-- Recover the newest successful account for every session completed in the previous hour.
+- Recover the newest successful account for every `session_key` completed in the previous hour.
 - Preserve the original completion-based expiry.
 - Recover dispatch admissions from the previous 60 seconds into account rolling windows.
 - Set in-flight counts to zero.
@@ -1913,6 +1919,7 @@ The implementation must document and test these invariants:
 - Strip proxy/session-specific, cookie, trace, forwarding, and hop-by-hop headers.
 - Disable redirects.
 - Never serialize configuration structs containing secrets.
+- Persist only keyed session digests.
 - Do not expose environment diagnostics through HTTP.
 - Do not pass secrets as command-line arguments.
 - Disable environment proxy discovery on the upstream transport, so no environment variable can choose who receives an account credential.
@@ -1957,7 +1964,7 @@ They must not contain:
 - Account keys.
 - Raw upstream error bodies.
 - Any request or response header value, including those of headers named in a drop event.
-- Session IDs in stderr by default.
+- Session identifiers, raw or digested, in stderr by default.
 - Upstream-generated IDs.
 - Currency or cost.
 
@@ -2334,7 +2341,7 @@ Verify:
 - Index presence.
 - Null token counts.
 - Full token counts.
-- Session ID fidelity.
+- Session digest stability across restart, and absence of the raw header.
 - All three record kinds.
 - Selection and attempt numbering.
 - Aggregate skip counts.
@@ -2370,6 +2377,7 @@ After requests:
 - Assert none of the marker text exists.
 - Assert account keys and proxy key do not exist.
 - Assert token counts and allowed metadata do exist.
+- Assert no raw session identifier exists, and that its versioned digest does.
 - Assert stripped header markers never reach the upstream.
 - Assert a dropped header’s name may appear in a debug event while its marker value appears in no log and no database file.
 - Assert JSON parse errors and panic logs contain positions/classifiers but not nearby body excerpts.
@@ -2458,7 +2466,7 @@ Benchmarks use `b.Loop`, run with `-benchmem`, and are compared across repeated 
 
 The argument that settles this is not durability, indexing, or the cost of the dependency. It is that this attempt log has a reader inside the proxy.
 
-Session affinity survives a restart only if startup can answer "which account most recently served this session id, within the last hour", and the rolling windows survive only if it can answer "which dispatches started in the last 60 seconds, per account". Both run before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
+Session affinity survives a restart only if startup can answer "which account most recently served this session key, within the last hour", and the rolling windows survive only if it can answer "which dispatches started in the last 60 seconds, per account". Both run before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
 
 The rest is real but follows from the choice rather than driving it: typed nullable columns that keep a missing token count distinct from a zero, constraints that fail a malformed row at the write instead of at a read months later, crash-safe transactional commits, and safe concurrent reading by a local analysis tool while the proxy is serving.
 
@@ -2515,43 +2523,47 @@ Five seconds is the maximum wait for an unknowable in-flight release. RPM and co
 
 The alternative account has the most recent complete prefix only after a successful response. Failed or partial output is not a safe continuation anchor.
 
-### 29.12 Stop retries after commitment
+### 29.12 Keyed session identifiers
+
+Affinity is an equality test, so it needs a stable key and nothing else. A keyed digest keeps every routing decision and every restart recovery exactly as it was, bounds a column whose input is arbitrary client text, and removes the one place where content the proxy does not understand entered a durable store. The key is separate from the proxy bearer key because the two rotate for different reasons, and tying them would make a routine credential rotation drop every live conversation's affinity.
+
+### 29.13 Stop retries after commitment
 
 This can expose a transport-level truncated response rather than transparently recovering, but retrying would create invalid concatenated output or duplicate tokens. Aborting rather than returning cleanly ensures clients can distinguish incomplete transport from a successful completion. Protocol correctness takes precedence.
 
-### 29.13 In-memory health state
+### 29.14 In-memory health state
 
 Credential disablement and cooldown are process-local, and restart is the entire recovery mechanism for both a rotated key and a renewed subscription on an unchanged key. A faster path was considered and rejected: letting an explicit account alias re-test a disabled account would buy back a restart that already costs one command on this machine, and would charge for it the only exception to the rule that a disabled account stays disabled, placed inside the admission path. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
 
-### 29.14 Stable model list despite health
+### 29.15 Stable model list despite health
 
 The model picker represents configured capabilities. Removing aliases based on transient health would make client behavior unstable and turn `/v1/models` into an implicit probe/readiness API.
 
-### 29.15 No observability endpoint
+### 29.16 No observability endpoint
 
 SQLite and structured stderr cover the stated operational need. A metrics/debug endpoint would add an unsupported user-visible surface.
 
-### 29.16 Bounded response observation
+### 29.17 Bounded response observation
 
 Small non-streaming bodies are buffered up to 8 MiB to make body-read failures retryable before commitment and make usage extraction reliable. Larger bodies and SSE remain incremental. The tradeoff is a bounded per-request memory allocation and delayed header/body delivery for non-streaming calls, whose clients ordinarily cannot use the completion until EOF anyway.
 
-### 29.17 Request-header allowlist
+### 29.18 Request-header allowlist
 
 A narrow allowlist may omit an exotic client header that a generic reverse proxy would forward. The fixed consumers do not require arbitrary header tunneling, and preventing accidental cookie, trace, forwarding, or machine-metadata leakage is more valuable.
 
-### 29.18 Sixty-second account-acquisition ceiling
+### 29.19 Sixty-second account-acquisition ceiling
 
 Waiting for all capacity until the full ten-minute logical deadline would convert local saturation into apparent service failure. Sixty seconds covers a complete RPM window while bounding interactive delay. Returning 429 with `Retry-After` gives the caller an accurate, retryable result.
 
-### 29.19 Precommit streaming primer
+### 29.20 Precommit streaming primer
 
 Delaying downstream headers until one upstream body chunk is successfully read does not delay the first visible token, because the client could not consume a body before that chunk existed, and it preserves the ability to retry an upstream that closes immediately after headers.
 
-### 29.20 Ambiguous-send duplication
+### 29.21 Ambiguous-send duplication
 
 Retrying a connection that failed after send may duplicate upstream generation. The proxy accepts duplicate flat-rate computation because it executes no tool side effects itself and because every dispatch remains independently limited and logged.
 
-### 29.21 Same-account first retry for isolated server failures
+### 29.22 Same-account first retry for isolated server failures
 
 An isolated 5xx/408/transient connection failure does not prove the account is unusable. Preferring it once preserves prompt cache; a repeated failure then prefers another account. Rate limits and upstream 504 responses still move away immediately because they are stronger account-specific signals.
 
@@ -2574,7 +2586,7 @@ The runbook must instruct the operator to:
 1. Place the static binary in an owner-controlled executable location.
 2. Create the SQLite parent directory before first launch.
 3. Create the owner-only environment file outside the repository.
-4. Set the four secrets and the absolute SQLite path.
+4. Set the five secrets and the absolute SQLite path.
 5. Verify that the three account credentials are distinct without printing them.
 6. Start the process and confirm that it binds only the expected address.
 7. Call authenticated `/v1/models`.
@@ -2893,7 +2905,7 @@ Inspect SQLite to prove:
 
 The project is complete only when all of the following are true:
 
-- One static cgo-free binary starts with the required five secrets/path settings.
+- One static cgo-free binary starts with the required five secrets and the SQLite path.
 - It listens on the configured loopback address and refuses any other.
 - Both endpoints enforce the shared bearer key.
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
@@ -2930,6 +2942,7 @@ The project is complete only when all of the following are true:
 - A no-dispatch capacity failure has an explicit terminal record.
 - All record IDs are proxy-generated.
 - Prompt and completion text are absent from durable and process logs.
+- Raw session identifiers are absent from both.
 - Currency and cost logic are absent.
 - Startup recovers recent rate timestamps and successful session pins.
 - Graceful shutdown releases permits and closes SQLite last.

@@ -1093,13 +1093,17 @@ Within one account-selection phase, repeated observations of the same `(account,
 | Field | Type/nullability | Meaning |
 | --- | --- | --- |
 | `record_id` | Text, primary key | Proxy-generated row ID |
+| `process_instance_id` | Text, non-null | Proxy-generated identity shared by one process’s start and stop rows |
 | `event_kind` | Text, non-null | `process_start` or `process_stop` |
 | `at_us` | Integer, non-null | UTC Unix microseconds |
+| `process_elapsed_us` | Integer, nullable | Monotonic duration from the start edge to the stop edge; null on `process_start` |
 | `version` | Text, non-null | Binary version, derived from build info the way §30.1 derives it |
 | `revision` | Text, non-null | VCS revision from build info |
 | `schema_version` | Integer, non-null | `PRAGMA user_version` after migration |
 
 A start row is appended once migration and recovery have succeeded and before readiness is announced, and failing to append it is a fatal startup like every other write failure at that point. A stop row is appended by every shutdown the process survives to perform, orderly or forced, after handlers drain and before the store closes; failing to append that one is a sanitized stderr event and does not change the exit status, because by then there is nothing left to protect. The absence of a stop row therefore means one thing only: the process died without reaching its shutdown path. Whether a shutdown was orderly or forced is deliberately not encoded here, because the process log already carries it and a stored vocabulary with no reader is exactly what §15.5 refuses.
+
+The two rows of one run are joined by `process_instance_id` and not by time, because `at_us` is wall time and pairing on it fails in exactly the case the pairing exists to report. A process that starts and dies, followed by a backward correction and a second process that starts and stops, leaves four rows whose wall order puts the second run’s stop before the first run’s start, and an operator asking which run ended uncleanly is told the wrong one. Subtracting the two stamps has the same defect one step earlier: a backward step inside a ten-minute run reports a negative uptime, and §24.6 guarantees only that a backward change cannot make a monotonic duration negative, which this span was not. So the span is measured on the monotonic clock like every other duration here and written on the stop row, and the wall stamps keep the job they are good at, which is saying when an event happened rather than how long anything took. An unclean stop becomes a start row that no stop row shares an identity with, which is a question the schema answers instead of a shape someone reads out of an ordering.
 
 This table passes the test the summary table failed, and the difference is worth stating because the two look alike from a distance. Every field here is a fact no attempt row contains. An idle proxy and a stopped proxy produce identical row sets, so uptime is not derivable from the attempt log at all, and nothing in that log records which binary wrote a given span of rows or which schema version was in force at the time. There is one writer, the lifecycle path, so there is no second copy of a fact to drift from. Stderr already carries the same information, but stderr is ephemeral and cannot be queried alongside the rows, which is the whole reason this store holds its own history. The cost is two inserts per process lifetime, and what it buys is the difference between a missing `eod` row meaning the consumer failed and it meaning the proxy was not running.
 
@@ -1275,6 +1279,7 @@ The schema enforces:
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
 - Boolean values restricted to zero/one.
+- At most one `process_start` and one `process_stop` for each `process_instance_id`, with `process_elapsed_us` present on the stop row only and non-negative.
 - Unique `logical_request_id` in `unrouted_request`, with `local_error_code` restricted to the fixed vocabulary of §22.
 - A `logical_request_id` appears in `unrouted_request` or in `attempt_log` and never in both. That one is an application rule asserted by tests rather than a trigger, because enforcing it in the schema means a cross-table query on every insert to buy a guarantee that a single writer per request already provides.
 
@@ -2665,7 +2670,7 @@ Verify:
 - No prompt/completion columns.
 - No cost/currency columns.
 - Startup session recovery.
-- Process start and stop rows, and the absent stop row after a killed subprocess.
+- Process start and stop rows paired by instance identity, a `process_elapsed_us` that stays correct and non-negative across forward and backward wall steps inside the run, and the unmatched start row left by a killed subprocess whose successor starts and stops under an earlier wall time than the one that died.
 - Startup reads no rate state from `dispatch_admission`, so a store seeded with recent admissions changes nothing about when the first dispatch may leave.
 - Admission rows survive a subprocess killed immediately after their commit.
 - Every named query recipe of §30.3 parses and runs against a seeded store and returns the shape its name promises, so a schema change that invalidates one fails here rather than in front of an operator.
@@ -2962,7 +2967,7 @@ The logical-request recipes carry their weight: they are the questions a summary
 - Prompt, completion, and total token sums with nulls kept distinct from zeros. Where counts are absent, `usage_observation` says which reason applies instead of leaving it to be inferred, and a run of `unsupported_encoding` is a consumer that started advertising an encoding the bounded observer cannot decode.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
-- Process uptime spans and unclean stops, which is what turns a missing `eod` row into either a consumer failure or proxy downtime.
+- Process uptime spans, read from `process_elapsed_us` on the stop row, and unclean stops, which are the start rows no stop row shares an instance identity with. Neither is a difference between two wall stamps. This is what turns a missing `eod` row into either a consumer failure or proxy downtime.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Per-consumer traffic, attributed from the presence of a `session_key`, the requested alias, and the streaming flag, because the store holds no consumer identifier. `eod` is the one sessionless caller, which is what makes its rows findable without appealing to the hour it usually runs at. This is a heuristic, and §15.5 records what would replace it and when.
 

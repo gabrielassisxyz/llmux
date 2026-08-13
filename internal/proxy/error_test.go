@@ -40,7 +40,7 @@ func TestWriteError(t *testing.T) {
 }
 
 func TestCalculateRetryAfter(t *testing.T) {
-	now := time.Now()
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name   string
 		reopen time.Time
@@ -65,7 +65,7 @@ func TestCalculateRetryAfter(t *testing.T) {
 
 func TestWriteRateLimitError(t *testing.T) {
 	rec := httptest.NewRecorder()
-	now := time.Now()
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 	reopen := now.Add(1500 * time.Millisecond)
 
 	WriteRateLimitError(rec, "req-456", ErrAccountCapacityTimeout, reopen, now)

@@ -1803,7 +1803,7 @@ An upstream final response is never converted into one of these local errors. A 
 
 Every authenticated chat response, local or upstream-derived, includes `X-LLMux-Request-ID`.
 
-Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known RPM/cooldown reopening among eligible accounts. If the only blockers are in-flight slots with unknowable release times, use one second. A disabled-only failure is 503 and has no fabricated reopening time.
+Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known RPM or gate reopening among eligible accounts. If the only blockers are in-flight slots with unknowable release times, use one second. A `proxy_overloaded` 429 also uses one second: it is a global handler or memory failure that consulted no account, so there is no account state to derive a reopening from. A disabled-only failure is 503 and has no fabricated reopening time.
 
 ## 23. User-visible workflows
 

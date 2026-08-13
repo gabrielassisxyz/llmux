@@ -10,7 +10,7 @@ The exact upstream model strings and the route-owned presets are a prerequisite 
 
 When two sections appear to pull in different directions, the non-negotiable invariants take precedence, followed by the external HTTP contract, the routing and retry state machines, and finally implementation convenience. Tests must encode that same precedence.
 
-Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and introduce none of their own. When one of them disagrees with the section that defines what it describes, the restatement is the defect and the fix belongs there, not in the rule. Duplication is how a contradiction gets in here: a restatement and its rule drift apart, nothing fails when they do, and whoever finds them next has to work out which one was meant. The three state machines this document restates most therefore get one table-driven conformance matrix each: retry classification from §21.2, response commitment from §13.6, and account-health transitions from §20. Each matrix is the single source the unit tests and the full-handler tests both read, because two levels of test reading one table is what stops a restatement and its rule from drifting apart without anything failing.
+Sections 23, 29, and 32, and all of section 24 except §24.6, restate behavior that is defined elsewhere and introduce none of their own. When one of them disagrees with the section that defines what it describes, the restatement is the defect and the fix belongs there, not in the rule. §24.6 is the carve-out and it runs the other way: it restates which clock each quantity already follows, but the general clock rules and the future-timestamp clamp are stated there and nowhere else, and §10.3, §15.3, §16.3, and §28 cite it as their source, so a section that disagrees with §24.6 about one of those is itself the defect. Duplication is how a contradiction gets in here: a restatement and its rule drift apart, nothing fails when they do, and whoever finds them next has to work out which one was meant. The three state machines this document restates most therefore get one table-driven conformance matrix each: retry classification from §21.2, response commitment from §13.6, and account-health transitions from §20. Each matrix is the single source the unit tests and the full-handler tests both read, because two levels of test reading one table is what stops a restatement and its rule from drifting apart without anything failing.
 
 ## 2. Goals
 
@@ -626,7 +626,7 @@ Properties:
 - Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
 - One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
-- One row per authenticated chat request that ends before account selection begins.
+- One row per authenticated chat request that receives a local response before account selection begins.
 - One lifecycle row at startup and one at shutdown.
 - Startup-only recovery queries.
 - No ORM or database server.
@@ -731,7 +731,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Transactionally append the selection skips and final attempt row.
 23. Release the body buffer and its memory charge as soon as no further replay can occur, which is the point at which the last attempt becomes terminal. There is no separate rewritten body to release, and no body is written to disk.
 24. Release the global handler slot and any remaining memory charge on every exit path, including panic and cancellation.
-25. A request that ended before step 13 began writes its local result to the client and then appends one `unrouted_request` row, which is the only durable record such a request produces.
+25. A request that ended before step 13 began writes its local result to the client and then appends one `unrouted_request` row, which is the only durable record such a request produces. A request whose client vanished before any status was written appends nothing, which §15.3 states as a decision rather than an omission.
 26. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
 27. Return only after the terminal transaction has been attempted.
 
@@ -866,7 +866,7 @@ The lease goes back at upstream EOF and not after the downstream write, because 
 
 This buffering does not persist completion text. It is request-lifetime process memory and is released immediately after relay. It is bounded independently of the request-body buffer.
 
-Final non-retryable 3xx/4xx responses and exhausted 5xx responses may be committed and relayed without waiting for a complete 8 MiB precommit read; their upstream status is already the final client-visible result. A later body failure is recorded and the response is aborted rather than rewritten.
+Final non-authentication 4xx responses and exhausted 5xx responses may be committed and relayed without waiting for a complete 8 MiB precommit read; their upstream status is already the final client-visible result. An upstream 3xx or 101 never reaches this path, because §13.2 turns it into a local 502 before commitment, and neither does a 401, because §20.1 fails the request over to another eligible account or answers a local 502 rather than relaying one. A later body failure is recorded and the response is aborted rather than rewritten.
 
 ### 13.6 Response commitment
 
@@ -1101,7 +1101,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `revision` | Text, non-null | VCS revision from build info |
 | `schema_version` | Integer, non-null | `PRAGMA user_version` after migration |
 
-A start row is appended once migration and recovery have succeeded and before readiness is announced, and failing to append it is a fatal startup like every other write failure at that point. A stop row is appended by every shutdown the process survives to perform, orderly or forced, after handlers drain and before the store closes; failing to append that one is a sanitized stderr event and does not change the exit status, because by then there is nothing left to protect. The absence of a stop row therefore means one thing only: the process died without reaching its shutdown path. Whether a shutdown was orderly or forced is deliberately not encoded here, because the process log already carries it and a stored vocabulary with no reader is exactly what §15.5 refuses.
+A start row is appended once migration and recovery have succeeded and before readiness is announced, and failing to append it is a fatal startup like every other write failure at that point. A stop row is appended by every shutdown the process survives to perform, orderly or forced, after handlers drain and before the store closes; failing to append that one is a sanitized stderr event and does not change the exit status, because by then there is nothing left to protect. The absence of a stop row therefore means the process never reached its shutdown path, or reached it and could not write there, and §24.5 is where the second case is stated. It is the rarer one and it is the only other one, so an unmatched start row is an upper bound on unclean deaths rather than a count of them. Whether a shutdown was orderly or forced is deliberately not encoded here, because the process log already carries it and a stored vocabulary with no reader is exactly what §15.5 refuses.
 
 The two rows of one run are joined by `process_instance_id` and not by time, because `at_us` is wall time and pairing on it fails in exactly the case the pairing exists to report. A process that starts and dies, followed by a backward correction and a second process that starts and stops, leaves four rows whose wall order puts the second run’s stop before the first run’s start, and an operator asking which run ended uncleanly is told the wrong one. Subtracting the two stamps has the same defect one step earlier: a backward step inside a ten-minute run reports a negative uptime, and §24.6 guarantees only that a backward change cannot make a monotonic duration negative, which this span was not. So the span is measured on the monotonic clock like every other duration here and written on the stop row, and the wall stamps keep the job they are good at, which is saying when an event happened rather than how long anything took. An unclean stop becomes a start row that no stop row shares an identity with, which is a question the schema answers instead of a shape someone reads out of an ordering.
 
@@ -1188,7 +1188,7 @@ The schema contains no body, message, completion, raw session identifier, header
 
 The schema carries no field that exists only to explain the proxy to itself. A pin move is reconstructed from `session_key`, `account_label`, `is_spill`, and `spill_from_account` ordered by time, and the reopening estimate that drove a wait is reconstructed from the skip rows and the rolling window. Both were considered as stored columns and rejected: neither has a reader today, and a column is cheaper to add in a later migration than a vocabulary is to keep honest without one.
 
-`usage_observation` is the exception that proves the rule above rather than a breach of it, and it earns its place on the test `upstream_retry_after_s` passed: a named reader on the day it is written. A null token count means any of upstream sending no usage object, a streaming client never asking for one, a response encoding the observer could not decode, a line past the observer’s cap, or a truncated stream, and today nothing separates them. §30.3 tells the operator to notice a run of nulls and then go and work out which, and §30.10 re-derives the per-account ceilings from a signal that can quietly fall to zero for one of those reasons without anything reporting it. Seven closed values with a single writer replace a heuristic that whoever reads the runbook next has to re-derive.
+`usage_observation` is the exception that proves the rule above rather than a breach of it, and it earns its place on the test `upstream_retry_after_s` passed: a named reader on the day it is written. A null token count means any of upstream sending no usage object, a streaming client never asking for one, a response encoding the observer could not decode, a line past the observer’s cap, or a truncated stream, and without this column nothing would separate them: §30.3 would be left telling the operator to notice a run of nulls and go and work out which, and it names the column instead. §30.10 re-derives the per-account ceilings from a signal that can quietly fall to zero for one of those reasons without anything reporting it. Seven closed values with a single writer replace a heuristic that whoever reads the runbook next has to re-derive.
 
 A validated consumer label, supplied by the caller in a fixed header, was considered on the same rule and rejected by it. It would be evidence rather than tenancy, since nothing would authenticate, route, or throttle on it, and a closed lowercase vocabulary rejected on mismatch would not reopen the question §6.6 settles for session identifiers. What it lacks is a reader the existing columns cannot serve. With three consumers, one of which is the only sessionless caller, `session_key`, `requested_alias`, and `request_streaming` already separate them, and the header would have to be added to all three callers as one more cutover precondition to buy that. It earns its cost at a fourth consumer, or at a second sessionless one, which is the point at which the attribution in §30.3 stops working; adding the column then is a migration, and a migration is the direction this schema treats as cheap.
 
@@ -1278,7 +1278,7 @@ The schema enforces:
 - `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
-- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column already says it was not.
+- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column says only that upstream stated no delay this proxy could use: the header was absent, or unparseable, or an HTTP-date the response gave no usable `Date` to derive against, which §20.2 stores as nothing, and no column records which of the three it was.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -2443,7 +2443,7 @@ Verify:
 - A failed admission commit frees the pending RPM slot and the in-flight slot.
 - No dispatch occurs when admission persistence fails.
 - A pending reservation holds the sixtieth slot against a concurrent caller for the whole time its admission commit runs.
-- A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so 60 dispatches never fall inside one 60-second interval measured at that boundary.
+- A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so more than 60 dispatches never fall inside one 60-second interval measured at that boundary.
 - No account admits a dispatch before one full rolling window has elapsed since process start, and the first admission after that instant succeeds.
 - A crash and restart straddling a saturated window cannot place more than 60 dispatches in any rolling 60-second interval, with the wall clock deliberately stepped forward and backward across the restart.
 - Inside one live process, stepping the wall clock forward and backward while monotonic time is held changes neither the contents of the rolling window nor the remaining blackout, so no eligibility decision moves.
@@ -2990,7 +2990,7 @@ The logical-request recipes carry their weight: they are the questions a summary
 - Prompt, completion, and total token sums with nulls kept distinct from zeros. Where counts are absent, `usage_observation` says which reason applies instead of leaving it to be inferred, and a run of `unsupported_encoding` is a consumer that started advertising an encoding the bounded observer cannot decode.
 - Session continuity and pin moves.
 - Terminal capacity failures and their advertised retry time.
-- Process uptime spans, read from `process_elapsed_us` on the stop row, and unclean stops, which are the start rows no stop row shares an instance identity with. Neither is a difference between two wall stamps. This is what turns a missing `eod` row into either a consumer failure or proxy downtime.
+- Process uptime spans, read from `process_elapsed_us` on the stop row, and the runs no stop row closes, which are the start rows no stop row shares an instance identity with and which bound the unclean deaths from above rather than counting them, by §15.3. Neither is a difference between two wall stamps. This is what turns a missing `eod` row into either a consumer failure or proxy downtime.
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Per-consumer traffic, attributed from the presence of a `session_key`, the requested alias, and the streaming flag, because the store holds no consumer identifier. `eod` is the one sessionless caller, which is what makes its rows findable without appealing to the hour it usually runs at. This is a heuristic, and §15.5 records what would replace it and when.
 
@@ -3102,6 +3102,7 @@ For the first week of real traffic, inspect the attempt store at least daily for
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
+- Suppressed retries by `retry_disposition`, which separates a failure upstream declared final from one this proxy would have retried and could not, and says whether the ten-minute deadline or a dispatch budget is the binding constraint on retry.
 - Response truncations or client disconnects.
 - Attempt-log write failures.
 - Missing `eod` execution evidence in its expected window.

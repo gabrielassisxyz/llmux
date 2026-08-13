@@ -158,6 +158,8 @@ This endpoint is entirely local:
 - It remains stable when accounts are saturated, cooling, or disabled.
 - It is both the picker catalog and cheap process liveness response.
 
+The response is `{"object":"list","data":[...]}` with `Content-Type: application/json`. The envelope is stated because a client picker that reads `data` finds nothing if the array is returned bare, and that is a failure with no error attached to it.
+
 Ordering is deterministic. For each base alias, return:
 
 1. Base alias.
@@ -628,8 +630,8 @@ There is no degraded startup mode.
 
 1. On SIGINT/SIGTERM, mark the application as draining.
 2. Stop accepting new requests.
-3. Let active handlers finish within the remainder of their request deadline, capped by ten minutes.
-4. A second termination signal forces closure and cancellation.
+3. Do not cancel handler contexts on the first signal. Let active handlers finish within the remainder of their request deadline, capped by ten minutes.
+4. A second signal, or expiry of the shutdown grace, cancels the application force context and calls `Server.Close`.
 5. Handler cleanup releases account leases.
 6. Handler cleanup appends terminal rows where possible.
 7. Close idle upstream connections.

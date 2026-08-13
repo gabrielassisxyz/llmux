@@ -2651,16 +2651,18 @@ The binary must never create a missing parent directory implicitly; a path typo 
 
 ### 30.3 Routine log inspection
 
-The README must provide SQLite query recipes, described and tested against the actual schema, for:
+The README must provide SQLite query recipes, described and tested against the actual schema, for the questions below. The logical-request ones carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
 - Upstream 429 responses against dispatch volume per account, which is the one measurement that can show the local ceiling sits above upstream's.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
-- Retry chains grouped by logical request.
+- Retry chains grouped by logical request, and the dispatch amplification they represent.
 - Authentication failures and the account disablement they caused.
-- Attempt and logical-request latency distributions.
+- Client-visible outcome per logical request, which is the terminal row of each `logical_request_id` and not the union of its attempts.
+- Final-response token counts per logical request, taken from that terminal row. Summing token columns across attempt rows counts a retried request several times, which is the one arithmetic mistake this schema invites.
+- Attempt and logical-request latency distributions, the second being handler start through the terminal row rather than the sum of attempt durations.
 - First-data-event distributions for streaming calls.
 - Prompt, completion, and total token sums with nulls kept distinct from zeros. Counts absent across the board are a signal to check whether a consumer began requesting a compressed response, which disables observation by design.
 - Session continuity and pin moves.

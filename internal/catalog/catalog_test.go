@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestBaseRoutesMatchTheFixedCatalog(t *testing.T) {
 	routes := BaseRoutes()
@@ -30,7 +33,7 @@ func TestBaseRoutesMatchTheFixedCatalog(t *testing.T) {
 		if route.UpstreamModel != wantModel {
 			t.Errorf("%s upstream model = %q, want %q", route.Alias, route.UpstreamModel, wantModels[route.Alias])
 		}
-		if route.EligibleAccounts != [3]Account{AccountK1, AccountK2, AccountK3} {
+		if !reflect.DeepEqual(route.EligibleAccounts, []Account{AccountK1, AccountK2, AccountK3}) {
 			t.Errorf("%s eligible accounts = %v", route.Alias, route.EligibleAccounts)
 		}
 	}

@@ -27,7 +27,8 @@ Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and intro
 - Disable revoked/lapsed credentials immediately and cool repeatedly rate-limited accounts.
 - Relay final upstream responses without transforming JSON or SSE content.
 - Record enough attempt metadata to reconstruct account use, spills, retries, local skips, latency, and upstream-reported token counts.
-- Durably record every dispatch admission before the network call it authorizes, so a restarted process cannot exceed the rolling ceiling it claims to enforce.
+- Durably record every dispatch admission before the network call it authorizes, so every dispatch that left this process has evidence that it started, whatever the process learned about it afterwards.
+- Refuse dispatch for one full rolling window after every process start, measured on the monotonic clock, so a restarted process cannot exceed the rolling ceiling it claims to enforce and no wall-clock adjustment can weaken that.
 - Bound request, replay, and precommit memory in aggregate, not only one request at a time.
 - Return a proxy-owned request ID that correlates a client-visible result with its durable rows.
 - Ship as one cgo-free static Go binary with no runtime, framework, container, database server, or ORM.
@@ -427,6 +428,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Concern | Value |
 | --- | ---: |
 | Logical request deadline | 10 minutes |
+| Shutdown grace after the first signal | 10 minutes 10 seconds |
 | Maximum account-acquisition time per attempt | 60 seconds |
 | Maximum request body | 64 MiB |
 | Non-streaming precommit response buffer | 8 MiB |
@@ -441,6 +443,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Provisional pin maximum lifetime | Logical request deadline |
 | Saturated-pin grace | 5 seconds |
 | Rolling rate window | 60 seconds |
+| Post-start dispatch blackout | 60 seconds |
 | Dispatches per window/account | 60 |
 | In-flight attempts/account | 12 |
 | Maximum dispatches/logical request | 4 |
@@ -579,6 +582,7 @@ Owns:
 - Account health.
 - Randomized candidate selection.
 - Wait notifications.
+- The post-start dispatch blackout deadline, which blocks every account at once.
 - Spill and re-pin decisions.
 
 It starts no background goroutine.
@@ -635,22 +639,25 @@ Properties:
 2. Validate required values without logging secrets.
 3. Ensure account keys are distinct.
 4. Validate the fixed route catalog.
-5. Open SQLite at the exact configured path, and set and read back the required connection-local pragmas on every connection it opens.
-6. Apply embedded forward-only migrations.
-7. Verify append permissions using a transaction that is rolled back.
-8. Recover recent rate timestamps from `dispatch_admission`, never from terminal attempt rows.
-9. Recover unexpired successful session pins.
-10. Append a `process_start` row.
-11. Construct the route coordinator.
-12. Construct the upstream transport and HTTP handlers.
-13. Bind the configured socket through the connection-limiting listener.
-14. Announce readiness only after the socket is bound.
-15. Serve until termination or fatal server failure.
+5. Validate the database path, its parent directory, and any existing file's type and permissions, as §15.2 requires.
+6. Acquire an exclusive advisory lock on `<LLMUX_DB_PATH>.lock`, creating it inside that validated directory with mode `0600` if absent, and hold it for the process lifetime. Failing to acquire it is fatal. The read-only `db` subcommands never take it, so inspection and backup stay possible while the proxy serves.
+7. Open SQLite at the exact configured path, and set and read back the required connection-local pragmas on every connection it opens.
+8. Apply embedded forward-only migrations.
+9. Verify append permissions using a transaction that is rolled back.
+10. Arm the post-start dispatch blackout from the process's monotonic origin. No rate state is read from the store.
+11. Recover unexpired successful session pins.
+12. Append a `process_start` row.
+13. Construct the route coordinator.
+14. Construct the upstream transport and HTTP handlers.
+15. Bind the configured socket through the connection-limiting listener.
+16. Announce readiness only after the socket is bound.
+17. Serve until termination or fatal server failure.
 
 Startup fails if:
 
 - Configuration is invalid.
 - Catalog validation fails.
+- The store lock is held by another live process.
 - The database cannot be opened.
 - Schema version is unsupported.
 - Migration fails.
@@ -664,7 +671,7 @@ There is no degraded startup mode.
 1. On SIGINT/SIGTERM, mark the application as draining.
 2. Stop accepting new requests.
 3. Do not cancel handler contexts on the first signal. Let active handlers finish within the remainder of their request deadline, capped by ten minutes.
-4. A second signal, or expiry of the shutdown grace, cancels the application force context and calls `Server.Close`.
+4. A second signal, or expiry of the shutdown grace of §9.2, cancels the application force context and calls `Server.Close`. That grace exceeds the logical request deadline by more than the store-operation ceiling on purpose. A handler admitted an instant before the signal may run for the full deadline and then needs its bounded store context to write the terminal row, and §12 step 26 derives that context from the force context, so a grace equal to the deadline would cancel exactly the record a graceful shutdown exists to flush.
 5. Handler cleanup releases account leases.
 6. Handler cleanup appends terminal rows where possible.
 7. Close idle upstream connections.
@@ -702,7 +709,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Cancel the pending reservation, which frees the RPM slot it was holding and releases its in-flight slot.
     - Append no dispatch row, because no dispatch occurred.
     - Return local 503 `admission_store_unavailable`.
-19. Reacquire the coordinator mutex, convert the pending reservation into a dispatch timestamp at the current instant, unlock, and call `http.Client.Do` immediately. That second critical section touches memory only and has no failure branch: the admission is committed, so the attempt is going upstream whatever the mutex reveals. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its slot is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
+19. Reacquire the coordinator mutex, convert the pending reservation into a dispatch timestamp at the current instant, unlock, and call `http.Client.Do` immediately. That second critical section touches memory only and has no failure branch: the admission is committed, so the attempt is going upstream whatever the mutex reveals. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its slot is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a phantom admission, a row the log reads as an attempt whose ending nothing recorded. The rolling ceiling does not rest on that ambiguity: §16.3 carries it across a restart on the monotonic clock rather than by reading the ledger back.
 20. Classify transport errors and upstream status before writing any downstream status or headers.
 21. If retrying:
     - Update account health from the classified status, under the coordinator lock, before anything else.
@@ -901,7 +908,7 @@ A downstream write error means the client is already gone. In that case, cancel 
 - `ReadTimeout` is two minutes and bounds receipt of the complete request body. `ReadHeaderTimeout` bounds only the headers, so without it a client that trickles a body holds a handler and its buffered body for as long as it likes: neither the logical context nor client cancellation interrupts a body read, because a slow client has not disconnected.
 - A downstream write deadline is armed immediately before each write or flush and cleared as soon as that call returns. It bounds the write, never the wait for upstream, so a model that produces nothing for five minutes is untouched by it while a consumer that has stopped reading is not.
 
-## 14. First-event and token observation
+## 14. Response observation
 
 ### 14.1 First-event definition
 
@@ -969,24 +976,32 @@ The decoder exists because without it the evidence the whole of §30 rests on ca
 
 Forcing `Accept-Encoding: identity` upstream and dropping the header from the request allowlist would delete the decoder, its bridge, and the decompression-bomb path in one move, and it remains rejected. It alters what the client asked for so that the proxy can read the answer more easily, which §30.7 states as a general principle in the other direction: the proxy will not alter a request or a response to improve its own observability, and what the callers send is therefore what decides what the log can hold. It also spends real bandwidth on every completion, permanently, to solve something on the observer’s side of the process. What it removes is conditional, since the decoder ships only if the Phase 0 gate finds upstream selecting a compressed encoding at all, so the trade is a bounded buffer and one lifecycle against a stated principle and a standing cost.
 
+### 14.4 Upstream rate-limit headers
+
+§9.2 concedes that the local ceilings cannot be measured from below: the guard prevents exactly the dispatches that would locate the wall, so the evidence about it runs in one direction only. Numeric rate-limit response headers are the one exception upstream can offer, because they arrive on successes rather than on refusals, and an observed remaining-quota floor across a week is the measured distance between the guard and the wall, which is the direction 429 silence never bounds.
+
+Whether they exist is a question about upstream and not a design choice, so it is settled where the other such questions are. If the Phase 0 gate records upstream sending a stable numeric family of them, a migration adds two nullable integer columns to the terminal attempt row and Phase 5 fills them by parsing the exact header names Phase 0 recorded, never a body, leaving them null whenever a header is absent or does not parse. Nothing routes, throttles, retries, or waits on them; their only reader is the weekly re-derivation of §30.10, which today reads silence as evidence of nothing. If Phase 0 finds no such headers, nothing ships and the schema gains nothing, which is the same conditional the observation decoder above already carries.
+
+The columns are not declared in §15.5 ahead of that answer. A conditional behavior is cheap to describe and a conditional column is not, because the schema is the thing §15.10 forbids updating and a migration is the sanctioned way to add to it; the condition is recorded there instead, in the form that section already uses for a column it has declined.
+
 ## 15. Durable data model
 
 ### 15.1 Store choice
 
 Use SQLite through the cgo-free `modernc.org/sqlite` driver.
 
-The decisive property is that the proxy reads its own log. Startup recovers session affinity and the rolling rate windows from recent history, so the store must answer a query with a predicate and an ordering before the listener binds, not merely accept an append.
+The decisive property is that the proxy reads its own log. Startup recovers session affinity from recent history, so the store must answer a predicate and an ordering over a table that grows for months, before the listener binds, not merely accept an append.
 
 Rationale:
 
-- Recovery queries over recent history, which is what affinity and rate restoration are.
+- Recovery queries over recent history, which is what affinity restoration is.
 - Typed nullable fields.
 - Transactional append.
 - Unique IDs and constraints.
 - Efficient account/session/time queries.
 - Safe concurrent reads by local analysis tools.
 - Crash-resistant commits.
-- Startup affinity/rate recovery.
+- Startup affinity recovery.
 - Forward-only schema migrations.
 
 The accepted costs are a larger binary and one pinned third-party dependency.
@@ -1006,21 +1021,23 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 - Set `PRAGMA foreign_keys` on and verify it by reading it back, on every connection. SQLite defaults it off and scopes it per connection, so a schema declaring that a dispatch row references an existing admission enforces nothing until each connection turns it on. Declared and unenforced is worse than absent: §15.8 would describe a guarantee the store does not provide, and an orphan row would surface in a query months later instead of failing the insert that wrote it.
 - Set `PRAGMA trusted_schema` off, so no object in the schema can cause a function to run during an ordinary statement.
 - Run no whole-database integrity scan at startup. `PRAGMA quick_check` and `PRAGMA foreign_key_check` cost time proportional to a store this document forbids ever truncating, so on the startup path they buy a check that gets slower every week and delay the listener by an amount nobody chose. They belong to `llmux db check`, which an operator runs deliberately.
-- Use full synchronous durability, unless and until the measurement §28.18 owes shows its cost is material. The alternative and the condition that would settle it are stated below.
+- Use full synchronous durability. The alternative, and why the measurement §28.18 owes is not what decides it, are stated below.
 - Set `wal_autocheckpoint` to zero and drive every checkpoint from the application. SQLite’s automatic checkpoint fires inside whichever commit crosses its page threshold, and the application does not get to choose which commit that is, so leaving it on would defeat the rule below on exactly the commits it exists to protect.
 - Attempt a passive checkpoint after each 256 terminal commits, and again when a terminal commit finds the WAL past its warning threshold. The attempt runs on the maintenance connection, in the foreground of the terminal path that triggered it, once that commit has returned.
 - A checkpoint never runs on the writer connection. The admission commit sits between reservation and `Do` on the dispatch critical path, so migrating a WAL there arrives as tens of milliseconds of first-token latency for whichever request drew the short straw. Placing the checkpoint behind a terminal commit is not sufficient on its own: with a single connection the next admission commit queues behind that checkpoint regardless of which commit it followed, and the rule protects nothing it names. The second connection is what makes the separation real, and it is also why the interval is a stated number rather than "a bounded number" of commits.
 - Attempt one last passive checkpoint at shutdown, after the stop row and before the store closes.
 - Never block request handling on a restart or truncate checkpoint.
 - Warn when the WAL keeps growing across those attempts, because that is what checkpoint starvation looks like from inside the process.
-- Use a five-second busy timeout, and bound every store operation with a six-second context so SQLite’s own busy handling always finishes before the application deadline fires. An application deadline shorter than the busy timeout would cancel exactly the contended writes the busy timeout exists to let through, and an unbounded one would leave the pending-reservation window of §17.1 with no stated ceiling for recovery to be conservative against.
+- Use a five-second busy timeout, and bound every store operation with a six-second context so SQLite’s own busy handling always finishes before the application deadline fires. An application deadline shorter than the busy timeout would cancel exactly the contended writes the busy timeout exists to let through, and an unbounded one would leave the pending-reservation window of §17.1 with no stated ceiling at all, while a reservation holds one RPM slot and one in-flight slot for the whole time its commit runs.
 - Cap the writer at one open and one idle connection, so every durable write serializes through it, and keep the maintenance connection separate from that pool.
 - Use parameterized SQL only.
 - Check every database error.
 
-`synchronous=NORMAL` is the alternative, and it is deliberately not taken yet. Under WAL it loses nothing to a process crash, because a committed WAL write is visible to a restarted process whether or not it was ever synced, so every crash-boundary property the admission ledger exists for survives it. What it surrenders is the newest commits across an operating-system crash or power loss, and that exposure is genuinely small: rate recovery reads only the last 60 seconds of admissions, so a lost admission matters only if the machine loses power, boots, and resumes dispatching inside one rolling window while an account sits at its ceiling, and the thing overrun then is the self-imposed guard of §9.2 rather than an upstream contract.
+`synchronous=NORMAL` is the alternative and it is not taken. Under WAL it loses nothing to a process crash, because a committed WAL write is visible to a restarted process whether or not it was ever synced, so every crash-boundary property the tests of §28.13 assert survives it untouched. What it surrenders is durability across an operating-system crash or a power loss, and with automatic checkpointing switched off that exposure is not the newest commit but everything the operating system has not yet written back, a quantity this process neither controls nor can observe.
 
-What it costs is a promise. §2 states without qualification that a restarted process cannot exceed the ceiling it claims to enforce, and under NORMAL that sentence needs an exception written into it. What full durability costs is one fsync per dispatch, on a path whose other component is an upstream call measured in seconds, plus whatever queueing that fsync creates against every other statement on the single connection. Neither number has been measured on the filesystem this store will live on, and trading a stated guarantee for an unmeasured saving is the wrong order to work in. §28.18 owes that measurement and the bullet above is where the answer lands. The first-event metric is no longer an argument in either direction, because §14.1 anchors it at the `Do` invocation and the admission commit therefore sits outside the number it would otherwise have polluted.
+What that would cost is the one thing the admission row is for. §2 states without qualification that a dispatch which left this process has evidence that it started, §24.5 refuses to serve rather than dispatch unrecorded, and §21.7 reconstructs an ambiguous send from exactly these rows. Under NORMAL that promise acquires a power-loss exception, and the failure it admits is undetectable from inside: an admission write that fails is something the process knows about and answers with a 503, while an admission lost to a power cut leaves nothing to notice and nothing to reconstruct from. Those are different trades and they deserve different answers. Refusing a detected failure costs nothing while the store is healthy; narrowing an undetectable one costs one fsync per dispatch, forever.
+
+That fsync is what full durability costs, on a path whose other component is an upstream call measured in seconds, plus whatever queueing it creates against every other statement on the writer connection. §28.18 measures it, and the number is worth having for its own sake, since it sizes the pending-reservation window of §17.1 and says what the one durable write on the dispatch critical path actually charges. It is not what decides this bullet. The rolling ceiling stopped riding on this write when §16.3 moved to the monotonic clock, and what still rides on it is evidence, which a measurement of latency cannot price. The first-event metric is an argument in neither direction, because §14.1 anchors it at the `Do` invocation and the admission commit therefore sits outside the number it would otherwise have polluted.
 
 SQLite-managed `-wal` and `-shm` files are part of the one embedded store, not separate services or application logs.
 
@@ -1046,9 +1063,9 @@ Four append-only tables exist, and the split is by commit point rather than by s
 | `limiter_rpm_used` | Integer, non-null | Post-reservation snapshot |
 | `limiter_in_flight` | Integer, non-null | Post-reservation snapshot |
 
-An admission row carries only what rate recovery needs and what identifies the attempt it authorized. It is never updated, so an admission without a matching terminal attempt row is itself a fact: the process crashed, stopped between the commit and the send, or lost its store before the attempt finished. Recovery counts it either way.
+An admission row carries only what identifies the attempt it authorized and the limiter state that authorized it. It is never updated, so an admission without a matching terminal attempt row is itself a fact: the process crashed, stopped between the commit and the send, or lost its store before the attempt finished. Which of the three it was is not recoverable and does not need to be, because nothing the next process decides is read out of these rows.
 
-`reserved_at_us` records the reservation and not the dispatch, because the row is committed before the dispatch it authorizes exists to be timed. The live window is measured at the dispatch boundary all the same, and §16.3 says what recovery does with the difference.
+`reserved_at_us` records the reservation and not the dispatch, because the row is committed before the dispatch it authorizes exists to be timed. The live window is measured at the dispatch boundary all the same, so the two differ by the commit's own duration, bounded by the store-operation ceiling, which is why no reader of this column may treat it as the instant a request left.
 
 `attempt_log` holds what became known after the fact.
 
@@ -1167,6 +1184,10 @@ The schema carries no field that exists only to explain the proxy to itself. A p
 
 A validated consumer label, supplied by the caller in a fixed header, was considered on the same rule and rejected by it. It would be evidence rather than tenancy, since nothing would authenticate, route, or throttle on it, and a closed lowercase vocabulary rejected on mismatch would not reopen the question §6.6 settles for session identifiers. What it lacks is a reader the existing columns cannot serve. With three consumers, one of which is the only sessionless caller, `session_key`, `requested_alias`, and `request_streaming` already separate them, and the header would have to be added to all three callers as one more cutover precondition to buy that. It earns its cost at a fourth consumer, or at a second sessionless one, which is the point at which the attribution in §30.3 stops working; adding the column then is a migration, and a migration is the direction this schema treats as cheap.
 
+Request and response body-size columns were considered on the same rule and fail it in the ordinary direction. They would be content-free metadata of the same class as a token count, and nothing in this store can say today how often a real response passes the 8 MiB precommit bound or how close real traffic comes to the 64 MiB envelope and the aggregate budget. What they lack is a reader. §9.2 fixes those three constants and states that they are not a tuning surface, and the one re-derivation this document does invite is of the per-account ceilings, which reads none of them; a column added now would arrive with a recipe written to justify it. The condition that buys them is a precommit bound or a memory budget that starts binding in production, which the existing overload rejections and their error codes are what makes visible first, and adding the columns at that point is a migration.
+
+The rate-limit projection of §14.4 is recorded here on the same terms, read forward rather than backward. Its reader exists today in §30.10 and the fact it would hold is one no other column can produce, since nothing else in this store can bound the local ceiling from below. What is not established is that upstream sends the headers at all, and that is what the Phase 0 gate answers. So the condition is written down and the columns are not: if the gate finds a stable numeric header family, a migration adds `upstream_rl_limit` and `upstream_rl_remaining` as nullable integers before Phase 5 fills them, and if it does not, nothing was carried for a fact that never arrives.
+
 ### 15.6 Outcome vocabulary
 
 - `succeeded`
@@ -1210,8 +1231,9 @@ Raw Go error strings are never stored.
 - `in_flight_limit`
 - `rate_gated`
 - `disabled`
+- `start_blackout`
 
-`rate_gated` covers both a single 429 and the cooldown circuit, because §20.2 keeps them on one deadline and selection acts on neither differently.
+`rate_gated` covers both a single 429 and the cooldown circuit, because §20.2 keeps them on one deadline and selection acts on neither differently. `start_blackout` is the one process-wide value: it names every account for the first rolling window of a process's life, which is what §16.3 uses in place of reading rate state back out of the store.
 
 `retry_disposition`, on every row:
 
@@ -1248,7 +1270,7 @@ The schema enforces:
 - `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
-- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429.
+- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column already says it was not.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.
@@ -1260,7 +1282,7 @@ The schema enforces:
 
 Create indexes for:
 
-- `dispatch_admission(account_label, reserved_at_us)`, which is the rolling-rate recovery query.
+- `dispatch_admission(account_label, reserved_at_us)`, which is the offline admission-pressure query of §30.3.
 - `attempt_log(started_at_us)`.
 - `attempt_log(account_label, started_at_us)`.
 - `(logical_request_id, sequence_no)`.
@@ -1290,12 +1312,12 @@ Correctness evidence and analytics have different commit points, because they an
 
 This means:
 
-- Every actual network dispatch has durable pre-dispatch evidence, so rate recovery is a query over what the process was authorized to send rather than over what it managed to finish.
+- Every actual network dispatch has durable pre-dispatch evidence, so the log records what the process was authorized to send and not only what it managed to finish.
 - One dispatched attempt has one complete immutable terminal row.
 - A terminal capacity failure is explicit rather than inferable from the last skip.
 - A phase normally incurs one terminal commit rather than one commit per account recheck, on top of one admission commit per dispatch.
 - Status, token counts, retry decision, and durations coexist in that terminal row.
-- A process crash during an active attempt can lose that attempt’s result metadata and its pending skip rows, but not its rate admission.
+- A process crash during an active attempt can lose that attempt’s result metadata and its pending skip rows, but not the record that it started.
 - A separate start row followed by an update is deliberately not used; the admission row is a distinct immutable fact, not a mutable draft of the terminal one.
 - A streaming success may reach the client before its final log insert fails.
 - A logging failure cannot retroactively replace an upstream success.
@@ -1374,16 +1396,18 @@ Before listening:
 
 - Recover, for every `session_key` with a successful completion in the previous hour, the account served by whichever of those requests arrived last.
 - Preserve the original completion-based expiry.
-- Recover dispatch admissions whose reservation instant, advanced by the store-operation ceiling, falls inside the previous 60 seconds, into account rolling windows.
+- Recover no rate state. The post-start dispatch blackout holds every account closed for the first 60 monotonic seconds of process life, which is one complete rolling window.
 - Set in-flight counts to zero.
 - Do not restore disabled state, because restart is how corrected credentials are installed.
 - Do not call upstream to validate recovered state.
 
-Rate recovery reads `dispatch_admission` and never the terminal attempt rows. An attempt that was in flight when the process died left an admission and no result, and recovery counts it exactly like a completed one: the instant is what the ceiling is defined over, and the outcome is irrelevant to it. The ledger can therefore be wrong in one direction only, counting a slot that a crash between the commit and the send never actually spent.
+The blackout is measured on the monotonic clock of the new process, and that is what makes it immune to the failure a recovery query cannot escape. Recovered instants are UTC wall time while the live window is monotonic, so a wall clock corrected forward across the restart, which is the ordinary step at boot and therefore exactly when recovery would run, makes recovered admissions look older than they are, expires them early, and readmits capacity the previous process had already spent. §24.6 clamps a recovered timestamp that lands in the future, and an error in the other direction has no clamp available at all, because nothing in a row says it is older than it looks. Sixty monotonic seconds of refusal need no timestamps: every dispatch of the previous process precedes that process's death, every dispatch of this one follows this one's start by a full window, and no 60-second interval can contain both. What the proof rests on is that the two processes did not overlap, which is the single-instance property §17.5 makes a checked condition of startup.
 
-Pin recovery orders by arrival and not by completion, because the live coordinator does. §16.2 guards a pin update with the request-arrival sequence, so when a newer request finishes first and an older one finishes afterwards, the live pin belongs to the newer request and the older completion is refused. Recovering the account with the newest `finished_at_us` reverses precisely that case, and a restart inside the hour would then move a live conversation onto an account the running process had already decided against, which is the one thing affinity exists to avoid. Arrival order needs no column of its own: `logical_elapsed_us` is measured from handler start, so `finished_at_us` less `logical_elapsed_us` is the arrival instant of the request that wrote the row, both columns are non-null on every row, and the elapsed half is a monotonic duration, so the derived instant does not wobble with the wall clock inside a process the way a stored arrival timestamp would.
+The blackout is unconditional, and the tempting exception is the one that would break it. A store holding no admission rows looks like a fresh install with nothing to be conservative about, but it is also what §30.4 hands a restarted process after an archive rotation, whose real dispatches are minutes old in a database that was moved aside. Skipping the wait on an empty store would reopen exactly the hole that procedure used to close by waiting.
 
-Recovery cannot read the instant a dispatch actually left, because the admission row is committed before it. It advances `reserved_at_us` by the store-operation ceiling, which is the latest moment the corresponding `Do` could have happened, so a recovered slot stays in the window at least as long as the live process would have kept it. That is the conservative direction, and the wrong one is available too: dating a recovered slot from its reservation would expire it early and let a restarted process readmit capacity the previous one had already spent, which is the failure the admission ledger exists to prevent. The value is derived at recovery time rather than stored, because a column holding a number computable from one already present is a second copy free to disagree with the first.
+The cost is up to one quiet minute after every start. Selection treats the blackout as a deterministic blocker with a known reopening instant, so a request arriving during it waits inside the ordinary 60-second acquisition ceiling and then proceeds, and only a request arriving in the first instants of process life can exhaust that ceiling and receive the local 429, with an accurate `Retry-After`, that §30.7 already requires every caller to handle. Restarts are rare by design, since restart is this proxy's only reload mechanism, and the minute is the honest price of a guarantee that needs no clock it cannot trust.
+
+Pin recovery orders by arrival and not by completion, because the live coordinator does. §16.2 guards a pin update with the request-arrival sequence, so when a newer request finishes first and an older one finishes afterwards, the live pin belongs to the newer request and the older completion is refused. Recovering the account with the newest `finished_at_us` reverses precisely that case, and a restart inside the hour would then move a live conversation onto an account the running process had already decided against, which is the one thing affinity exists to avoid. Arrival order needs no column of its own: `logical_elapsed_us` is measured from handler start, so `finished_at_us` less `logical_elapsed_us` is the arrival instant of the request that wrote the row, and both columns are non-null everywhere. What the derivation is not is proof against the wall clock. `finished_at_us` is wall time, so a step landing between two finishes moves the two derived arrivals against each other exactly as a step between two arrivals would move two stored stamps, and for a long-running request against a short one it moves them further. The derived instant is only as good as the wall clock was at each finish, which is a reason to prefer it for costing nothing rather than for being safer. Ties therefore resolve by a stated rule instead of by map order: equal derived arrivals go to the later `finished_at_us`, and then to the greater `record_id`. The residual exposure is a clock step between two successful completions of one session inside one hour, followed by a restart, and its cost is bounded to starting the next turn on the other of two accounts that both hold a recent prefix.
 
 ## 17. Concurrency-correct rate accounting
 
@@ -1394,15 +1418,16 @@ All account and session state is guarded by one coordinator mutex.
 For an account candidate:
 
 1. Read the monotonic clock.
-2. Remove dispatch timestamps at or before `now - 60 seconds`.
-3. Expire a gate deadline that has passed, returning an account the cooldown circuit had marked `cooling_down` to `enabled`.
-4. Reject a disabled account, or one whose gate deadline has not passed.
-5. Reject if in-flight is already 12.
-6. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
-7. Otherwise increment pending reservations.
-8. Increment in-flight.
-9. Return an immutable release-once pending lease.
-10. Unlock.
+2. Reject every candidate while the post-start dispatch blackout has not expired, recording `start_blackout`. This is the one place a slot is granted, so it is the one place the blackout has to hold, and putting it here is what stops three selection paths from each needing their own copy of the rule.
+3. Remove dispatch timestamps at or before `now - 60 seconds`.
+4. Expire a gate deadline that has passed, returning an account the cooldown circuit had marked `cooling_down` to `enabled`.
+5. Reject a disabled account, or one whose gate deadline has not passed.
+6. Reject if in-flight is already 12.
+7. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.
+8. Otherwise increment pending reservations.
+9. Increment in-flight.
+10. Return an immutable release-once pending lease.
+11. Unlock.
 
 The rate check and both mutations are one critical section. Concurrent goroutines cannot claim the same final slot.
 
@@ -1460,9 +1485,11 @@ Each account retains at most 60 rate timestamps, so the memory cost is trivial.
 Correctness is process-local.
 
 - One process owns the listener and all keys.
-- Starting another proxy with the same account keys would create independent counters.
-- Multi-process coordination is outside scope.
-- The operational deployment must run one instance.
+- Starting another proxy against the same store would create independent counters, which is why startup takes an exclusive advisory lock beside the database and holds it for the process lifetime.
+- Multi-process coordination is outside scope. The lock coordinates nothing; it refuses.
+- The operational deployment must run one instance, and the lock makes that a checked condition of startup rather than a sentence in a runbook.
+
+The bind was an accidental mutex and stopped being one the moment a second environment file could carry a different `LLMUX_LISTEN_ADDR`. Two processes on one store double every ceiling and interleave their writes, which is the operator error this document already converts into a fatal check everywhere else it appears: duplicate account keys are fatal precisely because they would create two limiters for one real account, and two processes are that same failure at process granularity. It is also what the blackout of §16.3 rests on. That proof holds because every dispatch of the previous process precedes the start of the next one, and only a single-instance guarantee makes that ordering true. An advisory lock dies with the process holding it, including one killed with no chance to clean up, so there is no stale lock to recover and no state to reconcile. The read-only `db` subcommands never take it, because a live proxy must remain inspectable and backable-up.
 
 ## 18. Account selection
 
@@ -1546,6 +1573,7 @@ Use a reopen-aware bounded stall followed by spill.
 4. For deterministic blockers:
    - RPM reopening is the oldest retained admission plus 60 seconds.
    - Rate-gate reopening is the account’s gate deadline, whether a single 429 or the cooldown circuit set it.
+   - Blackout reopening is one rolling window after this process started, and it blocks every account at once, so no alternative is any closer.
    - If several deterministic blockers apply, use the latest reopening time because all must clear.
 5. If the deterministic reopening time is later than the pin deadline, do not burn the five-second grace pointlessly; proceed to alternatives immediately.
 6. If deterministic reopening falls within the grace, wait exactly until that time or an earlier coordinator notification, then retry the pin.
@@ -1642,6 +1670,8 @@ Reason:
 - Disabling all accounts during a common provider outage would amplify failure.
 - The current logical request may prefer another account, but account health remains enabled.
 
+A retryable 5xx that carries a valid `Retry-After` is upstream saying when to come back, and scheduling a guessed 250 milliseconds in place of a stated delay is the wrong order. The value becomes the minimum delay for a retry that targets the account which sent it, exactly as §21.3 already treats it for 429, and it is persisted as `upstream_retry_after_s` under the same unclamped rules. It gates nothing else: it neither advances that account's gate deadline nor counts toward the cooldown circuit, because a 503 may describe the provider rather than the credential, which is the reason this whole section leaves health alone. A retry that moves to a different account ignores it entirely, for the reason §20.2 gives about a 429. A stated delay longer than the remaining runway suppresses the retry through the ordinary deadline rule and is recorded as exactly that.
+
 ### 20.4 Request failures
 
 400, 404, 409, 422, and other non-authentication 4xx responses:
@@ -1702,6 +1732,7 @@ Timeout/server retry:
 
 - First retry: approximately 250 milliseconds with equal jitter.
 - Second retry: approximately 1 second with equal jitter.
+- A valid `Retry-After` on the failed 5xx becomes the minimum delay, and only when the next attempt targets the account that sent it.
 - Delay is capped by the remaining deadline.
 
 Credential failover:
@@ -1798,14 +1829,14 @@ Messages are stable and sanitized.
 | Upstream credential rejected with no eligible account left | 502 | `server_error` / `upstream_auth_failure` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
 | Unexpected upstream redirect or upgrade | 502 | `server_error` / `invalid_upstream_response` |
-| Overall timeout before commit | 504 | `server_error` / `upstream_timeout` |
+| Overall timeout before commit | 504 | `server_error` / `deadline_exceeded` |
 | Recovered panic before commit | 500 | `server_error` / `internal_error` |
 
 An upstream final response is never converted into one of these local errors. A 3xx, a 101 and a 401 are the carve-outs, and none of them is an exception to the rule, because none of them is a final result: each is an instruction to make a different request, addressed to a party that cannot act on it safely. For a 3xx or a 101 that party is the client. For a 401 it is the proxy itself, which is why a 401 surfaces as account disablement plus failover rather than as a relayed status, and why the local code names the credential failure instead of hiding it behind a generic upstream error.
 
 Every authenticated chat response, local or upstream-derived, includes `X-LLMux-Request-ID`.
 
-Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known RPM or gate reopening among eligible accounts. If the only blockers are in-flight slots with unknowable release times, use one second. A `proxy_overloaded` 429 also uses one second: it is a global handler or memory failure that consulted no account, so there is no account state to derive a reopening from. A disabled-only failure is 503 and has no fabricated reopening time.
+Every proxy-generated 429 includes `Retry-After` as whole seconds, rounded up and never less than one. Use the earliest known reopening among eligible accounts, whether an RPM window, an account gate, or the post-start dispatch blackout. If the only blockers are in-flight slots with unknowable release times, use one second. A `proxy_overloaded` 429 also uses one second: it is a global handler or memory failure that consulted no account, so there is no account state to derive a reopening from. A disabled-only failure is 503 and has no fabricated reopening time.
 
 ## 23. User-visible workflows
 
@@ -1961,8 +1992,8 @@ Visible result: stable base and pinned aliases.
 ### 23.16 Restart during active conversations
 
 - Completed session pins from the preceding hour are restored.
-- Recent dispatch admissions seed rate windows.
-- Active unfinished attempts may have no terminal row after a hard crash; their admission rows survive and still count.
+- No dispatch leaves for one full rolling window after the restart, so no window can hold dispatches admitted by two different processes.
+- Active unfinished attempts may have no terminal row after a hard crash; their admission rows survive as the record that they started.
 - No health probes run.
 - Disabled state resets so corrected credentials can be tested by real traffic.
 
@@ -1983,6 +2014,7 @@ Visible result: stable base and pinned aliases.
 | Non-loopback listen address | Fatal startup |
 | Invalid catalog | Fatal startup |
 | Relative database path | Fatal startup |
+| Store lock held by another live process | Fatal startup |
 | Missing database directory | Fatal startup |
 | Database directory writable by group or others | Fatal startup |
 | Insecure existing database permissions | Fatal startup |
@@ -2020,6 +2052,7 @@ No startup failure triggers an upstream request.
 | Explicit account saturated | Wait only for that account, at most 60 seconds |
 | Explicit account disabled | Immediate local 503 |
 | All flexible accounts saturated | Wait for any account, at most 60 seconds, then local 429 |
+| Post-start dispatch blackout in force | Wait for it to lift, within the 60-second acquisition ceiling, then local 429 with `Retry-After` |
 | All flexible accounts disabled | Immediate local 503 |
 | Sixty-second acquisition ceiling reached during wait | Local 429 with `Retry-After`, because the capacity is expected back |
 | Ten-minute logical deadline reached during wait | Local 504, because the request ran out of time rather than the window |
@@ -2062,7 +2095,7 @@ No startup failure triggers an upstream request.
 | Crash after commit | Committed row remains durable |
 | One row in a phase batch violates a constraint | Roll back the entire phase transaction; emit one sanitized error |
 
-A store that cannot accept an admission stops the proxy from originating upstream traffic while letting admitted traffic finish. This is the one place where evidence outranks availability, and it is a deliberate reversal of the rule above it: a dispatch the ledger never saw is a dispatch no restart can account for, and the rolling ceiling silently stops being the thing this document says it is.
+A store that cannot accept an admission stops the proxy from originating upstream traffic while letting admitted traffic finish. This is the one place where evidence outranks availability, and it is a deliberate reversal of the rule above it. What it protects is completeness rather than rate correctness, which §16.3 carries on the monotonic clock instead: the admission ledger is the only thing that can say these and exactly these dispatches left this process, and a hole in it is indistinguishable from a hole in reality. A missing terminal row already means one stated thing, that the process never learned how an attempt ended. A missing admission row would mean either that the store was briefly unavailable or that a dispatch happened which nothing recorded, and no reader could tell those apart.
 
 There is no fallback JSONL file, alternate database, or memory log.
 
@@ -2071,7 +2104,7 @@ There is no fallback JSONL file, alternate database, or memory log.
 - Durations use monotonic time.
 - Persisted timestamps use UTC wall time.
 - In-process rate limiting uses monotonic time.
-- Restart recovery necessarily uses wall timestamps.
+- Restart recovery necessarily uses wall timestamps, and session affinity is the only thing recovered from them.
 - Future recovered timestamps are clamped to startup time and produce a warning.
 - Backward wall-clock changes cannot make monotonic durations negative.
 
@@ -2125,7 +2158,7 @@ The implementation must document and test these invariants:
 29. Aggregate request-owned memory never exceeds the configured budget, measured in allocated capacity rather than in bytes received. A request holds one charge, which may only grow while its body is read and is settled once when the read completes, and every charge is released exactly once.
 30. An unconfirmed provisional pin with no remaining holders cannot stay live.
 31. The rolling window is measured over `http.Client.Do` invocation instants, and a pending reservation occupies a slot from the moment it is granted until it is finalized or canceled.
-32. Startup recovery dates a recovered admission no earlier than the latest instant its dispatch could have occurred.
+32. No dispatch occurs during the first full rolling window of a process's life, measured monotonically, so no rolling window can contain dispatches admitted by two different processes.
 33. Live accepted client connections never exceed the configured ceiling, so no server goroutine exists for a connection beyond it.
 
 ## 26. Security and privacy
@@ -2386,10 +2419,10 @@ Verify:
 - Double lease release is harmless or detected without underflow.
 - A failed admission commit frees the pending RPM slot and the in-flight slot.
 - No dispatch occurs when admission persistence fails.
-- A committed admission with no terminal row is recovered as a spent slot.
 - A pending reservation holds the sixtieth slot against a concurrent caller for the whole time its admission commit runs.
 - A deliberately slow admission commit dates its dispatch timestamp at the `Do` boundary and not at reservation, so 60 dispatches never fall inside one 60-second interval measured at that boundary.
-- A recovered admission is dated by its reservation instant advanced by the store-operation ceiling, and a restart during a saturated window readmits nothing.
+- No account admits a dispatch before one full rolling window has elapsed since process start, and the first admission after that instant succeeds.
+- A crash and restart straddling a saturated window cannot place more than 60 dispatches in any rolling 60-second interval, with the wall clock deliberately stepped forward and backward across the restart.
 
 ### 28.6 Concurrency stress tests
 
@@ -2479,6 +2512,7 @@ Cover:
 - Two 5xx failures move from same-account preference to another account.
 - Same-account retry falls back to another when the preferred account lacks capacity.
 - Upstream 504 prefers another account.
+- A 503 carrying `Retry-After` delays a same-account retry by at least the stated value, stores it unclamped, leaves account health and the cooldown circuit untouched, and delays a retry that moves to another account not at all.
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
@@ -2604,7 +2638,7 @@ Verify:
 - Unique ID handling.
 - Update/delete triggers.
 - Index presence.
-- `EXPLAIN QUERY PLAN` on both recovery queries, asserting the intended index and no full table scan.
+- `EXPLAIN QUERY PLAN` on the session recovery query, asserting the intended index and no full table scan.
 - `PRAGMA foreign_keys` is on for every connection the pool hands out, and an orphan dispatch row is refused by the live connection rather than only by the schema text.
 - Passive checkpoints run on the maintenance connection, and an admission commit issued while one is running does not queue behind it.
 - WAL growth and its warning under a deliberately held external reader.
@@ -2617,7 +2651,7 @@ Verify:
 - No `logical_request_id` present in both `unrouted_request` and `attempt_log`, across the full matrix of local rejections, selection failures, and dispatched requests.
 - Selection and attempt numbering.
 - Aggregate skip counts.
-- Upstream retry delay persisted on 429 dispatch rows, in both the delta and the HTTP-date form, and absent everywhere else.
+- Upstream retry delay persisted on 429 and 5xx dispatch rows whose response carried the header, in both the delta and the HTTP-date form, and absent everywhere else.
 - Terminal capacity-failure rows.
 - One phase batch commits atomically.
 - A deliberate bad row rolls back its whole phase batch.
@@ -2625,8 +2659,9 @@ Verify:
 - No cost/currency columns.
 - Startup session recovery.
 - Process start and stop rows, and the absent stop row after a killed subprocess.
-- Startup rate recovery, driven by admission rows and not by terminal attempts.
+- Startup reads no rate state from `dispatch_admission`, so a store seeded with recent admissions changes nothing about when the first dispatch may leave.
 - Admission rows survive a subprocess killed immediately after their commit.
+- Every named query recipe of §30.3 parses and runs against a seeded store and returns the shape its name promises, so a schema change that invalidates one fails here rather than in front of an operator.
 - Busy timeout behavior.
 - Disk/permission failures where platform support permits.
 - Store close ordering.
@@ -2666,13 +2701,14 @@ Exercise:
 - Expired session not recovered.
 - Newest successful account chosen after spill.
 - Two successful requests of one session that finish out of arrival order recover the account of the later arrival, matching what the live sequence guard chose.
+- Two rows of one session with equal derived arrival instants recover the same account on every run, resolved by the stated tie-break rather than by the order the rows came back in.
 - Failed spill ignored for recovery.
-- Recent dispatch timestamps seed rate state.
-- Old attempts do not.
+- A restarted process refuses every dispatch until one full rolling window has elapsed, whatever the store holds.
 - In-flight resets to zero.
 - Disabled health resets.
 - No startup upstream requests.
 - Clock-skew clamping.
+- A second process pointed at the same database fails startup while the first lives, and succeeds once the first has exited, including after a SIGKILL that gave it no chance to release anything.
 
 ### 28.16 Shutdown tests
 
@@ -2682,6 +2718,7 @@ Verify:
 - Active stream can complete within grace.
 - First signal is graceful.
 - Second signal forces cancellation.
+- A handler admitted an instant before the first signal, running to its full logical deadline, still lands its terminal row before the shutdown grace expires.
 - Waiting account acquisition exits.
 - Retry backoff exits.
 - Leases release.
@@ -2726,7 +2763,7 @@ Benchmarks and load checks must establish:
 - SSE relay does not accumulate total stream size.
 - Non-streaming bodies above 8 MiB do not accumulate total response size.
 - Coordinator critical sections remain short.
-- The admission commit’s own latency, measured on the filesystem the store will live on and at the concurrency the in-flight ceilings permit, reported against total dispatch latency. It is the only durable write on a request’s critical path, and the synchronous level chosen in §15.2 is answerable from this number rather than from argument.
+- The admission commit’s own latency, measured on the filesystem the store will live on and at the concurrency the in-flight ceilings permit, reported against total dispatch latency. It is the only durable write on a request’s critical path, and it is what sizes the store-operation ceiling that bounds the pending-reservation window of §17.1.
 - SQLite inserts do not hold coordinator state.
 - Selection rechecks produce bounded aggregated skip state.
 - 28 catalog entries and tens of thousands of rows do not materially affect startup.
@@ -2750,7 +2787,7 @@ Benchmarks use `b.Loop`, run with `-benchmem`, and are compared across repeated 
 
 The argument that settles this is not durability, indexing, or the cost of the dependency. It is that this attempt log has a reader inside the proxy.
 
-Session affinity survives a restart only if startup can answer "which account most recently served this session key, within the last hour", and the rolling windows survive only if it can answer "which dispatches started in the last 60 seconds, per account". Both run before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
+Session affinity survives a restart only if startup can answer "which account most recently served this session key, within the last hour", ranked by an arrival instant derived from two columns of the rows that come back, and it has to answer before the listener binds. JSONL is proposed on the premise that an attempt log is written and never read back, and that premise is false here: it would turn startup into a full scan of a file that grows for months, and would move the correctness of affinity recovery into hand-written parsing of a format that enforces nothing.
 
 The rest is real but follows from the choice rather than driving it: typed nullable columns that keep a missing token count distinct from a zero, constraints that fail a malformed row at the write instead of at a read months later, crash-safe transactional commits, and safe concurrent reading by a local analysis tool while the proxy is serving.
 
@@ -2782,11 +2819,11 @@ Consequences:
 
 Synchronous writes make completion visibility deterministic and avoid an unbounded queue or background writer. Grouping a phase’s skips and terminal record in one transaction avoids one commit per recheck while retaining append-only rows. The accepted costs are that retry progression can wait for an earlier attempt’s transaction and that final streaming bytes may reach the client before final persistence.
 
-The admission write is synchronous for a different reason: it is not analytics, it is the input to a correctness decision the next process makes. Its costs are stated plainly because they are real. Every dispatch now pays one durable commit before the send, all such commits serialize through the single database connection, and a store that cannot accept them makes the proxy refuse to originate traffic rather than serve it unrecorded. Against an upstream call measured in seconds, one commit is not the expensive part of a dispatch, and the alternative is a ceiling that quietly means something weaker than what §2 promises. The number missing from that sentence is how long the commit actually takes on the filesystem this store will live on, at the concurrency the in-flight ceilings permit, where each commit also queues behind every other statement on the single connection. §28.18 measures it, and §15.2 records what a material answer would change.
+The admission write is synchronous for a different reason: it is not analytics, it is the evidence that a dispatch left this process, and evidence written after the send it was supposed to precede is evidence of nothing. Its costs are stated plainly because they are real. Every dispatch now pays one durable commit before the send, all such commits serialize through the single writer connection, and a store that cannot accept them makes the proxy refuse to originate traffic rather than serve it unrecorded. Against an upstream call measured in seconds, one commit is not the expensive part of a dispatch. The number missing from that sentence is how long the commit actually takes on the filesystem this store will live on, at the concurrency the in-flight ceilings permit, where each commit also queues behind every other statement on the connection. §28.18 measures it, and §15.2 states what that number does and does not decide.
 
 ### 29.6 Admission rows plus terminal attempt rows
 
-Two immutable rows per dispatch satisfy append-only logging without updates and separate what must be true before the send from what can only be known after it. The remaining cost is that a hard crash still loses result metadata for an attempt in flight. What it can no longer lose is the evidence that the attempt was authorized, which is the half a restarted process needs in order to stay under the rolling ceiling. An admission with no terminal row is not a gap in the log; it is the durable statement that an attempt started and this process never learned how it ended.
+Two immutable rows per dispatch satisfy append-only logging without updates and separate what must be true before the send from what can only be known after it. The remaining cost is that a hard crash still loses result metadata for an attempt in flight. What it can no longer lose is the evidence that the attempt was authorized. An admission with no terminal row is not a gap in the log; it is the durable statement that an attempt started and this process never learned how it ended, and it is what the ambiguous send of §21.7 has to be reconstructed from.
 
 ### 29.7 Exact rolling window
 
@@ -2822,7 +2859,7 @@ This can expose a transport-level truncated response rather than transparently r
 
 ### 29.14 In-memory health state
 
-Credential disablement and cooldown are process-local, and restart is the entire recovery mechanism for both a rotated key and a renewed subscription on an unchanged key. A faster path was considered and rejected: letting an explicit account alias re-test a disabled account would buy back a restart that already costs one command on this machine, and would charge for it the only exception to the rule that a disabled account stays disabled, placed inside the admission path. Session affinity and recent rate timestamps are recovered because they have direct correctness/cache value.
+Credential disablement and cooldown are process-local, and restart is the entire recovery mechanism for both a rotated key and a renewed subscription on an unchanged key. A faster path was considered and rejected: letting an explicit account alias re-test a disabled account would buy back a restart that already costs one command on this machine, and would charge for it the only exception to the rule that a disabled account stays disabled, placed inside the admission path. Session affinity is recovered because it has direct cache value; rate correctness is carried across the restart by the blackout of §16.3 rather than by recovering anything.
 
 ### 29.15 Stable model list despite health
 
@@ -2869,6 +2906,7 @@ Implementation is not complete without:
 - A `llmux version` subcommand printing release version, revision, the highest schema version the binary supports, and the Go toolchain, without opening configuration or a database.
 - A `llmux db check` subcommand that opens a named database read-only and reports its schema version, `quick_check`, `foreign_key_check`, WAL state, file size, and the free space on its filesystem.
 - A `llmux db backup` subcommand that writes an owner-only consistent backup, refuses to overwrite an existing file, and needs no account credential.
+- A directory of named SQL query recipes covering the questions of §30.3, each executed in CI against a seeded store, which is what keeps a recipe and the schema it reads from drifting apart.
 - Release artifacts built with `-trimpath`, published with checksums.
 
 These are documentation and launch aids, not a UI or additional runtime service. The list still stops where a document would start describing the process rather than the system: a written checklist restating build identity would be a second copy free to be wrong, which is exactly why `llmux version` reads `debug.ReadBuildInfo` at runtime instead of printing strings someone stamped in by hand. It derives the answer rather than repeating it, and during a cutover or a rollback "which binary is this" is a question worth being able to ask the binary.
@@ -2894,11 +2932,15 @@ The binary must never create a missing parent directory implicitly; a path typo 
 
 ### 30.3 Routine log inspection
 
-The README must provide SQLite query recipes, described and tested against the actual schema, for the questions below. The logical-request ones carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
+The query recipes for the questions below are checked-in SQL files, each one executed in CI against a seeded store, and the README describes each by name and points at its file rather than carrying a copy of its text. A recipe that lives only in prose is schema knowledge that nothing fails for when the schema moves, which is the failure §1 spends a paragraph on; a recipe that is executed is tested the way the migrations it reads are, and a migration that invalidates one breaks the build rather than an operator.
+
+Embedding them in the binary as a report subcommand was the alternative and is not taken. It would fix the same drift, but half of these questions are parameterized by an account or a time range, so the subcommand would either hard-code the answers, which makes it useless, or grow a query surface, which is the log-query API §3 rules out wearing a command-line hat. The two `db` subcommands that do exist are there because §30.4 needs a correct backup and a schema check that no other tool on the machine can produce; running a fixed SELECT is not in that class.
+
+The logical-request recipes carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
-- Upstream 429 responses against dispatch volume per account, together with the distribution of upstream-advertised retry delays, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered.
+- Upstream 429 responses against dispatch volume per account, together with the distribution of the retry delays advertised on those 429 rows, which is the one measurement that can show the local ceiling sits above upstream’s and by roughly how much upstream wants it lowered. The same column on a 5xx row is upstream describing an outage rather than a rate ceiling, so a recipe that does not filter by status mixes two different statements into one distribution.
 - In-flight and RPM selection skips by account.
 - Spill pivots with source and destination.
 - Retry chains grouped by logical request, and the dispatch amplification they represent.
@@ -2916,7 +2958,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Per-consumer traffic, attributed from the presence of a `session_key`, the requested alias, and the streaming flag, because the store holds no consumer identifier. `eod` is the one sessionless caller, which is what makes its rows findable without appealing to the hour it usually runs at. This is a heuristic, and §15.5 records what would replace it and when.
 
-No built-in query, README recipe, or report computes currency cost.
+No query recipe, subcommand, or report computes currency cost.
 
 ### 30.4 Database backup and archival
 
@@ -2936,11 +2978,10 @@ No built-in query, README recipe, or report computes currency cost.
 Retention is out of scope and unbounded growth is not a plan, so there is one manual escape hatch. Nothing deletes rows, and §24.5 makes a full filesystem a dispatch outage rather than a logging inconvenience, so a store left alone eventually stops the proxy. Cold archive rotation is how an operator gets ahead of that:
 
 1. Stop the service cleanly and confirm its stop row was written.
-2. Wait until a complete 60-second rolling window has passed since the last dispatch, so that the empty rate ledger the new store begins with is accurate rather than merely empty.
-3. Take an owner-only archive with `llmux db backup` and verify it with `llmux db check`.
-4. Preserve the archive and its checksum. Rotation never deletes one, which is what keeps the append-only rule true across the boundary.
-5. Move the old database aside and start the service, which migrates a fresh one.
-6. Accept that session affinity starts empty. At most the last hour of pins is lost, and rate safety is preserved by the wait in step 2.
+2. Take an owner-only archive with `llmux db backup` and verify it with `llmux db check`.
+3. Preserve the archive and its checksum. Rotation never deletes one, which is what keeps the append-only rule true across the boundary.
+4. Move the old database aside and start the service, which migrates a fresh one.
+5. Accept that session affinity starts empty. At most the last hour of pins is lost, and rate safety needs no step of its own here: the restarted process refuses dispatch for a full rolling window whatever store it opens, which is the case this procedure used to cover by waiting before the archive was taken.
 
 The procedure is manual and offline for the same reason retention is absent: anything that ran on its own would eventually run while the proxy was serving, and losing the evidence of a dispatch that happened is the one thing this store may not do.
 
@@ -2996,7 +3037,7 @@ The token and latency evidence has preconditions of the same shape, and they exi
 2. Stop the old listener cleanly.
 3. Start `llmux` on `127.0.0.1:4000`.
 4. Verify authenticated `/v1/models`.
-5. Run one small exact-account request.
+5. Run one small exact-account request, allowing for the post-start dispatch blackout, which can delay the first dispatch after any start by up to one rolling window.
 6. Run the `pi` multi-turn tool-loop check.
 7. Run representative `kernl` and `eod` checks.
 8. Confirm all three consumers still use only the documented base URL, proxy key, model aliases, and session header, and that none of them appends a query string.
@@ -3021,7 +3062,7 @@ The old proxy does not read or migrate the `llmux` database. A rollback therefor
 For the first week of real traffic, inspect the attempt store at least daily for:
 
 - Any account exceeding the designed local ceilings.
-- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. The retry delays stored on those rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants.
+- Upstream 429 rate against dispatch rate per account. Re-derive the per-account dispatch and in-flight ceilings, and the cooldown threshold, from it once a week of real traffic exists, remembering that the absence of 429s bounds the ceiling from neither side. Where §14.4 shipped, the lowest remaining quota observed across the week bounds it from below, which is the direction 429 silence never could, and the re-derivation stops being one-sided. The retry delays stored on the 429 rows are upstream’s own quantitative statement of how far over the line a burst landed, and they are the direct input to the cooldown constants; the same column on a 5xx row belongs to a different question and is filtered out here.
 - Repeated authentication failures.
 - Spill frequency and pin-move correctness.
 - Retries after response commitment, which must remain zero.
@@ -3043,6 +3084,7 @@ Deliver:
 - A settled answer for `reasoning_effort="max"`: supported and distinct, or replaced, or removed. Record what the compatibility page says on the day as context, never as the answer.
 - The status upstream returns for an invalid or revoked key, recorded from a deliberately bad credential.
 - Which `Content-Encoding` upstream selects when sent each consumer’s real `Accept-Encoding`, recorded per encoding advertised and separately for a streaming and a non-streaming request. This decides whether the bounded observation decoder of §14.3 ships in Phase 6 and which encodings the §30.7 consumer precondition has to name.
+- Whether upstream responses carry numeric rate-limit headers, recorded by exact header name and per account. This decides whether the bounded projection of §14.4 ships in Phase 5, and it costs one look at headers the inventory requests are already receiving.
 
 Gate:
 
@@ -3081,14 +3123,14 @@ Deliver:
 - Synchronous fail-closed admission insert API.
 - Transactional phase-batch insert API.
 - Dispatch, selection-skip, and selection-failure records.
-- Recovery queries.
+- The session recovery query.
 - Permission and schema checks.
 
 Gate:
 
 - Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
 - An admission insert that fails is reported to its caller as a failure and never as a partial success.
-- The admission commit’s latency is measured on the deployment filesystem and recorded, so the synchronous level of §15.2 is a decision with a number behind it before any dispatch depends on it, and the store-operation ceiling that §17.1 makes recovery conservative against is a number rather than a guess.
+- The admission commit’s latency is measured on the deployment filesystem and recorded, so the store-operation ceiling that bounds the pending-reservation window of §17.1 is a number rather than a guess, and the one durable write on the dispatch critical path has a measured cost before anything is built on top of it.
 - Connection-local pragmas are confirmed to hold on every connection the pool hands out, on the pinned driver, by reading them back after the pool has been forced to open a fresh one. A pragma is per connection and a pool may open another at any moment, so setting it once at open is an assumption about this driver and this pool rather than a property of SQLite.
 - Static cgo-free test build succeeds.
 
@@ -3123,7 +3165,8 @@ Deliver:
 - Reopen-aware bounded wait and spill behavior.
 - Sixty-second acquisition ceiling and `Retry-After`.
 - Health transitions.
-- Startup state loading.
+- Post-start dispatch blackout.
+- Startup session-pin loading.
 
 Gate:
 
@@ -3144,6 +3187,7 @@ Deliver:
 - Intermediate response drain.
 - Final response commitment rules.
 - Ambiguous-send accounting.
+- The bounded rate-limit header projection of §14.4, if Phase 0 recorded upstream sending one.
 
 Gate:
 
@@ -3182,7 +3226,7 @@ Deliver:
 - Panic recovery.
 - Structured lifecycle logging.
 - Durable process start and stop rows.
-- Secure file checks.
+- Secure file checks and the single-instance store lock.
 - Static build automation with `-trimpath` and published checksums.
 - `llmux version`, deriving its output rather than restating it, and the read-only `llmux db check` and `llmux db backup`.
 - Lint/security configuration.
@@ -3199,7 +3243,7 @@ Gate:
 Deliver:
 
 - Installation and environment documentation.
-- SQLite query, backup, restore, and archive runbooks.
+- The named SQLite query recipes and their CI execution, plus the backup, restore, and archive runbooks.
 - Disabled-account recovery procedure.
 - Cutover and rollback procedures.
 - Real-binary socket/signal/flush smoke test.
@@ -3240,6 +3284,7 @@ The project is complete only when all of the following are true:
 
 - One static cgo-free binary starts with the required five secrets and the SQLite path.
 - It listens on the configured loopback address and refuses any other.
+- A second process pointed at the same store refuses to start while the first is alive, so the ceilings are enforced by one counter set and not by two.
 - Both endpoints enforce the shared bearer key by digest comparison, and startup rejects a key that is too short or shared with an account.
 - `/v1/models` lists exactly 28 deterministic aliases without upstream I/O.
 - Every alias resolves to its fixed upstream model and eligible account set.
@@ -3263,7 +3308,7 @@ The project is complete only when all of the following are true:
 - No account exceeds twelve in-flight attempts.
 - Those ceilings are proven from the fake upstream’s observations, not only coordinator counters.
 - Every actual dispatch has a durable admission row committed before it.
-- Recovery counts admission rows even when the matching terminal metadata is absent, and dates them no earlier than the latest instant their dispatch could have occurred.
+- No dispatch leaves during the first full rolling window after any process start, proven across crash-restart boundaries with the wall clock stepped in both directions.
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.
@@ -3280,7 +3325,7 @@ The project is complete only when all of the following are true:
 - Prompt and completion text are absent from durable and process logs.
 - Raw session identifiers are absent from both.
 - Currency and cost logic are absent.
-- Startup recovers recent rate timestamps and successful session pins.
+- Startup recovers successful session pins and reads no rate state.
 - Every process start, and every shutdown the process survives to perform, is a row in the durable store.
 - Graceful shutdown releases permits and closes SQLite last.
 - Request bodies, account acquisition, retries, downstream writes, and store cleanup each have an independently enforceable bound.

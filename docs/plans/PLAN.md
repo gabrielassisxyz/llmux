@@ -4,7 +4,7 @@
 
 This document is the implementation contract for `llmux`. Implementation work should follow it without reopening the closed decisions in [`IDEA.md`](../../local/plans/IDEA.md).
 
-`llmux` is a single-user, single-machine OpenAI-compatible routing proxy. It exposes two HTTP resources, routes seven logical model aliases across three Ollama Cloud accounts, preserves conversation-to-account affinity, enforces account-wide ceilings, relays streaming and non-streaming responses, and writes append-only attempt records to one embedded SQLite store.
+`llmux` is a single-user, single-machine OpenAI-compatible routing proxy. It exposes two HTTP resources, routes seven logical model aliases across three Ollama Cloud accounts, preserves conversation-to-account affinity, enforces account-wide ceilings, relays streaming and non-streaming responses, and writes a durable dispatch-admission ledger plus append-only attempt records to one embedded SQLite store.
 
 Where the existing deployment’s exact upstream model strings differ from the provisional mapping in this document, implementation must transcribe those fixed strings into the source catalog. This is deployment inventory, not runtime backend configurability.
 
@@ -25,6 +25,7 @@ When two sections appear to pull in different directions, the non-negotiable inv
 - Disable revoked/lapsed credentials immediately and cool repeatedly rate-limited accounts.
 - Relay final upstream responses without transforming JSON or SSE content.
 - Record enough attempt metadata to reconstruct account use, spills, retries, local skips, latency, and upstream-reported token counts.
+- Durably record every dispatch admission before the network call it authorizes, so a restarted process cannot exceed the rolling ceiling it claims to enforce.
 - Ship as one cgo-free static Go binary with no runtime, framework, container, database server, or ORM.
 
 ## 3. Non-goals
@@ -53,17 +54,18 @@ When two sections appear to pull in different directions, the non-negotiable inv
 7. No alias, deployment, or model creates its own rate bucket.
 8. There is no currency type, cost column, pricing configuration, or cost calculation.
 9. Durable records live in one embedded SQLite store accessed through handwritten SQL.
-10. Each actual upstream dispatch consumes one RPM slot even if it fails to dial, returns an error, is canceled, or is a retry.
-11. Each dispatched attempt produces at most one terminal append-only row.
-12. Local selection skips produce separate append-only rows and do not count as upstream attempts.
-13. No retry occurs after the downstream response is committed.
-14. Coordinator state is never locked while performing network, database, logging, or downstream I/O.
-15. All request-owned resources are bounded by a deadline, size limit, permit, or explicit lifecycle.
-16. Every untouched top-level JSON member retains its original raw value bytes and relative order, including unknown members and duplicate unknown members. Only the routing-owned top-level values may differ.
-17. The proxy never injects `stream_options.include_usage`, never alters `stream`, and never changes the response stream to improve observability. Missing usage remains missing.
-18. Every account-acquisition phase ends in either one atomically reserved dispatch or one explicit terminal selection-failure record. It cannot wait indefinitely.
-19. A committed response that later breaks is aborted as a transport failure; the proxy must not make a truncated upstream body look like a cleanly completed HTTP response.
-20. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
+10. Each actual upstream dispatch has a committed `dispatch_admission` row written before `http.Client.Do`.
+11. Each actual upstream dispatch consumes one RPM slot even if it fails to dial, returns an error, is canceled, or is a retry.
+12. Each dispatched attempt produces at most one terminal append-only attempt row in addition to its admission row.
+13. Local selection skips produce separate append-only rows and do not count as upstream attempts.
+14. No retry occurs after the downstream response is committed.
+15. Coordinator state is never locked while performing network, database, logging, or downstream I/O.
+16. All request-owned resources are bounded by a deadline, size limit, permit, or explicit lifecycle.
+17. Every untouched top-level JSON member retains its original raw value bytes and relative order, including unknown members and duplicate unknown members. Only the routing-owned top-level values may differ.
+18. The proxy never injects `stream_options.include_usage`, never alters `stream`, and never changes the response stream to improve observability. Missing usage remains missing.
+19. Every account-acquisition phase ends in one atomically reserved and durably admitted dispatch, one explicit terminal selection-failure record, or one admission-store failure. It cannot wait indefinitely.
+20. A committed response that later breaks is aborted as a transport failure; the proxy must not make a truncated upstream body look like a cleanly completed HTTP response.
+21. An account disabled by an authentication failure stays disabled for the process lifetime. No request, alias or code path re-enables it.
 
 ## 5. Fixed design decisions
 
@@ -87,7 +89,8 @@ When two sections appear to pull in different directions, the non-negotiable inv
 | Retry limit | At most four dispatched attempts per logical request |
 | Retry placement | 429 and processing timeouts prefer another account; an initial 5xx/408/transient-network retry prefers the same account to retain cache |
 | Request headers | Fixed end-to-end allowlist; all proxy-internal and hop-by-hop headers are removed |
-| Logging | One synchronous SQLite transaction per terminal routing phase; pending skips and its dispatch/failure are committed together |
+| Dispatch evidence | One synchronous append-only admission row committed before every `http.Client.Do` |
+| Terminal logging | One synchronous SQLite transaction per terminal routing phase; pending skips and its dispatch/failure are committed together |
 | Disabled-account recovery | Restart only |
 | Process model | One proxy process |
 | Backend definition | Fixed source catalog |
@@ -407,7 +410,7 @@ Use a small layered service with explicit construction. The problem warrants sep
 
 Dependency direction:
 
-`cmd/llmux` → application composition → HTTP proxy, route coordinator, upstream client, attempt store.
+`cmd/llmux` → application composition → HTTP proxy, route coordinator, upstream client, durable store.
 
 Lower-level components do not import the application or command package.
 
@@ -500,10 +503,11 @@ Properties:
 - Overall lifetime controlled by request context.
 - Idle connections closed at shutdown.
 
-#### Attempt store
+#### Durable store
 
 - One SQLite database connection.
 - Parameterized handwritten SQL.
+- Synchronous append of one dispatch-admission row before every `http.Client.Do`.
 - Synchronous transactional batch inserts.
 - One phase batch contains its deduplicated selection skips followed by either its dispatched attempt or terminal selection failure.
 - Startup-only recovery queries.
@@ -520,7 +524,7 @@ Properties:
 5. Open SQLite at the exact configured path.
 6. Apply embedded forward-only migrations.
 7. Verify append permissions using a transaction that is rolled back.
-8. Recover recent rate timestamps.
+8. Recover recent rate timestamps from `dispatch_admission`, never from terminal attempt rows.
 9. Recover unexpired successful session pins.
 10. Construct the route coordinator.
 11. Construct the upstream transport and HTTP handlers.
@@ -572,17 +576,22 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Compute `Retry-After` when at least one account has temporary capacity state.
     - Transactionally append the deduplicated skip rows and one `selection_failure` row.
     - Return local 429 for temporary capacity exhaustion or local 503 when no flexible account is usable.
-13. If selection succeeds, install release cleanup immediately. The reservation and `http.Client.Do` must be adjacent; only account authorization and request-context binding remain between them.
-14. Dispatch through the selected account. Once reservation succeeds, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send.
-15. Classify transport errors and upstream status before writing any downstream status or headers.
-16. If retrying:
+13. If selection succeeds, install release cleanup immediately. The lease is provisional until its admission row commits.
+14. Generate the attempt's `attempt_id` and synchronously commit its `dispatch_admission` row.
+15. If the admission commit fails:
+    - Cancel the provisional lease, which removes its uncommitted RPM timestamp and releases its in-flight slot.
+    - Append no dispatch row, because no dispatch occurred.
+    - Return local 503 `admission_store_unavailable`.
+16. Mark the lease dispatchable and call `http.Client.Do` immediately. The admission commit is the only fallible step permitted between reservation and dispatch, and it ends the attempt rather than being worked around: account authorization and request-context binding are the only other work left, and neither can fail. Once the admission commits, its RPM timestamp is never refunded, even if a local panic or transport failure prevents a provably completed send. A crash after the commit but before `Do` leaves a conservative phantom admission, which is the direction the recovery ledger is deliberately wrong in.
+17. Classify transport errors and upstream status before writing any downstream status or headers.
+18. If retrying:
     - Drain and close the intermediate response within bounds.
     - Release the lease.
     - Update account health.
     - Transactionally append the selection skips and attempt row.
     - Wait using context-aware backoff.
     - Begin the next selection phase with the next prospective attempt number.
-17. If final:
+19. If final:
     - Stage filtered upstream headers without committing them.
     - For SSE, successfully read the first non-empty upstream body chunk before downstream commitment.
     - For non-streaming 2xx, buffer up to 8 MiB before commitment; complete small bodies in memory and transition larger bodies to progressive relay.
@@ -593,8 +602,9 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
     - Release the account lease.
     - Update health and session state.
     - Transactionally append the selection skips and final attempt row.
-18. Drop references to the original body immediately after rewrite, and to the rewritten replay body as soon as no future retry can occur. No body is written to disk.
-19. Return only after the terminal transaction has been attempted.
+20. Drop references to the original body immediately after rewrite, and to the rewritten replay body as soon as no future retry can occur. No body is written to disk.
+21. Terminal persistence uses a bounded context derived from the application force-shutdown context, not the client request context and not the expired logical-request context. A client that disconnects, or a deadline that expires, must not cancel the write that records exactly that.
+22. Return only after the terminal transaction has been attempted.
 
 ## 13. Upstream request and response handling
 
@@ -844,15 +854,33 @@ If initial migration fails after a new file was created, preserve the file for d
 
 ### 15.3 Record granularity
 
-The sole durable event table is `attempt_log`.
+Two append-only tables exist, and the split is by commit point rather than by subject.
+
+`dispatch_admission` holds the evidence a dispatch was authorized, and one row is committed synchronously before every possible upstream dispatch:
+
+| Field | Type/nullability | Meaning |
+| --- | --- | --- |
+| `attempt_id` | Text, primary key | Proxy-generated dispatch identity |
+| `logical_request_id` | Text, non-null | Groups one client request's attempts |
+| `attempt_no` | Integer, non-null | 1-based dispatch count within the logical request |
+| `account_label` | Text, non-null | `k1`, `k2`, or `k3` |
+| `requested_alias` | Text, non-null | Exact client alias |
+| `upstream_model` | Text, non-null | Fixed resolved upstream model |
+| `reserved_at_us` | Integer, non-null | UTC Unix microseconds at reservation |
+| `limiter_rpm_used` | Integer, non-null | Post-reservation snapshot |
+| `limiter_in_flight` | Integer, non-null | Post-reservation snapshot |
+
+An admission row carries only what rate recovery needs and what identifies the attempt it authorized. It is never updated, so an admission without a matching terminal attempt row is itself a fact: the process crashed, stopped between the commit and the send, or lost its store before the attempt finished. Recovery counts it either way.
+
+`attempt_log` holds what became known after the fact.
 
 Record kinds:
 
-- `dispatch`: one actual call to the upstream HTTP client.
+- `dispatch`: one actual call to the upstream HTTP client, referencing its required `attempt_id`.
 - `selection_skip`: one distinct local candidate rejection due to rate or account health.
 - `selection_failure`: one account-acquisition phase that ended without any dispatch.
 
-There is no separate logical-request summary table.
+There is still no separate logical-request summary table. Client-visible outcome, final token counts, retry amplification, and end-to-end latency are all reconstructable from the attempt rows of one `logical_request_id`: the highest `sequence_no` row is what the client saw, its token counts are the final response's, and counting `dispatch` rows is the amplification. A summary table would store no fact that is not already there, and would introduce the one failure the derived query cannot have, which is the two copies disagreeing. §30.3 therefore owes a tested recipe for each of those questions instead. The rule is the one applied to the omitted columns in §15.5: a table is cheaper to add in a later migration than two writers of one fact are to keep in agreement.
 
 A logical request may therefore contain:
 
@@ -881,6 +909,7 @@ Within one account-selection phase, repeated observations of the same `(account,
 | --- | --- | --- |
 | `record_id` | Text, primary key | Proxy-generated row ID |
 | `logical_request_id` | Text, non-null | Groups one client request’s rows |
+| `attempt_id` | Text, nullable | Required for dispatch rows; references `dispatch_admission`. Null for skips and selection failures |
 | `sequence_no` | Integer, non-null | Foreground event order within the logical request |
 | `selection_no` | Integer, non-null | 1-based account-acquisition phase; normally the prospective attempt number |
 | `record_kind` | Text, non-null | `dispatch`, `selection_skip`, or `selection_failure` |
@@ -910,8 +939,8 @@ Within one account-selection phase, repeated observations of the same `(account,
 | `prompt_tokens` | Integer, nullable | Upstream-reported count |
 | `completion_tokens` | Integer, nullable | Upstream-reported count |
 | `total_tokens` | Integer, nullable | Upstream-reported count |
-| `limiter_rpm_used` | Integer, nullable | Per-account post-reservation or skip snapshot |
-| `limiter_in_flight` | Integer, nullable | Per-account post-reservation or skip snapshot |
+| `limiter_rpm_used` | Integer, nullable | Per-account snapshot at a skip; null on dispatch rows, which carry it on their admission row |
+| `limiter_in_flight` | Integer, nullable | Per-account snapshot at a skip; null on dispatch rows, which carry it on their admission row |
 | `skip_reason` | Text, nullable | Local selection reason |
 | `skip_observation_count` | Integer, nullable | Repeated identical observations aggregated into a skip row |
 | `dropped_header_count` | Integer, nullable | Request headers removed by the allowlist; null for skips |
@@ -959,6 +988,9 @@ The schema enforces:
 
 - Unique `record_id`.
 - Unique `(logical_request_id, sequence_no)`.
+- Unique `attempt_id` and unique `(logical_request_id, attempt_no)` in `dispatch_admission`.
+- `attempt_id` required on dispatch rows, null on skip and selection-failure rows, and always referencing an existing admission.
+- Limiter snapshots present only on skip rows.
 - Fixed record kinds and enums.
 - Positive `selection_no` for every row.
 - Account labels restricted to three values when present.
@@ -978,8 +1010,9 @@ The schema enforces:
 
 Create indexes for:
 
-- Chronological access by `started_at_us`.
-- `(account_label, started_at_us)`.
+- `dispatch_admission(account_label, reserved_at_us)`, which is the rolling-rate recovery query.
+- `attempt_log(started_at_us)`.
+- `attempt_log(account_label, started_at_us)`.
 - `(logical_request_id, sequence_no)`.
 - `(session_id, finished_at_us)`.
 - `(requested_alias, started_at_us)`.
@@ -989,7 +1022,7 @@ Create indexes for:
 ### 15.10 Append-only enforcement
 
 - The application exposes no update or delete method.
-- SQLite triggers reject `UPDATE` and `DELETE` on `attempt_log`.
+- SQLite triggers reject `UPDATE` and `DELETE` on both durable tables.
 - Schema metadata uses `PRAGMA user_version`.
 - Migrations are numbered, embedded, forward-only, and transactional.
 - A database newer than the binary understands causes fatal startup.
@@ -997,20 +1030,27 @@ Create indexes for:
 
 ### 15.11 Commit timing and crash behavior
 
-Each selection phase accumulates a bounded set of skip facts in memory. When that phase’s dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
+Correctness evidence and analytics have different commit points, because they answer to different failures.
+
+1. `dispatch_admission` commits synchronously after the in-memory reservation and before `http.Client.Do`.
+2. Each selection phase accumulates a bounded set of skip facts in memory. When that phase's dispatch becomes terminal, or the phase itself ends without dispatch, the skip rows and the terminal dispatch or failure row are inserted in one SQLite transaction.
 
 This means:
 
-- One dispatched attempt has one complete immutable row.
+- Every actual network dispatch has durable pre-dispatch evidence, so rate recovery is a query over what the process was authorized to send rather than over what it managed to finish.
+- One dispatched attempt has one complete immutable terminal row.
 - A terminal capacity failure is explicit rather than inferable from the last skip.
-- A phase normally incurs one SQLite commit rather than one commit per account recheck.
-- Status, token counts, retry decision, and durations coexist in that row.
-- A process crash during an active attempt can lose that unfinished attempt and its pending skip rows.
-- A separate start row followed by an update is deliberately not used.
+- A phase normally incurs one terminal commit rather than one commit per account recheck, on top of one admission commit per dispatch.
+- Status, token counts, retry decision, and durations coexist in that terminal row.
+- A process crash during an active attempt can lose that attempt's result metadata and its pending skip rows, but not its rate admission.
+- A separate start row followed by an update is deliberately not used; the admission row is a distinct immutable fact, not a mutable draft of the terminal one.
 - A streaming success may reach the client before its final log insert fails.
 - A logging failure cannot retroactively replace an upstream success.
-- Runtime log failures produce sanitized stderr events and do not stop serving.
+- An admission failure produces a sanitized stderr event, prevents the dispatch, and returns local 503. It is the one persistence failure that stops work, because it is the one that would otherwise create traffic no restart could account for.
+- Terminal log failures produce sanitized stderr events and do not stop serving, including for traffic already admitted.
 - Database failure at startup is fatal.
+
+Admission and terminal writes both use bounded store contexts derived from the application force-shutdown context. Client cancellation and logical-deadline expiry must not suppress the record of that cancellation or expiry.
 
 The synchronous transaction is attempted:
 
@@ -1072,12 +1112,12 @@ Before listening:
 
 - Recover the newest successful account for every session completed in the previous hour.
 - Preserve the original completion-based expiry.
-- Recover dispatch starts from the previous 60 seconds into account rolling windows.
+- Recover dispatch admissions from the previous 60 seconds into account rolling windows.
 - Set in-flight counts to zero.
 - Do not restore disabled state, because restart is how corrected credentials are installed.
 - Do not call upstream to validate recovered state.
 
-A crash may omit active unfinished attempts. Graceful restarts recover all completed recent attempts.
+Rate recovery reads `dispatch_admission` and never the terminal attempt rows. An attempt that was in flight when the process died left an admission and no result, and recovery counts it exactly like a completed one: the timestamp is what the ceiling is defined over, and the outcome is irrelevant to it. The ledger can therefore be wrong in one direction only, counting a slot that a crash between the commit and the send never actually spent.
 
 ## 17. Concurrency-correct rate accounting
 
@@ -1114,7 +1154,7 @@ The rate check and both mutations are one critical section. Concurrent goroutine
 | `/v1/models` | No | No |
 | Local pre-routing rejection | No | No |
 
-Every committed dispatch reservation is counted because the proxy cannot prove that a request failing at the send boundary was unseen by upstream. All body rewriting, URL construction, and header filtering occur before reservation so that reservation-to-`Do` contains no ordinary fallible preparation.
+Every committed dispatch reservation is counted because the proxy cannot prove that a request failing at the send boundary was unseen by upstream. All body rewriting, URL construction, and header filtering occur before reservation, so the only fallible step left between reservation and `Do` is the admission commit, whose failure cancels the reservation outright rather than being retried or ignored.
 
 ### 17.3 Wait and wake
 
@@ -1213,6 +1253,13 @@ Rules:
 - Retain the RPM timestamp until it naturally expires.
 - Notify waiters on release.
 - Never hold coordinator state across network or database I/O.
+
+A lease is provisional between reservation and the commit of its admission row:
+
+- A pending reservation counts against RPM and in-flight for the whole time its admission transaction runs, so a concurrent caller can never be admitted into a slot that is about to be taken.
+- On commit success the lease becomes dispatchable, and `Do` follows immediately.
+- On commit failure the lease is canceled, which is the one path that removes an RPM timestamp: no dispatch happened, and no evidence of one exists.
+- A crash between commit and dispatch leaves an admission with no dispatch. That is the deliberate direction of the error, because the opposite one is a real dispatch with no record.
 
 ## 19. Saturated pinned-session policy
 
@@ -1452,6 +1499,7 @@ Messages are stable and sanitized.
 | Invalid routing envelope | 400 | `invalid_request_error` / `invalid_request` |
 | Unknown alias | 404 | `invalid_request_error` / `model_not_found` |
 | Temporary account-capacity timeout | 429 | `rate_limit_error` / `account_capacity_timeout` |
+| Dispatch-admission store unavailable | 503 | `server_error` / `admission_store_unavailable` |
 | Explicit account disabled | 503 | `server_error` / `account_unavailable` |
 | Every flexible account disabled | 503 | `server_error` / `account_unavailable` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
@@ -1615,8 +1663,8 @@ Visible result: stable base and pinned aliases.
 ### 23.16 Restart during active conversations
 
 - Completed session pins from the preceding hour are restored.
-- Recent completed dispatch starts seed rate windows.
-- Active unfinished attempts may have no row after a hard crash.
+- Recent dispatch admissions seed rate windows.
+- Active unfinished attempts may have no terminal row after a hard crash; their admission rows survive and still count.
 - No health probes run.
 - Disabled state resets so corrected credentials can be tested by real traffic.
 
@@ -1694,13 +1742,17 @@ No startup failure triggers an upstream request.
 | Failure | Behavior |
 | --- | --- |
 | SQLite busy under five seconds | Wait within busy timeout |
-| SQLite remains busy | Sanitized stderr error; preserve client result |
-| Disk full | Sanitized stderr error; continue serving |
+| SQLite remains busy for a terminal write | Sanitized stderr error; preserve client result |
+| SQLite remains busy for an admission write | Cancel the reservation; local 503; no dispatch |
+| Disk full during a terminal write | Sanitized stderr error; continue serving |
+| Disk full during an admission write | Local 503 for every new dispatch; already-admitted attempts finish |
 | Runtime corruption error | Sanitized high-severity log; continue only where connection remains usable |
 | Store becomes unusable | Repeated append failures remain visible; no in-memory unbounded queue |
-| Crash before terminal phase transaction | Active attempt and pending skip rows may be absent |
+| Crash before terminal phase transaction | Active attempt result and pending skip rows may be absent; its admission row is not |
 | Crash after commit | Committed row remains durable |
 | One row in a phase batch violates a constraint | Roll back the entire phase transaction; emit one sanitized error |
+
+A store that cannot accept an admission stops the proxy from originating upstream traffic while letting admitted traffic finish. This is the one place where evidence outranks availability, and it is a deliberate reversal of the rule above it: a dispatch the ledger never saw is a dispatch no restart can account for, and the rolling ceiling silently stops being the thing this document says it is.
 
 There is no fallback JSONL file, alternate database, or memory log.
 
@@ -1758,6 +1810,8 @@ The implementation must document and test these invariants:
 24. A post-commit upstream read failure cannot return normally through the HTTP handler.
 25. Pending skip facts are bounded by the fixed account/reason vocabulary and cannot form an unbounded per-request queue.
 26. No admission path grants an account an exception to disabled health state.
+27. No `http.Client.Do` occurs without a committed admission row, and no admission row is committed without a held reservation.
+28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
 
 ## 26. Security and privacy
 
@@ -1886,6 +1940,8 @@ All time-dependent tests must use either the complete injected clock/timer bound
 
 The scripted fake upstream must record the account by the bearer key it actually receives, dispatch start time, live concurrency, request bytes, and cancellation. Limiter invariants must be asserted at this external observation point as well as against coordinator state.
 
+Crash behavior is tested with real subprocesses killed at each boundary that the two commit points create: after coordinator reservation, after the admission commit, after `http.Client.Do` returns, after downstream commitment, and after the terminal insert. A restarted process reading that store must never admit more than the ceiling allows for the window the crash fell in.
+
 ### 28.1 Catalog tests
 
 Verify:
@@ -1991,6 +2047,9 @@ Verify:
 - RPM expiry requires no background goroutine.
 - Cooldown expiry is lazy and correct.
 - Double lease release is harmless or detected without underflow.
+- A failed admission commit rolls back the provisional RPM timestamp and in-flight slot.
+- No dispatch occurs when admission persistence fails.
+- A committed admission with no terminal row is recovered as a spent slot.
 
 ### 28.6 Concurrency stress tests
 
@@ -2191,7 +2250,8 @@ Verify:
 - No prompt/completion columns.
 - No cost/currency columns.
 - Startup session recovery.
-- Startup rate recovery.
+- Startup rate recovery, driven by admission rows and not by terminal attempts.
+- Admission rows survive a subprocess killed immediately after their commit.
 - Busy timeout behavior.
 - Disk/permission failures where platform support permits.
 - Store close ordering.
@@ -2324,13 +2384,15 @@ Consequences:
 - The body may temporarily exist twice during rewriting.
 - References to the buffered body should be dropped once no retry is possible.
 
-### 29.5 Synchronous terminal inserts
+### 29.5 Synchronous admission and terminal inserts
 
 Synchronous writes make completion visibility deterministic and avoid an unbounded queue or background writer. Grouping a phase’s skips and terminal record in one transaction avoids one commit per recheck while retaining append-only rows. The accepted costs are that retry progression can wait for an earlier attempt’s transaction and that final streaming bytes may reach the client before final persistence.
 
-### 29.6 Terminal-only attempt rows
+The admission write is synchronous for a different reason: it is not analytics, it is the input to a correctness decision the next process makes. Its costs are stated plainly because they are real. Every dispatch now pays one durable commit before the send, all such commits serialize through the single database connection, and a store that cannot accept them makes the proxy refuse to originate traffic rather than serve it unrecorded. Against an upstream call measured in seconds, one commit is not the expensive part of a dispatch, and the alternative is a ceiling that quietly means something weaker than what §2 promises.
 
-A single immutable terminal row satisfies append-only logging without updates. The cost is loss of active-attempt evidence on hard process crash.
+### 29.6 Admission rows plus terminal attempt rows
+
+Two immutable rows per dispatch satisfy append-only logging without updates and separate what must be true before the send from what can only be known after it. The remaining cost is that a hard crash still loses result metadata for an attempt in flight. What it can no longer lose is the evidence that the attempt was authorized, which is the half a restarted process needs in order to stay under the rolling ceiling. An admission with no terminal row is not a gap in the log; it is the durable statement that an attempt started and this process never learned how it ended.
 
 ### 29.7 Exact rolling window
 
@@ -2448,7 +2510,8 @@ No built-in query, README recipe, or report computes currency cost.
 - For a live backup, use SQLite’s own consistent backup mechanism rather than copying only the main file while WAL is active.
 - For a cold backup, stop the service cleanly, verify shutdown completed, then copy the database.
 - Preserve schema version with every archive.
-- Never delete or truncate the active attempt table as part of normal service startup.
+- Never delete or truncate the durable tables as part of normal service startup.
+- Treat an admission-store failure or disk exhaustion as dispatch-blocking rather than as optional telemetry loss, because that is what the process does with it.
 - Test restore by opening a copied database with a compatible binary and running read-only integrity/recovery queries.
 - A backup or archive operation must not make any upstream request.
 
@@ -2553,14 +2616,15 @@ Gate:
 - Catalog and configuration unit tests pass.
 - No network or database behavior yet.
 
-### Phase 2: SQLite attempt store
+### Phase 2: SQLite durable store
 
 Deliver:
 
 - Pinned cgo-free driver.
 - Embedded initial migration.
-- Append-only triggers.
+- Append-only `dispatch_admission` and `attempt_log` tables with their triggers.
 - Secure file pre-creation and permission checks.
+- Synchronous fail-closed admission insert API.
 - Transactional phase-batch insert API.
 - Dispatch, selection-skip, and selection-failure records.
 - Recovery queries.
@@ -2569,6 +2633,7 @@ Deliver:
 Gate:
 
 - Empty/upgrade/concurrency/atomic-batch/append-only tests pass.
+- An admission insert that fails is reported to its caller as a failure and never as a partial success.
 - Static cgo-free test build succeeds.
 
 ### Phase 3: Request scanner and rewriter
@@ -2730,6 +2795,8 @@ The project is complete only when all of the following are true:
 - No account exceeds 60 dispatch starts in a rolling minute.
 - No account exceeds twelve in-flight attempts.
 - Those ceilings are proven from the fake upstream’s observations, not only coordinator counters.
+- Every actual dispatch has a durable admission row committed before it.
+- Recovery counts admission rows even when the matching terminal metadata is absent.
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.

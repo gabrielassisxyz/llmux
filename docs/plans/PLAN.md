@@ -424,6 +424,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Aggregate request/replay/precommit memory budget | 512 MiB |
 | Unknown-length body charge step | 1 MiB |
 | Concurrent admitted chat requests | 128 |
+| Live accepted client connections | 256 |
 | Global request-admission wait | 1 second |
 | Session affinity TTL | 1 hour |
 | Live session pins | 4096 |
@@ -578,8 +579,11 @@ Owns the two process-wide admission bounds that no per-request limit can provide
 - A counting semaphore over concurrent admitted chat handlers.
 - A weighted budget over request-owned memory, charged in bytes and released on every exit path.
 - One bounded acquisition wait, after which the caller receives local 429 rather than queueing.
+- A listener wrapper bounding live accepted client connections.
 
 Both are acquired before the body is read and released by the same defer that releases the handler slot. The precommit allowance is a later charge against the same budget, taken only by a response that is actually going to buffer and released by that same defer. The gate holds no coordinator state, makes no I/O, and knows nothing about accounts: it bounds what the process has allocated, while the coordinator bounds what upstream is asked to do. Neither substitutes for the other, because a request buffers its body long before it competes for an account and may never reach one at all.
+
+The handler semaphore bounds handlers and not the goroutines waiting to become one. `net/http` creates a goroutine per accepted connection and reads the request on it before any handler runs, so a caller that opens connections faster than they complete grows that population whatever the semaphore admits, and the per-connection read buffers grow with it. The only place that can be bounded is where connections are accepted, which is why the listener is wrapped: past the ceiling an accept waits for a live connection to close. Three local consumers will never approach it, and a consumer defect that leaks connections is what it is for. Without it the controls in §26.6 bound everything except the one goroutine per connection that precedes all of them.
 
 #### Upstream transport
 
@@ -627,7 +631,7 @@ Properties:
 10. Append a `process_start` row.
 11. Construct the route coordinator.
 12. Construct the upstream transport and HTTP handlers.
-13. Bind the configured socket.
+13. Bind the configured socket through the connection-limiting listener.
 14. Announce readiness only after the socket is bound.
 15. Serve until termination or fatal server failure.
 
@@ -2061,6 +2065,7 @@ The implementation must document and test these invariants:
 30. An unconfirmed provisional pin with no remaining holders cannot stay live.
 31. The rolling window is measured over `http.Client.Do` invocation instants, and a pending reservation occupies a slot from the moment it is granted until it is finalized or canceled.
 32. Startup recovery dates a recovered admission no earlier than the latest instant its dispatch could have occurred.
+33. Live accepted client connections never exceed the configured ceiling, so no server goroutine exists for a connection beyond it.
 
 ## 26. Security and privacy
 
@@ -2136,6 +2141,7 @@ They must not contain:
 - 64 MiB request-body limit.
 - 8 MiB non-streaming precommit buffer, after which relay becomes progressive.
 - Global ceiling on concurrent admitted chat handlers.
+- Ceiling on live accepted client connections, which bounds the per-connection server goroutines that precede handler admission.
 - Weighted aggregate budget over request, replay, and precommit memory.
 - One body buffer per request, replayed from immutable segments, exact when the length was declared and grown inside its charge otherwise.
 - 64 KiB header limit.
@@ -2658,6 +2664,7 @@ Benchmarks and load checks must establish:
 - Charged request, replay, and precommit memory never exceeds the aggregate budget.
 - Streaming requests, requests waiting for an account, and requests backing off between attempts hold no precommit reservation.
 - Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
+- A client that opens far more connections than it completes waits at accept instead of creating server goroutines, and both the connection and handler ceilings hold throughout.
 - An unsized upload’s gate charge stays ahead of its buffered bytes at every step and settles to the actual size at read completion.
 - Concurrent small unsized uploads cannot exhaust the aggregate budget, and a denied extension releases the whole charge and answers 429.
 - A slow upload terminates at the request-read deadline instead of holding its buffer.

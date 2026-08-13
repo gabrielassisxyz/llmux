@@ -416,6 +416,7 @@ Key changes require restart. There is no reload endpoint, signal-based reload, w
 | Non-streaming precommit response buffer | 8 MiB |
 | Maximum JSON nesting depth | 256 |
 | Aggregate request/replay/precommit memory budget | 512 MiB |
+| Unknown-length body charge step | 1 MiB |
 | Concurrent admitted chat requests | 128 |
 | Global request-admission wait | 1 second |
 | Session affinity TTL | 1 hour |
@@ -650,7 +651,7 @@ No periodic health, cleanup, checkpoint, vacuum, or model-discovery worker is ad
 3. Generate a proxy logical-request ID.
 4. Create a context ending no later than ten minutes after admission.
 5. Acquire a global handler slot within one second, or return local 429 `proxy_overloaded`.
-6. Charge the aggregate memory gate for the body before reading it: the rounded allowance implied by a valid `Content-Length`, or the full 64 MiB allowance when the body is chunked and its size is unknown. Charging after the read would bound nothing.
+6. Charge the aggregate memory gate for the body before reading it. A valid `Content-Length` charges its rounded allowance once. A body whose size is unknown charges the fixed initial step and extends its charge one step at a time, always staying ahead of the bytes actually buffered; a denied extension releases everything the request holds and returns local 429 `proxy_overloaded`. When the read completes the charge settles to the bytes actually held, because the replay buffer then lives for the rest of the request. Charging after the read would bound nothing, and charging the 64 MiB worst case for the lifetime of every chunked request would let eight small uploads exhaust the entire budget between them while the process was holding a few hundred kilobytes.
 7. Read the body into one bounded allocation.
 8. Scan the top-level routing fields and build the immutable segmented replay plan.
 9. Charge the gate for the 8 MiB precommit allowance, and release it as soon as response classification proves it unnecessary.
@@ -1967,7 +1968,7 @@ The implementation must document and test these invariants:
 26. No admission path grants an account an exception to disabled health state.
 27. No `http.Client.Do` occurs without a committed admission row, and no admission row is committed without a held reservation.
 28. Client cancellation and logical-deadline expiry cannot cancel admission or terminal persistence before its own bounded store timeout.
-29. Aggregate request-owned memory never exceeds the configured budget, and every charge is released exactly once.
+29. Aggregate request-owned memory never exceeds the configured budget. A request holds one charge, which may only grow while its body is read and is settled once when the read completes, and every charge is released exactly once.
 30. An unconfirmed provisional pin with no remaining holders cannot stay live.
 
 ## 26. Security and privacy
@@ -2549,6 +2550,8 @@ Benchmarks and load checks must establish:
 - Concurrent admitted handlers never exceed the global ceiling.
 - Charged request, replay, and precommit memory never exceeds the aggregate budget.
 - Thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata.
+- An unsized upload's gate charge stays ahead of its buffered bytes at every step and settles to the actual size at read completion.
+- Concurrent small unsized uploads cannot exhaust the aggregate budget, and a denied extension releases the whole charge and answers 429.
 - A slow upload terminates at the request-read deadline instead of holding its buffer.
 
 Benchmarks use `b.Loop`, run with `-benchmem`, and are compared across repeated runs with `benchstat` rather than by reading one number. No performance optimization is accepted if it weakens message preservation, rate correctness, or append-only evidence.

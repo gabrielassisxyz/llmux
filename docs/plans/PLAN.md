@@ -1432,10 +1432,13 @@ Actions:
 - Mark the account disabled immediately.
 - Remove session pins that point to it.
 - Wake waiting requests.
-- Do not retry the current logical request.
-- Relay the upstream 401 unchanged as the final response.
+- For a flexible route, retry the current logical request on another eligible account, within the global dispatch budget and with no backoff. The failure is deterministic for the account rather than for the request, and routing around a broken account is the one job this proxy exists to do. Disablement bounds the chain by itself: each 401 removes an account for the process lifetime, so it can never exceed the three accounts that exist.
+- For an explicit `-kN` route, or when no eligible account remains, return local 502 `upstream_auth_failure`.
+- Never relay the upstream 401, its body, or its `WWW-Authenticate` header to the client.
 - Exclude the account from subsequent base-alias requests.
 - Explicit aliases targeting it return local 503 on later requests.
+
+Relaying that 401 downstream is the obvious alternative and it is wrong twice. An upstream 401 judges the credential the proxy presented, not the one the client presented, so it is the same kind of response as the redirect of §13.2: an instruction addressed to a party that is not the client, which the client cannot act on. It also collides with the proxy's own contract, where 401 means the proxy key was rejected, so an OpenAI-shaped SDK reports an invalid API key to a caller whose key is valid and abandons the conversation. And it throws the router away at the moment the router is most useful: with one credential revoked and two healthy, roughly a third of new unpinned sessions would fail on a fault the proxy had fully understood and could have hidden.
 
 The account remains disabled for the process lifetime. Correcting the key requires restart, which is also how a renewed subscription on an unchanged key is put back into rotation. Nothing inside the process re-tests a disabled account, on a timer or on a request.
 
@@ -1513,7 +1516,7 @@ Reason:
 | Dial or TLS-handshake timeout | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Precommit response-body read failure | Yes | Up to 2 retries | First retry same account; second retry another | No global disable |
 | Upstream 504 | Yes | Up to 2 retries | Different eligible account first | No global disable |
-| Upstream 401 | No | 0 | None | Disable immediately |
+| Upstream 401 | Flexible routes only | One per remaining eligible account | Different eligible account only | Disable immediately |
 | Upstream 403 | No | 0 | None | No change |
 | Other upstream 4xx | No | 0 | None | No change |
 | Upstream 3xx or 101 | No | 0 | None | Local invalid-upstream response |
@@ -1544,6 +1547,10 @@ Timeout/server retry:
 - First retry: approximately 250 milliseconds with equal jitter.
 - Second retry: approximately 1 second with equal jitter.
 - Delay is capped by the remaining deadline.
+
+Credential failover:
+
+- No delay at all. The account that answered 401 is already disabled, so the next dispatch necessarily targets a different one, and nothing about a rejected credential improves while the request waits.
 
 All waiting:
 
@@ -1632,12 +1639,13 @@ Messages are stable and sanitized.
 | Dispatch-admission store unavailable | 503 | `server_error` / `admission_store_unavailable` |
 | Explicit account disabled | 503 | `server_error` / `account_unavailable` |
 | Every flexible account disabled | 503 | `server_error` / `account_unavailable` |
+| Upstream credential rejected with no eligible account left | 502 | `server_error` / `upstream_auth_failure` |
 | Exhausted transport failure | 502 | `server_error` / `upstream_unavailable` |
 | Unexpected upstream redirect or upgrade | 502 | `server_error` / `invalid_upstream_response` |
 | Overall timeout before commit | 504 | `server_error` / `upstream_timeout` |
 | Recovered panic before commit | 500 | `server_error` / `internal_error` |
 
-An upstream final response is never converted into one of these local errors. A 3xx or 101 is the one carve-out and is not an exception to the rule, because such a response is not a final result: it is an instruction to make a different request, addressed to a client that cannot act on it safely.
+An upstream final response is never converted into one of these local errors. A 3xx, a 101 and a 401 are the carve-outs, and none of them is an exception to the rule, because none of them is a final result: each is an instruction to make a different request, addressed to a party that cannot act on it safely. For a 3xx or a 101 that party is the client. For a 401 it is the proxy itself, which is why a 401 surfaces as account disablement plus failover rather than as a relayed status, and why the local code names the credential failure instead of hiding it behind a generic upstream error.
 
 Every authenticated chat response, local or upstream-derived, includes `X-LLMux-Request-ID`.
 
@@ -1752,8 +1760,8 @@ Visible result: stable base and pinned aliases.
 1. Upstream returns 401.
 2. Account is disabled immediately.
 3. Pins to that account are removed.
-4. Current request is not retried.
-5. Upstream response is relayed unchanged.
+4. A flexible request retries immediately on another eligible account, and when one of them succeeds the client sees no sign that a credential failed.
+5. When no eligible account remains, or the route is an explicit alias, the client receives local 502 `upstream_auth_failure` rather than the upstream 401.
 6. Later base routes avoid the account.
 7. Later explicit routes to it return local 503.
 
@@ -1870,7 +1878,7 @@ No startup failure triggers an upstream request.
 | Upstream 504 | Retry on another account |
 | 429 | Retry and update rate-limit health |
 | 5xx | Retry |
-| 401 | Disable account, no retry |
+| 401 | Disable account; flexible routes fail over to another eligible account; local 502 when none remains |
 | 403 | Relay unchanged, no retry, account untouched |
 | Other 4xx | No retry |
 | 3xx or 101 | No redirect or upgrade; local 502 before commitment |
@@ -2264,7 +2272,8 @@ Verify:
 - First upstream 401 disables immediately.
 - 403 is relayed, is not retried, and leaves account health alone.
 - Pins to disabled account are removed.
-- Current auth failure is not retried.
+- A flexible request that hits 401 completes on another eligible account, and neither the upstream 401 nor its `WWW-Authenticate` header reaches the client.
+- An explicit-alias 401, and a 401 with no eligible account left, return local 502 without relaying the upstream response.
 - Subsequent base requests skip disabled account.
 - Explicit route fails locally.
 - No code path re-enables a disabled account within one process lifetime.
@@ -2295,7 +2304,7 @@ Cover:
 - Precommit response read failure retries.
 - Mixed 429 and 5xx respecting the global cap.
 - 400 with no retry.
-- 401 with no retry, and 403 with no retry and no disable.
+- 401 disables its account and fails over to another eligible one without backoff, and 403 has no retry and no disable.
 - TLS permanent error with no retry.
 - Client cancellation during backoff.
 - Deadline during backoff.
@@ -3022,7 +3031,7 @@ The project is complete only when all of the following are true:
 - Aliases and pinned variants cannot multiply an account’s capacity.
 - Retry behavior matches the classification table.
 - No retry occurs after downstream commitment.
-- Upstream 401 disables an account on its first failure and nothing but restart re-enables it.
+- Upstream 401 disables an account on its first failure, nothing but restart re-enables it, and the upstream 401 itself never reaches a client.
 - Upstream 403 alone never disables an account.
 - A `Retry-After` blocks only the account that sent it.
 - Repeated 429 responses cause bounded cooldown.

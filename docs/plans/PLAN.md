@@ -1395,7 +1395,7 @@ For an account candidate:
 
 1. Read the monotonic clock.
 2. Remove dispatch timestamps at or before `now - 60 seconds`.
-3. Expire a gate deadline that has passed, leaving `cooling_down` for `enabled` when the circuit opened it.
+3. Expire a gate deadline that has passed, returning an account the cooldown circuit had marked `cooling_down` to `enabled`.
 4. Reject a disabled account, or one whose gate deadline has not passed.
 5. Reject if in-flight is already 12.
 6. Reject if the remaining dispatch timestamps plus the account’s pending reservations already total 60.

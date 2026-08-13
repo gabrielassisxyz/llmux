@@ -1278,7 +1278,7 @@ The schema enforces:
 - `usage_observation` present only on dispatch records, restricted to its fixed vocabulary.
 - `selection_wait_us` required for dispatch and selection-failure rows.
 - `retry_after_s` allowed only for capacity failures.
-- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column already says it was not.
+- `upstream_retry_after_s` non-negative, and allowed only on dispatch rows whose upstream status is 429 or 5xx, which are the two statuses this proxy reads the header on. Whether the header was present is not separately constrained, because a null column says only that upstream stated no delay this proxy could use: the header was absent, or unparseable, or an HTTP-date the response gave no usable `Date` to derive against, which §20.2 stores as nothing, and no column records which of the three it was.
 - Non-negative durations.
 - Non-negative token counts.
 - Spill source required when `is_spill` is true.

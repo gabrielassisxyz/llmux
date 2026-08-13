@@ -396,13 +396,15 @@ The alternative is not free: a provisional string that survives into the catalog
 | `LLMUX_ACCOUNT_K2_KEY` | Yes | None | Account `k2` upstream key |
 | `LLMUX_ACCOUNT_K3_KEY` | Yes | None | Account `k3` upstream key |
 | `LLMUX_AFFINITY_HMAC_KEY` | Yes | None | Independent key for durable session digests |
-| `LLMUX_LOG_PATH` | Yes | None | Absolute SQLite path |
+| `LLMUX_DB_PATH` | Yes | None | Absolute SQLite path |
 | `LLMUX_LISTEN_ADDR` | No | `127.0.0.1:4000` | HTTP listen address |
 | `LLMUX_LOG_LEVEL` | No | `info` | Process log threshold |
 
 The three account keys must be non-empty and distinct. Duplicate credentials would create separate limiter buckets for one real account and are therefore a fatal configuration error.
 
 The proxy and affinity keys must be non-empty and distinct from each other and from every account key. The affinity key is separate from the proxy key rather than derived from it, so that rotating the client credential does not silently invalidate every stored digest and lose an hour of affinity for every live conversation. It has no default and cannot be generated per boot: either would make recovered pins unmatchable and quietly disable the restart recovery §16.3 promises.
+
+The store's path variable names a database and not a log, because the distinction it sits on is the one this document works hardest to keep: process logs are ephemeral, go to stderr and may be rotated freely, while the durable store is append-only evidence that §15.10 forbids truncating and no retention tooling should ever be pointed at. A variable called a log path invites exactly that. `LLMUX_LOG_LEVEL` keeps its name because it genuinely is about process logs.
 
 Key changes require restart. There is no reload endpoint, signal-based reload, watcher, or mutable configuration file.
 
@@ -462,7 +464,7 @@ The binary reads configuration from the environment, but the operating documenta
 - For a service manager, use an owner-readable environment file outside the repository, mode `0600`, referenced by the user service.
 - The example environment file committed to the repository contains names and placeholders only.
 - The reference service definition disables core dumps and sets an owner-only umask, since a core file of this process contains four credentials and whatever prompt text was in flight.
-- The log directory should be owned by the user and should not grant write access to other users.
+- The database directory should be owned by the user and should not grant write access to other users.
 - The service definition should set `GOMEMLIMIT` above the aggregate memory budget with room to spare, since the budget covers only request-owned buffers.
 - Startup messages may name a missing variable but must never print its value.
 - Diagnostic commands in the runbook must not dump the process environment.
@@ -493,7 +495,7 @@ Lower-level components do not import the application or command package.
 | `internal/proxy` | Auth, handlers, retry loop, headers, relay commitment, usage observation |
 | `internal/route` | Account limiter, health, session affinity, account selection, leases |
 | `internal/resource` | Global handler slots and the weighted aggregate-memory gate |
-| `internal/logstore` | SQLite configuration, migrations, inserts, startup recovery queries |
+| `internal/store` | SQLite configuration, migrations, inserts, startup recovery queries |
 | `internal/idgen` | Proxy-owned random identifiers |
 | `internal/testsupport` | Test-only clock/timer control, scripted upstream, deterministic shuffler, raw HTTP client helpers |
 | `deploy` | Reference user-service definition and placeholder-only environment template |
@@ -528,7 +530,7 @@ Owns:
 - HTTP server.
 - Shared upstream transport/client.
 - Route coordinator.
-- SQLite log store.
+- SQLite durable store.
 - Structured logger.
 - Shutdown state.
 
@@ -953,7 +955,7 @@ The accepted costs are a larger binary and one pinned third-party dependency.
 
 ### 15.2 SQLite configuration
 
-- Open exactly `LLMUX_LOG_PATH`.
+- Open exactly `LLMUX_DB_PATH`.
 - Require an absolute path.
 - Require the parent directory to exist, to be owned by the service user, and to deny write access to group and others. Checking the file is not enough on its own: `Lstat` followed by open is a race, and a directory nobody else can write to is what makes the symlink and mode checks below mean something rather than merely narrow a window.
 - Do not silently fall back to another path or memory.
@@ -1859,10 +1861,10 @@ Visible result: stable base and pinned aliases.
 | Invalid listen address | Fatal startup |
 | Non-loopback listen address | Fatal startup |
 | Invalid catalog | Fatal startup |
-| Relative log path | Fatal startup |
-| Missing log directory | Fatal startup |
-| Log directory writable by group or others | Fatal startup |
-| Insecure existing log permissions | Fatal startup |
+| Relative database path | Fatal startup |
+| Missing database directory | Fatal startup |
+| Database directory writable by group or others | Fatal startup |
+| Insecure existing database permissions | Fatal startup |
 | SQLite open failure | Fatal startup |
 | Unsupported future schema | Fatal startup |
 | Migration failure | Transaction rollback and fatal startup |

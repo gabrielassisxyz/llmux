@@ -2657,6 +2657,7 @@ Verify:
 - Process start and stop rows, and the absent stop row after a killed subprocess.
 - Startup reads no rate state from `dispatch_admission`, so a store seeded with recent admissions changes nothing about when the first dispatch may leave.
 - Admission rows survive a subprocess killed immediately after their commit.
+- Every named query recipe of §30.3 parses and runs against a seeded store and returns the shape its name promises, so a schema change that invalidates one fails here rather than in front of an operator.
 - Busy timeout behavior.
 - Disk/permission failures where platform support permits.
 - Store close ordering.
@@ -2899,6 +2900,7 @@ Implementation is not complete without:
 - A `llmux version` subcommand printing release version, revision, the highest schema version the binary supports, and the Go toolchain, without opening configuration or a database.
 - A `llmux db check` subcommand that opens a named database read-only and reports its schema version, `quick_check`, `foreign_key_check`, WAL state, file size, and the free space on its filesystem.
 - A `llmux db backup` subcommand that writes an owner-only consistent backup, refuses to overwrite an existing file, and needs no account credential.
+- A directory of named SQL query recipes covering the questions of §30.3, each executed in CI against a seeded store, which is what keeps a recipe and the schema it reads from drifting apart.
 - Release artifacts built with `-trimpath`, published with checksums.
 
 These are documentation and launch aids, not a UI or additional runtime service. The list still stops where a document would start describing the process rather than the system: a written checklist restating build identity would be a second copy free to be wrong, which is exactly why `llmux version` reads `debug.ReadBuildInfo` at runtime instead of printing strings someone stamped in by hand. It derives the answer rather than repeating it, and during a cutover or a rollback "which binary is this" is a question worth being able to ask the binary.
@@ -2924,7 +2926,11 @@ The binary must never create a missing parent directory implicitly; a path typo 
 
 ### 30.3 Routine log inspection
 
-The README must provide SQLite query recipes, described and tested against the actual schema, for the questions below. The logical-request ones carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
+The query recipes for the questions below are checked-in SQL files, each one executed in CI against a seeded store, and the README describes each by name and points at its file rather than carrying a copy of its text. A recipe that lives only in prose is schema knowledge that nothing fails for when the schema moves, which is the failure §1 spends a paragraph on; a recipe that is executed is tested the way the migrations it reads are, and a migration that invalidates one breaks the build rather than an operator.
+
+Embedding them in the binary as a report subcommand was the alternative and is not taken. It would fix the same drift, but half of these questions are parameterized by an account or a time range, so the subcommand would either hard-code the answers, which makes it useless, or grow a query surface, which is the log-query API §3 rules out wearing a command-line hat. The two `db` subcommands that do exist are there because §30.4 needs a correct backup and a schema check that no other tool on the machine can produce; running a fixed SELECT is not in that class.
+
+The logical-request recipes carry their weight: they are the questions a summary table would have answered, and having them written and tested once is what makes that table unnecessary rather than merely absent.
 
 - Dispatch count by account and time range.
 - Current/recent RPM pressure by account.
@@ -2946,7 +2952,7 @@ The README must provide SQLite query recipes, described and tested against the a
 - Requests whose headers were removed by the allowlist, which is how a consumer that started sending something new becomes visible.
 - Per-consumer traffic, attributed from the presence of a `session_key`, the requested alias, and the streaming flag, because the store holds no consumer identifier. `eod` is the one sessionless caller, which is what makes its rows findable without appealing to the hour it usually runs at. This is a heuristic, and §15.5 records what would replace it and when.
 
-No built-in query, README recipe, or report computes currency cost.
+No query recipe, subcommand, or report computes currency cost.
 
 ### 30.4 Database backup and archival
 
@@ -3231,7 +3237,7 @@ Gate:
 Deliver:
 
 - Installation and environment documentation.
-- SQLite query, backup, restore, and archive runbooks.
+- The named SQLite query recipes and their CI execution, plus the backup, restore, and archive runbooks.
 - Disabled-account recovery procedure.
 - Cutover and rollback procedures.
 - Real-binary socket/signal/flush smoke test.

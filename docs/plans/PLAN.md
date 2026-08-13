@@ -2809,9 +2809,13 @@ That is a change in the callers, and it stays there. The proxy holds no model of
 Before cutover:
 
 - Confirm each caller retries a local 429 and honours `Retry-After`.
-- Confirm that a caller which wants durable token and first-event evidence advertises only response encodings the observer can decode, once Phase 0 has recorded which encodings upstream actually selects. A caller that asks for one the observer cannot decode receives its bytes exactly as ever and writes `NULL` observation columns forever, which is its choice to make and is recorded here rather than worked around inside the proxy.
 - The once-a-day `eod` summariser is the one to change first. It runs with no session file and no operator watching, so a lost result there is invisible until someone notices a missing day. It needs retry in its own codebase before cutover.
 - A caller that cannot be changed is recorded as accepting the loss, rather than answered by relaxing the ceiling here.
+
+The token and latency evidence has preconditions of the same shape, and they exist for the same reason: the proxy will not alter a request or a response to improve its own observability, so what the callers send decides what the log can hold. Each of these is a caller that quietly writes null columns forever, and the absence is first noticed a month later in §30.3's token recipes rather than at cutover.
+
+- Confirm that each streaming caller which wants durable token evidence sends `stream_options.include_usage` itself. The proxy never injects it, by invariant 18, so a streaming consumer that omits it reports no usage object and every token column stays `NULL`. This one matters most for `pi`, the primary streaming consumer.
+- Confirm that a caller which wants durable token and first-event evidence advertises only response encodings the observer can decode, once Phase 0 has recorded which encodings upstream actually selects. A caller that asks for one the observer cannot decode receives its bytes exactly as ever and writes `NULL` observation columns, which is its choice to make and is recorded here rather than worked around inside the proxy.
 
 ### 30.8 Cutover
 

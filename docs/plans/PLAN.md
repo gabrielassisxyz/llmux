@@ -245,7 +245,7 @@ The fixed session header is `X-Session-ID`.
 - Affinity is keyed only by `session_key`, not by alias or model.
 - A value over 256 bytes returns local 400.
 
-Affinity needs stable equality, not the caller’s string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess.
+Affinity needs stable equality, not the caller’s string. The header is client-chosen text of arbitrary content and length, and storing it verbatim puts unbounded unreviewed input into a durable log that outlives every conversation in it. A keyed digest keeps every routing decision identical, bounds the column, and leaves nothing in the store to read or to guess. The claim is about what the proxy retains, not about what the process can touch: the inbound `http.Request` necessarily holds the raw header until the handler returns, and what the rule forbids is making a second copy of it, carrying it past validation, or writing it anywhere at all.
 
 ### 6.7 Request content encoding and content type
 

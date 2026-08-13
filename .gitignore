@@ -27,3 +27,10 @@
 *.db
 *.db-wal
 *.db-shm
+
+# Issue-tracker state. The backlog is maintainer material: it records what is being
+# considered, abandoned and reordered, which is a different document from a statement
+# of direction. ROADMAP.md is the part written for whoever arrives. No trailing slash,
+# for the same reason the block above gives.
+/.beads
+/.bv

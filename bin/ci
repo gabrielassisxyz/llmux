@@ -41,7 +41,7 @@ if [ -z "${GOTMPDIR:-}" ] && [ -d /mnt/build ]; then
 fi
 
 # Every Go gate below needs at least one package to look at, and `go vet ./...` exits
-# non-zero on "matched no packages" — so on a checkout that has the harness but not yet
+# non-zero on "matched no packages", so on a checkout that has the harness but not yet
 # the sources, running them would report a failure that describes nothing. This branch
 # disappears by itself the moment the first .go file is tracked; until then the skip is
 # counted in the closing summary rather than passing quietly.
@@ -104,6 +104,25 @@ if command -v gitleaks >/dev/null 2>&1; then
 else
     skip "gitleaks not installed: mise use -g go:github.com/zricethezav/gitleaks/v8"
 fi
+
+# Prose gates. Both scan the whole tree rather than a diff, which is the stronger
+# posture and is only available because this repo starts clean: nothing gets
+# grandfathered in, so the gate can stay at zero tolerance instead of being a number
+# that only ever grows and that people learn to scroll past.
+#
+# Soft wrap, one paragraph per line. Hard-wrapped prose is a per-file accident that
+# spreads by contact, since every editor and every agent inherits the wrap of whatever
+# it is editing. --check deliberately does not apply the script's own fork heuristic:
+# that heuristic compares commit authors against `git config user.email`, a CI runner
+# configures no identity, and the check would therefore read every repo as third-party
+# and skip itself while reporting success.
+section "markdown soft-wrap"
+python3 scripts/md-unwrap.py --check . && ok || bad
+
+# The em-dash worn as a prose habit, and the name of the cleanup tool in committed
+# text. Last on purpose: when it trips, everything above has already reported.
+section "slop-guard (prose tells)"
+bin/slop-guard && ok || bad
 
 if [ ${#skipped[@]} -gt 0 ]; then
     printf '\n\033[33mbin/ci: %d check(s) did NOT run:\033[0m\n' "${#skipped[@]}"

@@ -20,3 +20,8 @@ local
 # tree only" starts.
 .ai-jail
 .env
+
+# Issue-tracker state. A worktree without it sees an empty backlog and cheerfully
+# starts work that is already claimed.
+.beads
+.bv

@@ -4,9 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` is load-bearing. The default types cover pushes, not text edits, so
+    # without it the PR-text job only reruns on the next push and reads that event's
+    # payload: a title fixed since then still fails, and a body edited afterwards to
+    # add a tell passes.
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   ci:
+    # The expensive job opts out of pure text edits, so correcting a typo in a PR
+    # description does not trigger a full build.
+    if: github.event.action != 'edited'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,7 +26,21 @@ jobs:
       # exists only in the workflow is a check nobody can run before pushing.
       - run: bin/ci
 
+  # The tree is covered by bin/ci and the commit message by the commit-msg hook, but a
+  # PR's title and body never touch the git tree, so nothing else can see them.
+  slop-guard-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: PR text has no slop
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n%s\n' "$TITLE" "$BODY" | bin/slop-guard --stdin "PR text"
+
   gitleaks:
+    if: github.event.action != 'edited'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

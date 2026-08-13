@@ -46,6 +46,7 @@ Sections 23, 24, 29, and 32 restate behavior that is defined elsewhere and intro
 - Active health checking, scheduled probes, model discovery, or warm-up traffic.
 - Horizontal scaling or coordination among multiple proxy processes.
 - Automatic account-key reload or runtime route changes.
+- Automatic retention, rotation, compaction, or deletion of durable records. The cold archive procedure of §30.4 exists and is operator-invoked, offline, and deletes nothing.
 
 ## 4. Non-negotiable invariants
 
@@ -505,7 +506,7 @@ Lower-level components do not import the application or command package.
 
 | Path | Responsibility |
 | --- | --- |
-| `cmd/llmux` | Minimal entry point, `version` subcommand, configuration load, construction, run, exit status |
+| `cmd/llmux` | Minimal entry point, the `version` and read-only `db` subcommands, configuration load, construction, run, exit status |
 | `internal/app` | Composition root, server lifecycle, startup recovery, signal handling |
 | `internal/catalog` | Fixed routes, generated pinned variants, model-list projection |
 | `internal/rewrite` | Top-level JSON scanner, rewrite plan, immutable replay segments |
@@ -917,7 +918,7 @@ This definition excludes:
 
 It does not retain the event’s content.
 
-The anchor is the `Do` invocation rather than the dispatch reservation, because §12 places the admission commit between the two. Measured from the reservation, every first event would carry the store’s commit latency inside a number named for upstream behavior, and the weekly ceiling re-derivation of §30.10 would be tuned partly against this machine’s filesystem. `attempt_duration_us` shares that anchor for the same reason. `started_at_us` keeps recording the reservation instant, because that is the moment the rolling window is defined over.
+The anchor is the `Do` invocation rather than the dispatch reservation, because §12 places the admission commit between the two. Measured from the reservation, every first event would carry the store’s commit latency inside a number named for upstream behavior, and the weekly ceiling re-derivation of §30.10 would be tuned partly against this machine’s filesystem. `attempt_duration_us` shares that anchor for the same reason. `started_at_us` keeps recording the reservation instant, which is where the phase’s own accounting begins and what the admission row is timed against. The window itself is measured at the `Do` boundary, by invariant 24, and no column holds that instant because the admission row is written before it exists.
 
 It is deliberately not called time to first token. In OpenAI-shaped streams the first event routinely carries a role declaration or other protocol metadata and no generated text at all, so the number is a latency-to-first-byte-of-stream measurement wearing a token’s name. Naming it accurately costs nothing now and prevents a permanently mislabeled column, which a schema this document forbids updating cannot fix later without a migration.
 
@@ -1261,7 +1262,7 @@ Create indexes for:
 - `attempt_log(started_at_us)`.
 - `attempt_log(account_label, started_at_us)`.
 - `(logical_request_id, sequence_no)`.
-- A partial successful-completion index on `(session_key, finished_at_us DESC)`, which is the session recovery query.
+- A partial successful-completion index on `(session_key, finished_at_us DESC)`, which is the session recovery query. It restricts the query to successful completions inside the hour; the arrival order that query then ranks by is computed from the retrieved rows, because it is derived from two columns rather than stored in one.
 - `(requested_alias, started_at_us)`.
 - `(outcome, started_at_us)`.
 - `(error_class, started_at_us)`.

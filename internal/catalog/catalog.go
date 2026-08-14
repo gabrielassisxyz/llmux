@@ -18,6 +18,7 @@ type Injection struct {
 // Route describes one client-visible base alias.
 type Route struct {
 	Alias            string
+	BaseAlias        string
 	UpstreamModel    string
 	EligibleAccounts []Account
 	Injection        *Injection
@@ -38,6 +39,7 @@ func BaseRoutes() []Route {
 	routes := make([]Route, len(baseRoutes))
 	copy(routes, baseRoutes[:])
 	for index := range routes {
+		routes[index].BaseAlias = routes[index].Alias
 		routes[index].EligibleAccounts = append([]Account(nil), routes[index].EligibleAccounts...)
 		if routes[index].Injection != nil {
 			injection := *routes[index].Injection

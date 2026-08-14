@@ -724,6 +724,8 @@ Do not create:
 
 The single-branch model removes delayed merge reconciliation. It does not remove coordination obligations.
 
+This section overrides the worktree instruction in the stamped `universal-principles` block below: create no worktree, and do every edit in this one shared tree. The block's physical isolation is replaced here by three coupled protections, Agent Mail file reservations, the pre-commit reservation guard, and DCG, and all three assume a single tree; following the block's worktree instead removes an agent's edits from the surface those protections watch, and mixing the two models gives neither the isolation of separate trees nor the coordination the reservation system provides.
+
 ### Before editing
 
 1. Confirm the branch is `main`.

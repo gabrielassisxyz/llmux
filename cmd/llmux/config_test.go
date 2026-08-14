@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -205,6 +206,28 @@ func TestLoadConfig_Credentials(t *testing.T) {
 		}
 		if cfg.ProxyKeyDigest == [32]byte{} {
 			t.Error("expected proxy key digest to be populated")
+		}
+	})
+
+	t.Run("ProxyKeyDigestStableAcrossRestarts", func(t *testing.T) {
+		setupValid()
+		want := sha256.Sum256([]byte("12345678901234567890123456789012"))
+
+		first, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("first LoadConfig() error = %v", err)
+		}
+
+		second, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("second LoadConfig() error = %v", err)
+		}
+
+		if first.ProxyKeyDigest != second.ProxyKeyDigest {
+			t.Error("same proxy key produced different digests across fresh configuration loads")
+		}
+		if first.ProxyKeyDigest != want || second.ProxyKeyDigest != want {
+			t.Error("fresh configuration loads did not derive the proxy key digest")
 		}
 	})
 

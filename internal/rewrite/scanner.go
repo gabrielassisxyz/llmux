@@ -92,7 +92,11 @@ func Scan(body []byte) (Metadata, error) {
 		if err != nil {
 			return Metadata{}, err
 		}
-		key, err := decodeString(body[keyStart:i])
+		isModel, err := matchesRoutingName(body[keyStart:i], "model")
+		if err != nil {
+			return Metadata{}, ErrMalformedJSON
+		}
+		isStream, err := matchesRoutingName(body[keyStart:i], "stream")
 		if err != nil {
 			return Metadata{}, ErrMalformedJSON
 		}
@@ -113,8 +117,8 @@ func Scan(body []byte) (Metadata, error) {
 			return Metadata{}, err
 		}
 
-		switch key {
-		case "model":
+		switch {
+		case isModel:
 			if haveModel {
 				return Metadata{}, ErrMalformedJSON
 			}
@@ -131,7 +135,7 @@ func Scan(body []byte) (Metadata, error) {
 			haveModel = true
 			meta.Model = value
 			meta.ModelSpan = Span{Start: valueStart, End: i}
-		case "stream":
+		case isStream:
 			if meta.HasStream {
 				return Metadata{}, ErrMalformedJSON
 			}
@@ -150,6 +154,73 @@ func Scan(body []byte) (Metadata, error) {
 		return Metadata{}, ErrMalformedJSON
 	}
 	return meta, nil
+}
+
+// matchesRoutingName compares a JSON member name to an ASCII routing name
+// while decoding escapes into the comparison itself. It allocates no decoded
+// string for opaque member names.
+func matchesRoutingName(raw []byte, want string) (bool, error) {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return false, ErrMalformedJSON
+	}
+	matched := 0
+	for i := 1; i < len(raw)-1; {
+		var value byte
+		if raw[i] != '\\' {
+			value = raw[i]
+			i++
+		} else {
+			i++
+			if i >= len(raw)-1 {
+				return false, ErrMalformedJSON
+			}
+			switch raw[i] {
+			case '"', '\\', '/':
+				value = raw[i]
+				i++
+			case 'b', 'f', 'n', 'r', 't':
+				return false, nil
+			case 'u':
+				if i+4 >= len(raw)-1 {
+					return false, ErrMalformedJSON
+				}
+				hex, ok := asciiEscape(raw[i+1 : i+5])
+				if !ok {
+					return false, ErrMalformedJSON
+				}
+				if hex > 0x7f {
+					return false, nil
+				}
+				value = byte(hex)
+				i += 5
+			default:
+				return false, ErrMalformedJSON
+			}
+		}
+		if matched >= len(want) || value != want[matched] {
+			return false, nil
+		}
+		matched++
+	}
+	return matched == len(want), nil
+}
+
+func asciiEscape(raw []byte) (uint16, bool) {
+	var value uint16
+	for _, digit := range raw {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 // decodeString decodes a single, already-bounded JSON string span into a Go

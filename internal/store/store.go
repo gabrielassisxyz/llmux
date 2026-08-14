@@ -51,6 +51,10 @@ func Open(path string) (*Store, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	if err := store.Migrate(ctx); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return store, nil
 }
 

@@ -20,10 +20,22 @@ CREATE TABLE attempt_log (
     attempt_duration_us INTEGER CHECK (attempt_duration_us IS NULL OR attempt_duration_us >= 0),
     logical_elapsed_us INTEGER NOT NULL CHECK (logical_elapsed_us >= 0),
     time_to_first_event_us INTEGER CHECK (time_to_first_event_us IS NULL OR time_to_first_event_us >= 0),
-    outcome TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'succeeded', 'upstream_http_error', 'transport_error', 'deadline_exceeded',
+        'client_canceled', 'response_read_error', 'response_write_error', 'selection_skipped',
+        'capacity_timeout', 'no_account_available', 'internal_error'
+    )),
     upstream_status_code INTEGER,
-    error_class TEXT,
-    retry_disposition TEXT NOT NULL,
+    error_class TEXT CHECK (error_class IS NULL OR error_class IN (
+        'rate_limited', 'upstream_authentication', 'upstream_client_error', 'upstream_server_error',
+        'invalid_upstream_response', 'transport_timeout', 'transport_transient', 'transport_permanent',
+        'client_disconnect', 'response_truncated', 'local_deadline', 'account_disabled',
+        'account_cooldown', 'local_capacity'
+    )),
+    retry_disposition TEXT NOT NULL CHECK (retry_disposition IN (
+        'final', 'retry_same_account', 'retry_other_account', 'retry_named_account',
+        'suppressed_class_budget', 'suppressed_global_budget', 'suppressed_deadline', 'not_applicable'
+    )),
     retry_delay_ms INTEGER,
     retry_after_s INTEGER,
     upstream_retry_after_s INTEGER,
@@ -32,10 +44,15 @@ CREATE TABLE attempt_log (
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
     total_tokens INTEGER,
-    usage_observation TEXT,
+    usage_observation TEXT CHECK (usage_observation IS NULL OR usage_observation IN (
+        'not_applicable', 'absent', 'complete', 'malformed', 'truncated',
+        'unsupported_encoding', 'limit_exceeded'
+    )),
     limiter_rpm_used INTEGER CHECK (limiter_rpm_used IS NULL OR limiter_rpm_used >= 0),
     limiter_in_flight INTEGER CHECK (limiter_in_flight IS NULL OR limiter_in_flight >= 0),
-    skip_reason TEXT,
+    skip_reason TEXT CHECK (skip_reason IS NULL OR skip_reason IN (
+        'rpm_limit', 'in_flight_limit', 'rate_gated', 'disabled', 'start_blackout'
+    )),
     skip_observation_count INTEGER CHECK (skip_observation_count IS NULL OR skip_observation_count >= 1),
     dropped_header_count INTEGER CHECK (dropped_header_count IS NULL OR dropped_header_count >= 0),
     UNIQUE(logical_request_id, sequence_no),
@@ -59,6 +76,10 @@ CREATE TABLE attempt_log (
     CHECK (
         (record_kind = 'dispatch' AND limiter_rpm_used IS NULL AND limiter_in_flight IS NULL) OR
         (record_kind != 'dispatch')
+    ),
+    CHECK (
+        (record_kind = 'selection_skip' AND retry_disposition = 'not_applicable') OR
+        (record_kind != 'selection_skip' AND retry_disposition != 'not_applicable')
     ),
     CHECK (
         (record_kind = 'selection_skip' AND dropped_header_count IS NULL) OR

@@ -82,6 +82,16 @@ else
     section "go vet"
     go vet ./... && ok || bad
 
+    section "clock boundary"
+    forbidden_time_calls="$(rg -n --glob '*.go' --glob '!**/*_test.go' --glob '!internal/clock/**' --glob '!internal/testsupport/**' 'time\.(Now|Since|After|NewTimer)\(' . || true)"
+    if [ -n "$forbidden_time_calls" ]; then
+        printf '%s\n' "$forbidden_time_calls" | sed 's/^/    /'
+        printf '    direct wall-clock calls belong in internal/clock or internal/testsupport\n'
+        bad
+    else
+        ok
+    fi
+
     section "package dependencies"
     if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./internal/... 2>/dev/null | grep -E ' (github.com/gabrielassisxyz/llmux/internal/app|github.com/gabrielassisxyz/llmux/cmd)' >/dev/null; then
         printf '    lower-level package imports internal/app or cmd/llmux\n'

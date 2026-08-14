@@ -93,7 +93,9 @@ func FuzzScan(f *testing.F) {
 
 // FuzzApplyInjection proves ApplyInjection never panics on valid JSON input,
 // produces valid JSON output, injects the expected value, and leaves every
-// other top-level member byte-for-byte identical.
+// other top-level member byte-for-byte identical. The proxy's entire purpose
+// is to avoid altering request bodies, so this target asserts the strongest
+// preservation property: only the injected route-owned field changes.
 func FuzzApplyInjection(f *testing.F) {
 	seeds := []string{
 		`{"route_owned":"old","model":"m","messages":[]}`,
@@ -140,10 +142,13 @@ func FuzzApplyInjection(f *testing.F) {
 			t.Fatalf("injected field mismatch: got %s=%s, want %s", field, gotField, encoded)
 		}
 
-		// Untouched routed members must be preserved byte-for-byte.
-		mustPreserve(t, []byte(body), got, "model")
-		if _, ok := result["messages"]; ok {
-			mustPreserve(t, []byte(body), got, "messages")
+		// Every top-level member other than the injected field must be
+		// preserved byte-for-byte. This is the proxy's core invariant.
+		for key := range result {
+			if key == field {
+				continue
+			}
+			mustPreserve(t, []byte(body), got, key)
 		}
 	})
 }

@@ -108,6 +108,16 @@ else
         ok
     fi
 
+    # The lexical scanner and segmented rewriter touch request bytes. Fuzzing
+    # catches the adversarial inputs no unit test author thinks of, and a
+    # smoke run in the gate turns every fuzz finding into a regression failure.
+    section "fuzz smoke run"
+    # Use -run='^$' so only fuzz targets execute, not the full unit-test suite,
+    # which go test already ran above. A short fuzztime keeps the gate fast
+    # while still exercising the mutation engine against the seed corpus.
+    go test -fuzz=FuzzScan -fuzztime=5s -run='^$' ./internal/rewrite >/dev/null && ok || bad
+    go test -fuzz=FuzzApplyInjection -fuzztime=5s -run='^$' ./internal/rewrite >/dev/null && ok || bad
+
     section "golangci-lint"
     if command -v golangci-lint >/dev/null 2>&1; then
         golangci-lint run ./... && ok || bad

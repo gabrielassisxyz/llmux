@@ -26,12 +26,21 @@ const requestResourcesKey contextKey = "request_resources"
 type Gate struct {
 	handlerSemaphore chan struct{}
 	memoryRemaining  atomic.Int64
+	clk              clock.Clock
 }
 
-// NewGate initializes the resource gate with policy constants.
+// NewGate initializes the resource gate with policy constants and the
+// production clock.
 func NewGate() *Gate {
+	return NewGateWithClock(clock.NewRealClock())
+}
+
+// NewGateWithClock initializes the resource gate with an injected clock so
+// its admission timeout can be driven deterministically in tests.
+func NewGateWithClock(clk clock.Clock) *Gate {
 	g := &Gate{
 		handlerSemaphore: make(chan struct{}, policy.ConcurrentAdmittedChatRequests),
+		clk:              clk,
 	}
 	g.memoryRemaining.Store(int64(policy.AggregateMemoryBudgetBytes))
 	return g
@@ -40,13 +49,15 @@ func NewGate() *Gate {
 // AcquireHandlerSlot waits up to policy.GlobalRequestAdmissionWait for a
 // handler slot. It returns ErrOverloaded if the wait times out.
 func (g *Gate) AcquireHandlerSlot(ctx context.Context) error {
-	waitCtx, cancel := context.WithTimeout(ctx, policy.GlobalRequestAdmissionWait)
-	defer cancel()
+	timer := g.clk.NewTimer(policy.GlobalRequestAdmissionWait)
+	defer timer.Stop()
 
 	select {
 	case g.handlerSemaphore <- struct{}{}:
 		return nil
-	case <-waitCtx.Done():
+	case <-ctx.Done():
+		return ErrOverloaded
+	case <-timer.C():
 		return ErrOverloaded
 	}
 }

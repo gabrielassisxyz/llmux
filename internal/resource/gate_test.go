@@ -12,6 +12,7 @@ import (
 	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/proxy"
+	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
 type mockAdmissionStore struct {
@@ -26,7 +27,8 @@ func (m *mockAdmissionStore) RecordUnroutedRequest(ctx context.Context, reqID st
 }
 
 func TestGate_HandlerCeiling(t *testing.T) {
-	g := NewGate()
+	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
+	g := NewGateWithClock(fake)
 
 	// Acquire all available handler slots
 	for i := 0; i < policy.ConcurrentAdmittedChatRequests; i++ {
@@ -36,21 +38,34 @@ func TestGate_HandlerCeiling(t *testing.T) {
 		}
 	}
 
-	// The next one should fail with ErrOverloaded after 1 second.
-	start := time.Now()
-	err := g.AcquireHandlerSlot(context.Background())
-	dur := time.Since(start)
+	// The next one should block until the fake clock crosses the admission
+	// wait, then fail with ErrOverloaded. Proven with AdvanceMonotonic
+	// rather than a real 1-second sleep.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- g.AcquireHandlerSlot(context.Background())
+	}()
 
-	if err != ErrOverloaded {
-		t.Errorf("expected ErrOverloaded, got %v", err)
+	select {
+	case err := <-errCh:
+		t.Fatalf("AcquireHandlerSlot returned %v before the admission wait elapsed", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	if dur < policy.GlobalRequestAdmissionWait || dur > policy.GlobalRequestAdmissionWait+300*time.Millisecond {
-		t.Errorf("expected wait around %v, got %v", policy.GlobalRequestAdmissionWait, dur)
+
+	fake.AdvanceMonotonic(policy.GlobalRequestAdmissionWait)
+
+	select {
+	case err := <-errCh:
+		if err != ErrOverloaded {
+			t.Errorf("expected ErrOverloaded, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AcquireHandlerSlot did not return once the admission wait elapsed")
 	}
 
 	// Release one, we should be able to acquire again
 	g.ReleaseHandlerSlot()
-	err = g.AcquireHandlerSlot(context.Background())
+	err := g.AcquireHandlerSlot(context.Background())
 	if err != nil {
 		t.Errorf("expected to acquire after release, got %v", err)
 	}
@@ -181,7 +196,8 @@ func TestGate_Middleware(t *testing.T) {
 func TestGate_ConcurrentWaiters(t *testing.T) {
 	// "thousands of small requests waiting on the gate create neither unbounded goroutines nor unbounded waiter metadata."
 	// We will simulate 2000 concurrent requests when slots are full.
-	g := NewGate()
+	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
+	g := NewGateWithClock(fake)
 	for i := 0; i < policy.ConcurrentAdmittedChatRequests; i++ {
 		_ = g.AcquireHandlerSlot(context.Background())
 	}
@@ -203,8 +219,11 @@ func TestGate_ConcurrentWaiters(t *testing.T) {
 		}()
 	}
 
-	// Give them time to time out
-	time.Sleep(policy.GlobalRequestAdmissionWait + 500*time.Millisecond)
+	// Give the waiters time to register their timers on the fake clock
+	// before advancing, since NewTimer must be called before the advance
+	// can find it due.
+	time.Sleep(200 * time.Millisecond)
+	fake.AdvanceMonotonic(policy.GlobalRequestAdmissionWait)
 	wg.Wait()
 
 	if int(rejections.Load()) != waiters {

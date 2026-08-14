@@ -401,6 +401,10 @@ func FuzzScan(f *testing.F) {
 		`{"model":"a"` + strings.Repeat(",", 1000),
 		strings.Repeat("[", 10000),
 		`{"model":"a","x":1e999999999}`,
+		// Nesting exactly below, at, and above the accepted depth boundary.
+		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth-2) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth-2) + `}`,
+		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth-1) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth-1) + `}`,
+		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth) + `}`,
 	}
 	for _, s := range seeds {
 		f.Add(s)

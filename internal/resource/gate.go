@@ -125,6 +125,18 @@ func (r *RequestResources) Release() {
 	}
 }
 
+// releaseMemory returns size bytes charged earlier via AcquireMemory back to
+// the gate, leaving the rest of the request's charge intact. Used to settle
+// a charge down to less than what was acquired for it, rather than release
+// the request's entire charge at once.
+func (r *RequestResources) releaseMemory(size int) {
+	if size < 0 || size > r.memoryCharge {
+		panic("resource: invalid partial memory release")
+	}
+	r.gate.ReleaseMemory(size)
+	r.memoryCharge -= size
+}
+
 // AdmissionStore is the interface for recording requests that are rejected before routing.
 type AdmissionStore interface {
 	RecordUnroutedRequest(ctx context.Context, reqID string, code proxy.ErrorCode)

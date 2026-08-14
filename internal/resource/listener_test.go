@@ -2,6 +2,7 @@ package resource
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -58,6 +59,32 @@ func TestLimitedConnectionReleasesSlotOnce(t *testing.T) {
 	if err := connection.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
+}
+
+func TestLimitedConnectionConcurrentCloseDoesNotPanic(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	underlying := &singleConnectionListener{connections: make(chan net.Conn, 1)}
+	underlying.connections <- server
+	listener := NewConnectionLimitedListener(underlying, 1)
+
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			if err := connection.Close(); err != nil {
+				t.Errorf("concurrent Close() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 type singleConnectionListener struct {

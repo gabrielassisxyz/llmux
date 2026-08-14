@@ -1,6 +1,9 @@
 package resource
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
 // ConnectionLimitedListener prevents more than limit accepted connections from being live.
 type ConnectionLimitedListener struct {
@@ -23,7 +26,7 @@ func (listener *ConnectionLimitedListener) Accept() (net.Conn, error) {
 		<-listener.slots
 		return nil, err
 	}
-	return &limitedConn{Conn: connection, release: listener.release, closed: make(chan struct{})}, nil
+	return &limitedConn{Conn: connection, release: listener.release}, nil
 }
 
 func (listener *ConnectionLimitedListener) release() {
@@ -33,17 +36,14 @@ func (listener *ConnectionLimitedListener) release() {
 type limitedConn struct {
 	net.Conn
 	release func()
-	closed  chan struct{}
+	once    sync.Once
+	err     error
 }
 
 func (connection *limitedConn) Close() error {
-	select {
-	case <-connection.closed:
-		return nil
-	default:
-		close(connection.closed)
-		err := connection.Conn.Close()
+	connection.once.Do(func() {
+		connection.err = connection.Conn.Close()
 		connection.release()
-		return err
-	}
+	})
+	return connection.err
 }

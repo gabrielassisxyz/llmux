@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 func init() {
@@ -19,6 +21,20 @@ func Validate(base []Route, all []Route) error {
 		return fmt.Errorf("expected exactly 28 public aliases, got %d", len(all))
 	}
 
+	for _, route := range all {
+		if route.Alias == "" {
+			return fmt.Errorf("empty alias")
+		}
+		if strings.ContainsRune(route.Alias, '/') {
+			return fmt.Errorf("alias %q contains invalid character '/': aliases may not contain slashes", route.Alias)
+		}
+		for _, r := range route.Alias {
+			if unicode.IsSpace(r) {
+				return fmt.Errorf("alias %q contains whitespace", route.Alias)
+			}
+		}
+	}
+
 	seen := make(map[string]bool)
 	for _, route := range all {
 		if seen[route.Alias] {
@@ -28,6 +44,10 @@ func Validate(base []Route, all []Route) error {
 
 		if route.UpstreamModel == "" {
 			return fmt.Errorf("empty upstream model for alias: %s", route.Alias)
+		}
+
+		if strings.ContainsRune(route.UpstreamModel, ' ') {
+			return fmt.Errorf("upstream model %q contains a space", route.UpstreamModel)
 		}
 
 		if route.Injection != nil && route.Injection.Field == "messages" {

@@ -46,6 +46,46 @@ func TestValidate_Failures(t *testing.T) {
 			expectedError: "expected exactly 28 public aliases",
 		},
 		{
+			name: "empty alias",
+			setup: func() ([]Route, []Route) {
+				return setup(func(base []Route, all []Route) ([]Route, []Route) {
+					all[0].Alias = ""
+					return base, all
+				})
+			},
+			expectedError: "empty alias",
+		},
+		{
+			name: "alias contains a slash",
+			setup: func() ([]Route, []Route) {
+				return setup(func(base []Route, all []Route) ([]Route, []Route) {
+					all[0].Alias = "bad/alias"
+					return base, all
+				})
+			},
+			expectedError: "contains invalid character '/': aliases may not contain slashes",
+		},
+		{
+			name: "alias contains a space",
+			setup: func() ([]Route, []Route) {
+				return setup(func(base []Route, all []Route) ([]Route, []Route) {
+					all[0].Alias = "bad alias"
+					return base, all
+				})
+			},
+			expectedError: "contains whitespace",
+		},
+		{
+			name: "upstream model contains a space",
+			setup: func() ([]Route, []Route) {
+				return setup(func(base []Route, all []Route) ([]Route, []Route) {
+					all[0].UpstreamModel = "bad model"
+					return base, all
+				})
+			},
+			expectedError: "contains a space",
+		},
+		{
 			name: "duplicate public aliases",
 			setup: func() ([]Route, []Route) {
 				return setup(func(base []Route, all []Route) ([]Route, []Route) {

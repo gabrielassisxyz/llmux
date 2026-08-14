@@ -96,8 +96,19 @@ func (c *Coordinator) ExpireGateIfDue(account catalog.Account) {
 	defer c.mu.Unlock()
 
 	state := &c.accounts[accountIndex(account)]
-	if state.rateGateDeadline == 0 || c.clk.MonotonicNow() < state.rateGateDeadline {
+	if !c.expireGateIfDueLocked(state) {
 		return
+	}
+	c.notifyLocked()
+}
+
+// expireGateIfDueLocked expires a gate deadline that has passed and reports
+// whether any state changed. The caller must hold c.mu. Reserve uses this
+// under the same lock as the rest of the admission algorithm so eligibility
+// is evaluated against a single consistent snapshot.
+func (c *Coordinator) expireGateIfDueLocked(state *accountState) bool {
+	if state.rateGateDeadline == 0 || c.clk.MonotonicNow() < state.rateGateDeadline {
+		return false
 	}
 
 	wasCoolingDown := state.health == HealthCoolingDown
@@ -106,5 +117,5 @@ func (c *Coordinator) ExpireGateIfDue(account catalog.Account) {
 		state.health = HealthEnabled
 		state.recent429s = nil
 	}
-	c.notifyLocked()
+	return true
 }

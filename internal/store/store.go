@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"sync"
 
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	_ "modernc.org/sqlite"
@@ -15,6 +16,12 @@ import (
 type Store struct {
 	Writer      *sql.DB
 	Maintenance *sql.DB
+
+	checkpointMu        sync.Mutex
+	checkpointRunner    checkpointRunner
+	walSize             walSizeReader
+	terminalCommitCount uint64
+	lastCheckpointWAL   int64
 }
 
 // Open opens the configured SQLite database with the required per-connection pragmas.
@@ -35,7 +42,7 @@ func Open(path string) (*Store, error) {
 		_ = writer.Close()
 		return nil, err
 	}
-	store := &Store{Writer: writer, Maintenance: maintenance}
+	store := &Store{Writer: writer, Maintenance: maintenance, checkpointRunner: sqliteCheckpointRunner{database: maintenance}, walSize: fileWALSize{path: path}}
 	if err := verifySidecarPermissions(path); err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("verify sidecar permissions: %w", err)

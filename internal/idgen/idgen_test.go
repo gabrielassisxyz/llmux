@@ -3,6 +3,7 @@ package idgen
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -31,6 +32,39 @@ func TestGeneratorRejectsEntropyFailure(t *testing.T) {
 	}
 	if identifier != "" {
 		t.Errorf("AttemptID() identifier = %q, want empty", identifier)
+	}
+}
+
+func TestGeneratorProducesNoCollisionsUnderConcurrentGeneration(t *testing.T) {
+	generator := SecureGenerator()
+	const count = 2000
+
+	ids := make(chan string, count)
+	var wg sync.WaitGroup
+	wg.Add(count)
+	for i := 0; i < count; i++ {
+		go func() {
+			defer wg.Done()
+			id, err := generator.AttemptID()
+			if err != nil {
+				t.Errorf("AttemptID() error = %v", err)
+				return
+			}
+			ids <- id
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[string]bool, count)
+	for id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate identifier generated: %q", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("got %d unique identifiers, want %d", len(seen), count)
 	}
 }
 

@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +94,67 @@ func TestFileSecurity_SidecarPermissions(t *testing.T) {
 	err := verifySidecarPermissions(dbPath)
 	if err == nil {
 		t.Errorf("expected verifySidecarPermissions to fail due to insecure sidecar permissions")
+	}
+}
+
+func TestFileSecurity_RejectsMissingParentDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "missing", "test.db")
+
+	err := ensureSecureDatabaseFile(dbPath)
+	if err == nil {
+		t.Fatal("expected rejection for missing parent directory, got nil")
+	}
+	if !strings.Contains(err.Error(), "stat parent directory") {
+		t.Errorf("expected error to mention stat parent directory, got: %v", err)
+	}
+}
+
+func TestFileSecurity_RejectsParentDirNotOwnedByServiceUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("ownership test requires root to create a directory owned by another user")
+	}
+
+	tempDir := t.TempDir()
+	badDir := filepath.Join(tempDir, "bad-owner")
+	if err := os.Mkdir(badDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(badDir, 1, -1); err != nil {
+		t.Skipf("could not chown directory to uid 1: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chown(badDir, os.Geteuid(), -1); err != nil {
+			t.Logf("failed to restore directory ownership: %v", err)
+		}
+	})
+
+	dbPath := filepath.Join(badDir, "test.db")
+	err := ensureSecureDatabaseFile(dbPath)
+	if err == nil || err.Error() != "parent directory not owned by service user" {
+		t.Errorf("expected parent directory ownership rejection, got: %v", err)
+	}
+}
+
+func TestFileSecurity_RejectsParentDirGroupOrOtherWritable(t *testing.T) {
+	tempDir := t.TempDir()
+	badDir := filepath.Join(tempDir, "bad-perms")
+	if err := os.Mkdir(badDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(badDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(badDir, 0700); err != nil {
+			t.Logf("failed to restore directory permissions: %v", err)
+		}
+	})
+
+	dbPath := filepath.Join(badDir, "test.db")
+	err := ensureSecureDatabaseFile(dbPath)
+	if err == nil || err.Error() != "parent directory allows group or other write access" {
+		t.Errorf("expected parent directory group/other writable rejection, got: %v", err)
 	}
 }
 

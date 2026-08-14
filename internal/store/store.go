@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"strconv"
 
+	"github.com/gabrielassisxyz/llmux/internal/policy"
 	_ "modernc.org/sqlite"
 )
 
@@ -17,15 +19,18 @@ type Store struct {
 
 // Open opens the configured SQLite database with the required per-connection pragmas.
 func Open(path string) (*Store, error) {
+	ctx, cancel := OperationContext(context.Background())
+	defer cancel()
+
 	if err := ensureSecureDatabaseFile(path); err != nil {
 		return nil, fmt.Errorf("secure database file: %w", err)
 	}
 
-	writer, err := openPool(path)
+	writer, err := openPool(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	maintenance, err := openPool(path)
+	maintenance, err := openPool(ctx, path)
 	if err != nil {
 		_ = writer.Close()
 		return nil, err
@@ -35,7 +40,7 @@ func Open(path string) (*Store, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("verify sidecar permissions: %w", err)
 	}
-	if err := store.verify(context.Background()); err != nil {
+	if err := store.verify(ctx); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -55,14 +60,14 @@ func (store *Store) Close() error {
 	return nil
 }
 
-func openPool(path string) (*sql.DB, error) {
+func openPool(ctx context.Context, path string) (*sql.DB, error) {
 	database, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
 	database.SetMaxOpenConns(1)
 	database.SetMaxIdleConns(1)
-	if err := database.Ping(); err != nil {
+	if err := database.PingContext(ctx); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("connect to sqlite database: %w", err)
 	}
@@ -71,6 +76,7 @@ func openPool(path string) (*sql.DB, error) {
 
 func sqliteDSN(path string) string {
 	query := url.Values{}
+	query.Add("_pragma", "busy_timeout("+strconv.FormatInt(policy.SQLiteBusyTimeout.Milliseconds(), 10)+")")
 	query.Add("_pragma", "foreign_keys(ON)")
 	query.Add("_pragma", "trusted_schema(OFF)")
 	query.Add("_pragma", "journal_mode(WAL)")
@@ -121,6 +127,7 @@ func verifyPragmas(ctx context.Context, database *sql.DB) error {
 		value string
 	}{
 		{name: "foreign_keys", value: "1"},
+		{name: "busy_timeout", value: strconv.FormatInt(policy.SQLiteBusyTimeout.Milliseconds(), 10)},
 		{name: "trusted_schema", value: "0"},
 		{name: "journal_mode", value: "wal"},
 		{name: "synchronous", value: "2"},

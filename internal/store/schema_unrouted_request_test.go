@@ -149,6 +149,131 @@ func TestUnroutedRequestStoreFailureLeavesPriorRowUnchanged(t *testing.T) {
 	}
 }
 
+func TestUnroutedRequestSchemaRejectsImpossibleRows(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "llmux.db"))
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+
+	insert := func(recordID, requestID string, started, finished int64, status int, code string) error {
+		_, err := s.Writer.ExecContext(ctx, `
+			INSERT INTO unrouted_request (
+				record_id, logical_request_id, started_at_us, finished_at_us,
+				session_key, downstream_status, local_error_code
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, recordID, requestID, started, finished, "session", status, code)
+		return err
+	}
+
+	if err := insert("rec-valid", "req-valid", 1000, 2000, 400, "invalid_request"); err != nil {
+		t.Fatalf("expected valid insert, got error: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		exec func() error
+	}{
+		{
+			name: "duplicate record_id",
+			exec: func() error {
+				return insert("rec-valid", "req-dup-record", 1000, 2000, 400, "invalid_request")
+			},
+		},
+		{
+			name: "duplicate logical_request_id",
+			exec: func() error {
+				return insert("rec-dup-request", "req-valid", 1000, 2000, 400, "invalid_request")
+			},
+		},
+		{
+			name: "null logical_request_id",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-null-request', NULL, 1000, 2000, 'session', 400, 'invalid_request')
+				`)
+				return err
+			},
+		},
+		{
+			name: "null started_at_us",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-null-started', 'req-null-started', NULL, 2000, 'session', 400, 'invalid_request')
+				`)
+				return err
+			},
+		},
+		{
+			name: "null finished_at_us",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-null-finished', 'req-null-finished', 1000, NULL, 'session', 400, 'invalid_request')
+				`)
+				return err
+			},
+		},
+		{
+			name: "null downstream_status",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-null-status', 'req-null-status', 1000, 2000, 'session', NULL, 'invalid_request')
+				`)
+				return err
+			},
+		},
+		{
+			name: "null local_error_code",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-null-code', 'req-null-code', 1000, 2000, 'session', 400, NULL)
+				`)
+				return err
+			},
+		},
+		{
+			name: "unknown local_error_code",
+			exec: func() error {
+				return insert("rec-bad-code", "req-bad-code", 1000, 2000, 400, "made_up_error")
+			},
+		},
+		{
+			name: "wrong type for started_at_us",
+			exec: func() error {
+				_, err := s.Writer.ExecContext(ctx, `
+					INSERT INTO unrouted_request (
+						record_id, logical_request_id, started_at_us, finished_at_us,
+						session_key, downstream_status, local_error_code
+					) VALUES ('rec-wrong-type', 'req-wrong-type', 'not-a-number', 2000, 'session', 400, 'invalid_request')
+				`)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.exec(); err == nil {
+				t.Fatal("expected constraint failure, got nil")
+			}
+		})
+	}
+}
+
 func TestUnroutedRequestSchemaConstraints(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "llmux.db"))
 	if err != nil {

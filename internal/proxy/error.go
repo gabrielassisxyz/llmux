@@ -81,6 +81,17 @@ var errorsByCode = map[ErrorCode]LocalError{
 	ErrInternalError:              {ErrInternalError, TypeServerError, 500, "Recovered panic before commit"},
 }
 
+// ErrorStatus returns the HTTP status for a known local error code, or 500
+// if the code is not part of the fixed vocabulary. It lets durable row
+// writers derive downstream_status from the same source of truth that answers
+// the client.
+func ErrorStatus(code ErrorCode) int {
+	if def, ok := errorsByCode[code]; ok {
+		return def.Status
+	}
+	return http.StatusInternalServerError
+}
+
 // WriteError writes the OpenAI-shaped error envelope to the response.
 func WriteError(w http.ResponseWriter, reqID string, code ErrorCode) {
 	errDef, ok := errorsByCode[code]

@@ -33,11 +33,11 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("secure database file: %w", err)
 	}
 
-	writer, err := openPool(ctx, path)
+	writer, err := openPool(ctx, path, false)
 	if err != nil {
 		return nil, err
 	}
-	maintenance, err := openPool(ctx, path)
+	maintenance, err := openPool(ctx, path, true)
 	if err != nil {
 		_ = writer.Close()
 		return nil, err
@@ -71,8 +71,8 @@ func (store *Store) Close() error {
 	return nil
 }
 
-func openPool(ctx context.Context, path string) (*sql.DB, error) {
-	database, err := sql.Open("sqlite", sqliteDSN(path))
+func openPool(ctx context.Context, path string, readOnly bool) (*sql.DB, error) {
+	database, err := sql.Open("sqlite", sqliteDSN(path, readOnly))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -85,7 +85,14 @@ func openPool(ctx context.Context, path string) (*sql.DB, error) {
 	return database, nil
 }
 
-func sqliteDSN(path string) string {
+// sqliteDSN builds the connection string every physical connection in the
+// pool is dialed with. readOnly adds query_only, the pragma that makes the
+// maintenance connection's writes-nothing separation an enforced property
+// of the connection rather than a fact about which callers happen to use
+// it: it refuses INSERT, UPDATE, DELETE and DDL while leaving PRAGMA
+// wal_checkpoint, the one operation the maintenance connection runs,
+// unaffected.
+func sqliteDSN(path string, readOnly bool) string {
 	query := url.Values{}
 	query.Add("_pragma", "busy_timeout("+strconv.FormatInt(policy.SQLiteBusyTimeout.Milliseconds(), 10)+")")
 	query.Add("_pragma", "foreign_keys(ON)")
@@ -93,13 +100,24 @@ func sqliteDSN(path string) string {
 	query.Add("_pragma", "journal_mode(WAL)")
 	query.Add("_pragma", "synchronous(FULL)")
 	query.Add("_pragma", "wal_autocheckpoint(0)")
+	if readOnly {
+		query.Add("_pragma", "query_only(ON)")
+	}
 	return (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 }
 
 func (store *Store) verify(ctx context.Context) error {
-	for name, database := range map[string]*sql.DB{"writer": store.Writer, "maintenance": store.Maintenance} {
-		if err := verifyPragmas(ctx, database); err != nil {
-			return fmt.Errorf("verify %s database pragmas: %w", name, err)
+	pools := []struct {
+		name     string
+		database *sql.DB
+		readOnly bool
+	}{
+		{name: "writer", database: store.Writer, readOnly: false},
+		{name: "maintenance", database: store.Maintenance, readOnly: true},
+	}
+	for _, pool := range pools {
+		if err := verifyPragmas(ctx, pool.database, pool.readOnly); err != nil {
+			return fmt.Errorf("verify %s database pragmas: %w", pool.name, err)
 		}
 	}
 	if err := store.verifyAppend(ctx); err != nil {
@@ -124,7 +142,7 @@ func (store *Store) verifyAppend(ctx context.Context) error {
 	return nil
 }
 
-func verifyPragmas(ctx context.Context, database *sql.DB) error {
+func verifyPragmas(ctx context.Context, database *sql.DB, readOnly bool) error {
 	connection, err := database.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
@@ -133,6 +151,10 @@ func verifyPragmas(ctx context.Context, database *sql.DB) error {
 		_ = connection.Close()
 	}()
 
+	queryOnly := "0"
+	if readOnly {
+		queryOnly = "1"
+	}
 	for _, expected := range []struct {
 		name  string
 		value string
@@ -143,6 +165,7 @@ func verifyPragmas(ctx context.Context, database *sql.DB) error {
 		{name: "journal_mode", value: "wal"},
 		{name: "synchronous", value: "2"},
 		{name: "wal_autocheckpoint", value: "0"},
+		{name: "query_only", value: queryOnly},
 	} {
 		var actual string
 		if err := connection.QueryRowContext(ctx, "PRAGMA "+expected.name).Scan(&actual); err != nil {

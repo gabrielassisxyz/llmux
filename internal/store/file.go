@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -26,11 +27,7 @@ func ensureSecureDatabaseFile(dbPath string) error {
 	}
 
 	// Verify parent directory is owned by the current process user and denies write to group/other
-	stat, ok := dirInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to get underlying stat for directory: %s", parentDir)
-	}
-	if stat.Uid != uint32(os.Geteuid()) {
+	if !directoryOwnedByUID(dirInfo, os.Geteuid()) {
 		return fmt.Errorf("parent directory not owned by service user")
 	}
 
@@ -71,6 +68,17 @@ func ensureSecureDatabaseFile(dbPath string) error {
 	}
 
 	return nil
+}
+
+// directoryOwnedByUID reports whether the supplied directory info is owned by
+// the given Unix user ID. It exists as a separate function so the ownership
+// check can be exercised in tests without requiring root privileges.
+func directoryOwnedByUID(dirInfo fs.FileInfo, uid int) bool {
+	stat, ok := dirInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return stat.Uid == uint32(uid)
 }
 
 // verifySidecarPermissions rechecks the database and its SQLite sidecars

@@ -5,7 +5,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+type dummyFileInfo struct{}
+
+func (dummyFileInfo) Name() string       { return "dummy" }
+func (dummyFileInfo) Size() int64        { return 0 }
+func (dummyFileInfo) Mode() os.FileMode  { return 0 }
+func (dummyFileInfo) ModTime() time.Time { return time.Time{} }
+func (dummyFileInfo) IsDir() bool        { return false }
+func (dummyFileInfo) Sys() any           { return nil }
 
 func TestFileSecurity_NewDatabase(t *testing.T) {
 	tempDir := t.TempDir()
@@ -136,25 +146,60 @@ func TestFileSecurity_RejectsParentDirNotOwnedByServiceUser(t *testing.T) {
 	}
 }
 
+func TestDirectoryOwnedByUID(t *testing.T) {
+	tempDir := t.TempDir()
+	dirInfo, err := os.Stat(tempDir)
+	if err != nil {
+		t.Fatalf("stat temp dir: %v", err)
+	}
+
+	if !directoryOwnedByUID(dirInfo, os.Geteuid()) {
+		t.Error("expected directory to be reported as owned by current uid")
+	}
+	if directoryOwnedByUID(dirInfo, os.Geteuid()+1) {
+		t.Error("expected directory not to be reported as owned by a different uid")
+	}
+}
+
+func TestDirectoryOwnedByUID_ReportsFalseWhenStatMissing(t *testing.T) {
+	dirInfo := dummyFileInfo{}
+	if directoryOwnedByUID(dirInfo, os.Geteuid()) {
+		t.Error("expected false for a FileInfo whose Sys() is not *syscall.Stat_t")
+	}
+}
+
 func TestFileSecurity_RejectsParentDirGroupOrOtherWritable(t *testing.T) {
 	tempDir := t.TempDir()
-	badDir := filepath.Join(tempDir, "bad-perms")
-	if err := os.Mkdir(badDir, 0777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(badDir, 0777); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chmod(badDir, 0700); err != nil {
-			t.Logf("failed to restore directory permissions: %v", err)
-		}
-	})
 
-	dbPath := filepath.Join(badDir, "test.db")
-	err := ensureSecureDatabaseFile(dbPath)
-	if err == nil || err.Error() != "parent directory allows group or other write access" {
-		t.Errorf("expected parent directory group/other writable rejection, got: %v", err)
+	for _, test := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"group writable only", 0720},
+		{"other writable only", 0702},
+		{"group and other writable", 0777},
+		{"write bits without owner write", 0222},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			badDir := filepath.Join(tempDir, test.name)
+			if err := os.Mkdir(badDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(badDir, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.Chmod(badDir, 0700); err != nil {
+					t.Logf("failed to restore directory permissions: %v", err)
+				}
+			})
+
+			dbPath := filepath.Join(badDir, "test.db")
+			err := ensureSecureDatabaseFile(dbPath)
+			if err == nil || err.Error() != "parent directory allows group or other write access" {
+				t.Errorf("expected parent directory group/other writable rejection for mode %04o, got: %v", test.mode, err)
+			}
+		})
 	}
 }
 

@@ -165,10 +165,7 @@ func TestProcessEventRejectsImpossibleLifecycle(t *testing.T) {
 				record_id, process_instance_id, event_kind,
 				at_us, process_elapsed_us, version, revision, schema_version
 			) VALUES ('rec_orphan_stop', 'new_inst', 'process_stop', 1000, 1, 'v1', 'rev', 3)`,
-			// The schema does not enforce a foreign-key ordering between start and stop rows.
-			// A stop row without a matching start is admissible because the schema only knows
-			// the per-instance uniqueness of each event kind, not the temporal sequence.
-			expectReject: false,
+			expectReject: true,
 		},
 		{
 			name: "negative elapsed duration",

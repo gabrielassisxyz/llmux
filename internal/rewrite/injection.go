@@ -20,6 +20,14 @@ func ApplyInjection(body []byte, field, value string) (Plan, error) {
 			return Plan{}, ErrMalformedJSON
 		}
 		if body[i] == '}' {
+			// Trailing content after the closing brace makes the whole body
+			// malformed JSON, so the rewritten body would also be invalid.
+			close := i
+			i = skipWS(body, i+1)
+			if i != len(body) {
+				return Plan{}, ErrMalformedJSON
+			}
+
 			encoded, err := json.Marshal(value)
 			if err != nil {
 				return Plan{}, fmt.Errorf("encode injection value: %w", err)
@@ -31,7 +39,7 @@ func ApplyInjection(body []byte, field, value string) (Plan, error) {
 			if first {
 				prefix = prefix[1:]
 			}
-			return NewPlan(body, []Replacement{{Span: Span{Start: i, End: i}, Value: append(prefix, encoded...)}})
+			return NewPlan(body, []Replacement{{Span: Span{Start: close, End: close}, Value: append(prefix, encoded...)}})
 		}
 		if !first {
 			if body[i] != ',' {

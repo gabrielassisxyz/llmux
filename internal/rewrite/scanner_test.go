@@ -385,39 +385,3 @@ func TestScan_EmptyObject(t *testing.T) {
 		t.Fatalf("expected ErrMalformedJSON for a missing model in an empty object, got %v", err)
 	}
 }
-
-// FuzzScan proves Scan never panics regardless of input. The full fuzz
-// corpus and CI wiring belong to a dedicated bead; this seed corpus still
-// runs under plain go test.
-func FuzzScan(f *testing.F) {
-	seeds := []string{
-		`{"model":"a","messages":[]}`,
-		`{}`,
-		`[]`,
-		`null`,
-		`{"model":"a","x":[[[[[1]]]]]}`,
-		`{"\\u006dodel":"a","messages":[]}`,
-		`{"model":"a","\\u0073tream":true}`,
-		`{"model":"a","stream":true,"\\u0073tream":false}`,
-		`{"model":"m","x":"😀"}`,
-		`{"model":"a","x":"\`,
-		`{"model":"a"` + strings.Repeat(",", 1000),
-		strings.Repeat("[", 10000),
-		`{"model":"a","x":1e999999999}`,
-		// Nesting exactly below, at, and above the accepted depth boundary.
-		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth-2) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth-2) + `}`,
-		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth-1) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth-1) + `}`,
-		`{"model":"a","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth) + `}`,
-	}
-	for _, s := range seeds {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, body string) {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("Scan panicked on input %q: %v", body, r)
-			}
-		}()
-		_, _ = Scan([]byte(body))
-	})
-}

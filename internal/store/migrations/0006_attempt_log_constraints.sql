@@ -42,7 +42,7 @@ CREATE TABLE attempt_log_new (
         'final', 'retry_same_account', 'retry_other_account', 'retry_named_account',
         'suppressed_class_budget', 'suppressed_global_budget', 'suppressed_deadline', 'not_applicable'
     )),
-    retry_delay_ms INTEGER,
+    retry_delay_ms INTEGER CHECK (retry_delay_ms IS NULL OR retry_delay_ms >= 0),
     retry_after_s INTEGER CHECK (retry_after_s IS NULL OR (outcome = 'capacity_timeout' AND retry_after_s >= 0)),
     upstream_retry_after_s INTEGER CHECK (
         upstream_retry_after_s IS NULL OR
@@ -90,8 +90,8 @@ CREATE TABLE attempt_log_new (
         (record_kind != 'dispatch' AND usage_observation IS NULL)
     ),
     CHECK (
-        (record_kind = 'dispatch' AND limiter_rpm_used IS NULL AND limiter_in_flight IS NULL) OR
-        (record_kind != 'dispatch')
+        (record_kind = 'selection_skip' AND limiter_rpm_used IS NOT NULL AND limiter_in_flight IS NOT NULL) OR
+        (record_kind != 'selection_skip' AND limiter_rpm_used IS NULL AND limiter_in_flight IS NULL)
     ),
     CHECK (
         (record_kind = 'selection_skip' AND retry_disposition = 'not_applicable') OR

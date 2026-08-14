@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpenConfiguresSeparateSingleConnectionPools(t *testing.T) {
@@ -39,6 +40,35 @@ func assertFreshConnectionPragmas(t *testing.T, database *sql.DB) {
 	}
 	if err := verifyPragmas(context.Background(), database); err != nil {
 		t.Fatalf("fresh connection pragmas: %v", err)
+	}
+}
+
+// TestPragmasHoldOnAConnectionThePoolDidNotHaveAtOpen proves the property
+// PLAN.md 15.4 states directly: the required pragmas are per connection,
+// not per database, and database/sql may open a new connection at any
+// moment. Reading a pragma back once, on the one connection Open already
+// dialed, would pass even if the DSN's _pragma mechanism only applied on
+// the very first dial. SetConnMaxLifetime forces every connection the pool
+// currently holds to be discarded and redialed before it can be reused, so
+// each pragma read below runs on a connection Open never saw.
+func TestPragmasHoldOnAConnectionThePoolDidNotHaveAtOpen(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "llmux.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Store.Close() error = %v", err)
+		}
+	})
+
+	for name, database := range map[string]*sql.DB{"writer": store.Writer, "maintenance": store.Maintenance} {
+		database.SetConnMaxLifetime(time.Nanosecond)
+		for i := 0; i < 3; i++ {
+			if err := verifyPragmas(context.Background(), database); err != nil {
+				t.Fatalf("%s: pragmas on redialed connection %d: %v", name, i, err)
+			}
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gabrielassisxyz/llmux/internal/clock"
+	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/proxy"
 	"github.com/gabrielassisxyz/llmux/internal/resource"
 )
@@ -34,28 +35,42 @@ func (writer *fakeUnroutedRequestWriter) recordedCodes() []proxy.ErrorCode {
 	return append([]proxy.ErrorCode(nil), writer.codes...)
 }
 
-func TestRequireScannedEnvelopeRejectsAndRecordsOnce(t *testing.T) {
-	writer := &fakeUnroutedRequestWriter{}
-	nextCalled := false
-	scanned := RequireScannedEnvelope(writer, func(http.ResponseWriter, *http.Request) {
-		nextCalled = true
-	})
-	handler := resource.RequireResources(resource.NewGate(), nil, clock.NewRealClock(), RequireBoundedBody(scanned))
+func TestRequireScannedEnvelopeMapsEveryOwnedRejection(t *testing.T) {
+	overDepth := `{"model":"kimi-k2.7","x":` + strings.Repeat("[", policy.MaxJSONNestingDepth) + `1` + strings.Repeat("]", policy.MaxJSONNestingDepth) + `}`
+	cases := []struct {
+		name string
+		body string
+		code proxy.ErrorCode
+	}{
+		{name: "invalid JSON", body: `{"model":"kimi-k2.7"`, code: proxy.ErrInvalidRequest},
+		{name: "non-object", body: `[]`, code: proxy.ErrInvalidRequest},
+		{name: "missing model", body: `{}`, code: proxy.ErrInvalidRequest},
+		{name: "non-string model", body: `{"model":1}`, code: proxy.ErrInvalidRequest},
+		{name: "duplicate model", body: `{"model":"kimi-k2.7","model":"kimi-k2.7"}`, code: proxy.ErrInvalidRequest},
+		{name: "duplicate stream", body: `{"model":"kimi-k2.7","stream":true,"stream":false}`, code: proxy.ErrInvalidRequest},
+		{name: "depth exceeded", body: overDepth, code: proxy.ErrJSONDepthExceeded},
+		{name: "unknown alias", body: `{"model":"unknown"}`, code: proxy.ErrModelNotFound},
+	}
 
-	recorder := httptest.NewRecorder()
-	handler(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &fakeUnroutedRequestWriter{}
+			nextCalled := false
+			handler := RequireScannedEnvelope(writer, func(http.ResponseWriter, *http.Request) {
+				nextCalled = true
+			})
 
-	if nextCalled {
-		t.Fatal("next handler ran after scanner rejection")
-	}
-	if recorder.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
-	}
-	if got, want := recorder.Body.String(), "{\"error\":{\"message\":\"Invalid routing envelope\",\"type\":\"invalid_request_error\",\"code\":\"invalid_request\"}}\n"; got != want {
-		t.Errorf("response = %q, want %q", got, want)
-	}
-	if got, want := writer.recordedCodes(), []proxy.ErrorCode{proxy.ErrInvalidRequest}; !equalErrorCodes(got, want) {
-		t.Errorf("recorded codes = %v, want %v", got, want)
+			recorder := httptest.NewRecorder()
+			handler(recorder, requestWithBody(test.body))
+
+			if nextCalled {
+				t.Fatal("next handler ran after scanner rejection")
+			}
+			assertErrorResponse(t, recorder, test.code)
+			if got, want := writer.recordedCodes(), []proxy.ErrorCode{test.code}; !equalErrorCodes(got, want) {
+				t.Errorf("recorded codes = %v, want %v", got, want)
+			}
+		})
 	}
 }
 
@@ -68,13 +83,56 @@ func TestRequireScannedEnvelopeAcceptsWithoutRecording(t *testing.T) {
 	})
 
 	recorder := httptest.NewRecorder()
-	handler(recorder, requestWithBody(`{"model":"route"}`))
+	handler(recorder, requestWithBody(`{"model":"kimi-k2.7"}`))
 
 	if !nextCalled {
 		t.Fatal("next handler did not run for a valid envelope")
 	}
 	if recorder.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if got := writer.recordedCodes(); len(got) != 0 {
+		t.Errorf("recorded codes = %v, want none", got)
+	}
+}
+
+func TestRequireScannedEnvelopeReadsBoundedBodyContext(t *testing.T) {
+	writer := &fakeUnroutedRequestWriter{}
+	nextCalled := false
+	scanned := RequireScannedEnvelope(writer, func(http.ResponseWriter, *http.Request) {
+		nextCalled = true
+	})
+	handler := resource.RequireResources(resource.NewGate(), nil, clock.NewRealClock(), RequireBoundedBody(writer, scanned))
+
+	recorder := httptest.NewRecorder()
+	handler(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"unknown"}`)))
+
+	if nextCalled {
+		t.Fatal("next handler ran after unknown alias")
+	}
+	assertErrorResponse(t, recorder, proxy.ErrModelNotFound)
+	if got, want := writer.recordedCodes(), []proxy.ErrorCode{proxy.ErrModelNotFound}; !equalErrorCodes(got, want) {
+		t.Errorf("recorded codes = %v, want %v", got, want)
+	}
+}
+
+func TestRequireScannedEnvelopePassesOpaqueParametersAndDuplicateUnknownMembers(t *testing.T) {
+	writer := &fakeUnroutedRequestWriter{}
+	body := `{"model":"kimi-k2.7","unrecognized":1,"unrecognized":{"nested":[true,false]},"vendor_field":"value"}`
+	var gotBody []byte
+	handler := RequireScannedEnvelope(writer, func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = RequestBody(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	handler(recorder, requestWithBody(body))
+
+	if recorder.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if got := string(gotBody); got != body {
+		t.Errorf("body = %q, want byte-identical %q", got, body)
 	}
 	if got := writer.recordedCodes(); len(got) != 0 {
 		t.Errorf("recorded codes = %v, want none", got)
@@ -140,4 +198,18 @@ func equalErrorCodes(got, want []proxy.ErrorCode) bool {
 		}
 	}
 	return true
+}
+
+func assertErrorResponse(t *testing.T, recorder *httptest.ResponseRecorder, code proxy.ErrorCode) {
+	t.Helper()
+	wantStatus := http.StatusBadRequest
+	if code == proxy.ErrModelNotFound {
+		wantStatus = http.StatusNotFound
+	}
+	if recorder.Code != wantStatus {
+		t.Errorf("status = %d, want %d", recorder.Code, wantStatus)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"`+string(code)+`"`) {
+		t.Errorf("response = %q, want code %q", recorder.Body.String(), code)
+	}
 }

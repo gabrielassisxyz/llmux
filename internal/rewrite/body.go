@@ -31,7 +31,7 @@ func RequestBody(ctx context.Context) ([]byte, bool) {
 // capacity before that capacity is allocated, and bounded by
 // policy.MaxRequestBodyBytes. It reads the RequestResources attached to the
 // context by resource.RequireResources, which must run first.
-func RequireBoundedBody(next http.HandlerFunc) http.HandlerFunc {
+func RequireBoundedBody(writer UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		res := resource.ContextResources(r.Context())
 		body, err := readBoundedBody(r, res)
@@ -43,16 +43,24 @@ func RequireBoundedBody(next http.HandlerFunc) http.HandlerFunc {
 			}
 
 			reqID, _ := proxy.RequestID(r.Context())
+			var code proxy.ErrorCode
 			switch {
 			case errors.Is(err, errBodyTooLarge):
-				proxy.WriteError(w, reqID, proxy.ErrRequestTooLarge)
+				code = proxy.ErrRequestTooLarge
+				proxy.WriteError(w, reqID, code)
 			case errors.Is(err, resource.ErrOverloaded):
+				code = proxy.ErrProxyOverloaded
 				// A global memory failure consulted no account, so there is
 				// no reopening time to derive; the zero value falls back to
 				// the fixed one-second Retry-After.
-				proxy.WriteRateLimitError(w, reqID, proxy.ErrProxyOverloaded, time.Time{}, time.Time{})
+				proxy.WriteRateLimitError(w, reqID, code, time.Time{}, time.Time{})
 			default:
-				proxy.WriteError(w, reqID, proxy.ErrInvalidRequest)
+				code = proxy.ErrInvalidRequest
+				proxy.WriteError(w, reqID, code)
+			}
+
+			if writer != nil {
+				_ = writer.RecordUnroutedRequest(r.Context(), code)
 			}
 			return
 		}

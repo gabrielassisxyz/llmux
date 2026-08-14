@@ -10,6 +10,7 @@ import (
 
 	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
+	"github.com/gabrielassisxyz/llmux/internal/proxy"
 	"github.com/gabrielassisxyz/llmux/internal/resource"
 )
 
@@ -200,7 +201,8 @@ func TestReadUnsizedBody_ContextCancelledDuringGrowthReleasesCharge(t *testing.T
 
 func TestRequireBoundedBody_OversizeIsLocal413(t *testing.T) {
 	g := resource.NewGate()
-	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(func(w http.ResponseWriter, r *http.Request) {
+	writer := &fakeUnroutedRequestWriter{}
+	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(writer, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler must not run for an oversized body")
 	}))
 
@@ -211,13 +213,17 @@ func TestRequireBoundedBody_OversizeIsLocal413(t *testing.T) {
 	wrapped(w, r)
 
 	if w.Code != 413 {
-		t.Errorf("expected 413, got %d", w.Code)
+		t.Errorf("status = %d, want 413", w.Code)
+	}
+	if got, want := writer.recordedCodes(), []proxy.ErrorCode{proxy.ErrRequestTooLarge}; !equalErrorCodes(got, want) {
+		t.Errorf("recorded codes = %v, want %v", got, want)
 	}
 }
 
 func TestRequireBoundedBody_ReadErrorIsLocal400(t *testing.T) {
 	g := resource.NewGate()
-	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(func(w http.ResponseWriter, r *http.Request) {
+	writer := &fakeUnroutedRequestWriter{}
+	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(writer, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler must not run when the body fails to read")
 	}))
 
@@ -229,13 +235,16 @@ func TestRequireBoundedBody_ReadErrorIsLocal400(t *testing.T) {
 	wrapped(w, r)
 
 	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if got, want := writer.recordedCodes(), []proxy.ErrorCode{proxy.ErrInvalidRequest}; !equalErrorCodes(got, want) {
+		t.Errorf("recorded codes = %v, want %v", got, want)
 	}
 }
 
 func TestRequireBoundedBody_ClientVanishedWritesNothing(t *testing.T) {
 	g := resource.NewGate()
-	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(func(w http.ResponseWriter, r *http.Request) {
+	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(&fakeUnroutedRequestWriter{}, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler must not run when the body fails to read")
 	}))
 
@@ -262,7 +271,7 @@ func TestRequireBoundedBody_SuccessAttachesBodyToContext(t *testing.T) {
 
 	var gotBody []byte
 	var gotOK bool
-	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(func(w http.ResponseWriter, r *http.Request) {
+	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(&fakeUnroutedRequestWriter{}, func(w http.ResponseWriter, r *http.Request) {
 		gotBody, gotOK = RequestBody(r.Context())
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -295,7 +304,8 @@ func TestRequireBoundedBody_GateDenialIsLocal429(t *testing.T) {
 		t.Fatalf("failed to exhaust the gate: %v", err)
 	}
 
-	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(func(w http.ResponseWriter, r *http.Request) {
+	writer := &fakeUnroutedRequestWriter{}
+	wrapped := resource.RequireResources(g, nil, clock.NewRealClock(), RequireBoundedBody(writer, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler must not run when the memory gate denies the charge")
 	}))
 
@@ -307,6 +317,9 @@ func TestRequireBoundedBody_GateDenialIsLocal429(t *testing.T) {
 
 	if w.Code != 429 {
 		t.Errorf("expected 429, got %d", w.Code)
+	}
+	if got, want := writer.recordedCodes(), []proxy.ErrorCode{proxy.ErrProxyOverloaded}; !equalErrorCodes(got, want) {
+		t.Errorf("recorded codes = %v, want %v", got, want)
 	}
 	if w.Header().Get("Retry-After") != "1" {
 		t.Errorf("expected Retry-After: 1, got %q", w.Header().Get("Retry-After"))

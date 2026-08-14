@@ -251,3 +251,59 @@ func countAdmissions(t *testing.T, s *store.Store, logicalRequestID string) int 
 	}
 	return count
 }
+
+// fakeAdmissionWriter is a test double whose only job is to return the error it
+// was configured with, so tests can prove the dispatch path is fail-closed.
+type fakeAdmissionWriter struct {
+	err error
+}
+
+func (f *fakeAdmissionWriter) InsertDispatchAdmission(ctx context.Context, admission store.DispatchAdmission) error {
+	return f.err
+}
+
+// fakeUpstreamExecutor records whether it was called, so a test can assert that
+// the dispatch did not proceed when admission failed.
+type fakeUpstreamExecutor struct {
+	called bool
+}
+
+func (f *fakeUpstreamExecutor) Do(ctx context.Context) error {
+	f.called = true
+	return nil
+}
+
+// dispatchIfAdmitted is the minimal fail-closed dispatch skeleton used to test the
+// admission contract in isolation. A real dispatcher lives in later phases; this
+// helper exists only to prove that an admission-writer error prevents the upstream
+// call.
+func dispatchIfAdmitted(ctx context.Context, writer store.AdmissionWriter, exec *fakeUpstreamExecutor, admission store.DispatchAdmission) error {
+	if err := writer.InsertDispatchAdmission(ctx, admission); err != nil {
+		return err
+	}
+	return exec.Do(ctx)
+}
+
+func TestAdmissionWriterErrorPreventsDispatch(t *testing.T) {
+	writer := &fakeAdmissionWriter{err: errors.New("store unavailable")}
+	exec := &fakeUpstreamExecutor{}
+	admission := store.DispatchAdmission{
+		AttemptID:        "attempt-fail",
+		LogicalRequestID: "request-fail",
+		AttemptNo:        1,
+		AccountLabel:     "k1",
+		RequestedAlias:   "a",
+		UpstreamModel:    "b",
+		ReservedAtUS:     1,
+		LimiterRPMUsed:   0,
+		LimiterInFlight:  0,
+	}
+
+	err := dispatchIfAdmitted(context.Background(), writer, exec, admission)
+	if err == nil {
+		t.Fatal("dispatchIfAdmitted() succeeded with a failing admission writer")
+	}
+	if exec.called {
+		t.Fatal("upstream executor was called even though admission failed")
+	}
+}

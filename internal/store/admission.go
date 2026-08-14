@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+// AdmissionWriter is the narrow store surface a dispatch uses to commit its
+// pre-dispatch evidence row. A real implementation writes to SQLite; a fake can
+// return any error the dispatch path must handle as fail-closed.
+type AdmissionWriter interface {
+	InsertDispatchAdmission(ctx context.Context, admission DispatchAdmission) error
+}
+
 // DispatchAdmission is the pre-dispatch evidence row written synchronously after the
 // in-memory reservation and before http.Client.Do.
 type DispatchAdmission struct {

@@ -37,12 +37,12 @@ func loadMigrations() ([]migration, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
 		}
-		
+
 		parts := strings.SplitN(entry.Name(), "_", 2)
 		if len(parts) < 2 {
 			return nil, fmt.Errorf("invalid migration filename format: %s", entry.Name())
 		}
-		
+
 		version, err := strconv.Atoi(parts[0])
 		if err != nil {
 			return nil, fmt.Errorf("invalid migration version %q in %s", parts[0], entry.Name())

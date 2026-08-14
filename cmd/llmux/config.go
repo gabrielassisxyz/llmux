@@ -111,6 +111,9 @@ func validateCredentials(c *Config) error {
 		if val == "" {
 			return fmt.Errorf("%s must not be empty", name)
 		}
+		if name != "LLMUX_PROXY_KEY" && name != "LLMUX_AFFINITY_HMAC_KEY" && len(val) < 32 {
+			return fmt.Errorf("%s must be at least 32 bytes", name)
+		}
 		if other, ok := seen[val]; ok {
 			return fmt.Errorf("%s must not be equal to %s", name, other)
 		}

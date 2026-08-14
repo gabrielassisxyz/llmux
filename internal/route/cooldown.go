@@ -31,8 +31,9 @@ type Apply429Result struct {
 
 // Apply429 records an upstream 429 for account. It adds the receipt
 // instant to the recent-429 history, pruning entries outside the rolling
-// window; derives the gate delay from header and responseDate; advances
-// the gate deadline by that delay, clamped to ten minutes; and, on the
+// window; derives the gate delay from header and responseDate; extends
+// the gate deadline by that delay, clamped to ten minutes, without ever
+// shortening an existing gate; and, on the
 // third 429 within the window, additionally enters cooldown and floors the
 // gate deadline at one full rolling window from now.
 //
@@ -68,7 +69,9 @@ func (c *Coordinator) Apply429(account catalog.Account, header string, responseD
 		}
 		entered = true
 	}
-	state.rateGateDeadline = gate
+	if gate > state.rateGateDeadline {
+		state.rateGateDeadline = gate
+	}
 
 	c.notifyLocked()
 

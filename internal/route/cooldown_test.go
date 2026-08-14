@@ -52,6 +52,25 @@ func TestSingle429WithNoRetryAfterGatesOneSecond(t *testing.T) {
 	}
 }
 
+func TestApply429NeverShortensAnExistingLongerGate(t *testing.T) {
+	c, fake := newRateTestCoordinator()
+
+	c.Apply429(catalog.AccountK1, "600", time.Time{}, false)
+	c.mu.Lock()
+	longerGate := c.accounts[accountIndex(catalog.AccountK1)].rateGateDeadline
+	c.mu.Unlock()
+
+	fake.AdvanceMonotonic(time.Second)
+	c.Apply429(catalog.AccountK1, "", time.Time{}, false)
+
+	c.mu.Lock()
+	gate := c.accounts[accountIndex(catalog.AccountK1)].rateGateDeadline
+	c.mu.Unlock()
+	if gate != longerGate {
+		t.Errorf("gate deadline = %v, want existing longer deadline %v", gate, longerGate)
+	}
+}
+
 func TestSingleOrDouble429DoesNotEnterCooldownOrClearHistory(t *testing.T) {
 	c, _ := newRateTestCoordinator()
 

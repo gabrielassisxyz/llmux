@@ -48,3 +48,16 @@
 /.githooks/pre-commit.ps1
 /.githooks/pre-commit.orig
 /.ntm/
+
+# Per-repository agent harness configuration. Both directories are machine state rather
+# than project state: the Claude side carries a permission allowlist naming absolute paths
+# outside this checkout, and the Codex side wires a coordination server that only exists
+# while a swarm is running on this host. Neither is required to build, test or run llmux,
+# so a cloner loses nothing by not receiving them, and this repository is public.
+#
+# The Codex file reads its bearer token from MCP_AGENT_MAIL_TOKEN rather than carrying it
+# inline. That remains the right shape now that the file is ignored: an ignored file is one
+# `git add -f` away from being committed, and a credential that never enters the tree cannot
+# be committed by accident at all.
+/.claude/
+/.codex/

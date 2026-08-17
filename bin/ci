@@ -92,6 +92,22 @@ else
         ok
     fi
 
+    # The four durable tables are evidence: rows written once and never mutated.
+    # Migration 0007 installs triggers that reject UPDATE and DELETE at the
+    # database level; this check proves no application code path issues either
+    # statement against those tables, so the triggers are a backstop rather than
+    # the only defense. The migrations themselves are .sql files and are not
+    # scanned, and the rejection tests are excluded as test files.
+    section "append-only tables (no UPDATE/DELETE)"
+    forbidden_mutations="$(rg -n --glob '*.go' --glob '!**/*_test.go' '\b(UPDATE|DELETE)\s+(FROM\s+)?(unrouted_request|process_event|dispatch_admission|attempt_log)\b' . || true)"
+    if [ -n "$forbidden_mutations" ]; then
+        printf '%s\n' "$forbidden_mutations" | sed 's/^/    /'
+        printf '    the four durable tables are append-only; no application UPDATE or DELETE is allowed\n'
+        bad
+    else
+        ok
+    fi
+
     section "package dependencies"
     if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./internal/... 2>/dev/null | grep -E ' (github.com/gabrielassisxyz/llmux/internal/app|github.com/gabrielassisxyz/llmux/cmd)' >/dev/null; then
         printf '    lower-level package imports internal/app or cmd/llmux\n'

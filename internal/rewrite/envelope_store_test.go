@@ -51,7 +51,7 @@ func newStoreEnvelopeFixture(t *testing.T, next http.HandlerFunc) *storeEnvelope
 	envelope := RequireScannedEnvelope(writer, next)
 	bounded := RequireBoundedBody(writer, envelope)
 	resourced := resource.RequireResources(gate, nil, clk, bounded)
-	handler := proxy.RequireLogicalContext(gen, resourced)
+	handler := proxy.AssignRequestID(gen, proxy.RequireLogicalDeadline(resourced))
 
 	return &storeEnvelopeFixture{
 		t:       t,

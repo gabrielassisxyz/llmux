@@ -13,14 +13,14 @@ func RequireBearerAuth(expectedDigest [32]byte, next http.HandlerFunc) http.Hand
 	return func(w http.ResponseWriter, r *http.Request) {
 		headers := r.Header.Values("Authorization")
 		if len(headers) != 1 {
-			writeAuthError(w)
+			writeAuthError(w, r)
 			return
 		}
 
 		authHeader := headers[0]
 		parts := strings.Split(authHeader, " ")
 		if len(parts) != 2 {
-			writeAuthError(w)
+			writeAuthError(w, r)
 			return
 		}
 
@@ -28,14 +28,14 @@ func RequireBearerAuth(expectedDigest [32]byte, next http.HandlerFunc) http.Hand
 		token := parts[1]
 
 		if !strings.EqualFold(scheme, "Bearer") || token == "" {
-			writeAuthError(w)
+			writeAuthError(w, r)
 			return
 		}
 
 		presentedDigest := sha256.Sum256([]byte(token))
 
 		if subtle.ConstantTimeCompare(expectedDigest[:], presentedDigest[:]) != 1 {
-			writeAuthError(w)
+			writeAuthError(w, r)
 			return
 		}
 
@@ -43,7 +43,11 @@ func RequireBearerAuth(expectedDigest [32]byte, next http.HandlerFunc) http.Hand
 	}
 }
 
-func writeAuthError(w http.ResponseWriter) {
+// writeAuthError answers a rejected credential. It reads the request ID from
+// the context so that, when authentication runs after identifier assignment,
+// the rejection carries the identifier the client was already given.
+func writeAuthError(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	WriteError(w, "", ErrInvalidAPIKey)
+	reqID, _ := RequestID(r.Context())
+	WriteError(w, reqID, ErrInvalidAPIKey)
 }

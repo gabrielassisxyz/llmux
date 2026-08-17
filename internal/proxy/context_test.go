@@ -20,14 +20,36 @@ func newTestGenerator() (idgen.Generator, string) {
 	return gen, hex.EncodeToString(entropy)
 }
 
-func TestRequireLogicalContext_DeadlineExceeded(t *testing.T) {
+func TestAssignRequestID_Success(t *testing.T) {
+	gen, expectedID := newTestGenerator()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		id, ok := RequestID(r.Context())
+		if !ok || id != expectedID {
+			t.Errorf("expected request ID %q in context, got %q (ok=%v)", expectedID, id, ok)
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+
+	wrapped := AssignRequestID(gen, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	wrapped(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func TestRequireLogicalDeadline_DeadlineExceeded(t *testing.T) {
 	gen, expectedID := newTestGenerator()
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}
 
-	wrapped := RequireLogicalContext(gen, handler)
+	wrapped := AssignRequestID(gen, RequireLogicalDeadline(handler))
 
 	// Create a parent context that times out immediately
 	parentCtx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
@@ -60,14 +82,14 @@ func TestRequireLogicalContext_DeadlineExceeded(t *testing.T) {
 	}
 }
 
-func TestRequireLogicalContext_ClientCancel(t *testing.T) {
+func TestRequireLogicalDeadline_ClientCancel(t *testing.T) {
 	gen, _ := newTestGenerator()
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}
 
-	wrapped := RequireLogicalContext(gen, handler)
+	wrapped := AssignRequestID(gen, RequireLogicalDeadline(handler))
 
 	// Create a parent context that is canceled, not timed out
 	parentCtx, cancel := context.WithCancel(context.Background())
@@ -89,15 +111,10 @@ func TestRequireLogicalContext_ClientCancel(t *testing.T) {
 	}
 }
 
-func TestRequireLogicalContext_Success(t *testing.T) {
-	gen, expectedID := newTestGenerator()
+func TestRequireLogicalDeadline_Success(t *testing.T) {
+	gen, _ := newTestGenerator()
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		id, ok := RequestID(r.Context())
-		if !ok || id != expectedID {
-			t.Errorf("expected request ID %q in context, got %q (ok=%v)", expectedID, id, ok)
-		}
-
 		// check deadline is set
 		dl, ok := r.Context().Deadline()
 		if !ok {
@@ -114,7 +131,7 @@ func TestRequireLogicalContext_Success(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}
 
-	wrapped := RequireLogicalContext(gen, handler)
+	wrapped := AssignRequestID(gen, RequireLogicalDeadline(handler))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	w := httptest.NewRecorder()

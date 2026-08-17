@@ -18,11 +18,11 @@ func RequestID(ctx context.Context) (string, bool) {
 	return id, ok
 }
 
-// RequireLogicalContext generates a logical request ID, attaches it to the
-// request context, and bounds the request lifetime to policy.LogicalRequestDeadline.
-// It answers local 504 deadline_exceeded if the context expires before the
-// downstream response is committed.
-func RequireLogicalContext(generator idgen.Generator, next http.HandlerFunc) http.HandlerFunc {
+// AssignRequestID generates a logical request ID and attaches it to the
+// request context. It answers local 500 internal_error if the generator
+// fails. Every request past the route guard carries an identity, so this
+// runs before any rejection on the identity side of the boundary.
+func AssignRequestID(generator idgen.Generator, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID, err := generator.LogicalRequestID()
 		if err != nil {
@@ -30,10 +30,20 @@ func RequireLogicalContext(generator idgen.Generator, next http.HandlerFunc) htt
 			return
 		}
 
+		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// RequireLogicalDeadline bounds the request lifetime to
+// policy.LogicalRequestDeadline and answers local 504 deadline_exceeded if
+// the context expires before the downstream response is committed. It reads
+// the request ID from the context, so AssignRequestID must run first.
+func RequireLogicalDeadline(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), policy.LogicalRequestDeadline)
 		defer cancel()
 
-		ctx = context.WithValue(ctx, requestIDKey, reqID)
 		r = r.WithContext(ctx)
 
 		// We run the next handler in the same goroutine.
@@ -44,6 +54,7 @@ func RequireLogicalContext(generator idgen.Generator, next http.HandlerFunc) htt
 		next(cw, r)
 
 		if !cw.committed && ctx.Err() == context.DeadlineExceeded {
+			reqID, _ := RequestID(ctx)
 			WriteError(w, reqID, ErrDeadlineExceeded)
 		}
 	}

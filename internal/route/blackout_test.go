@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
@@ -14,7 +15,7 @@ import (
 // the blackout so rate-window tests are not incidentally testing it too.
 func freshCoordinator() (*Coordinator, *testsupport.FakeClock) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	return NewCoordinator(testKeys(), fake), fake
+	return NewCoordinator(testKeys(), fake, clock.RandomPermutationSource{}), fake
 }
 
 func TestNoDispatchAdmittedDuringTheBlackout(t *testing.T) {

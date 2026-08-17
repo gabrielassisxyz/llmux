@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/store"
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
@@ -20,7 +21,7 @@ import (
 // behavior.
 func newReservationTestCoordinator() (*Coordinator, *testsupport.FakeClock) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	c := NewCoordinator(testKeys(), fake)
+	c := NewCoordinator(testKeys(), fake, clock.RandomPermutationSource{})
 	fake.AdvanceMonotonic(policy.PostStartDispatchBlackout)
 	return c, fake
 }
@@ -52,7 +53,7 @@ func TestReserveReturnsLeaseAndIncrementsCounters(t *testing.T) {
 
 func TestReserveSkipsDuringBlackout(t *testing.T) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	c := NewCoordinator(testKeys(), fake)
+	c := NewCoordinator(testKeys(), fake, clock.RandomPermutationSource{})
 
 	lease, outcome := c.Reserve(catalog.AccountK1)
 	if outcome != SkippedBlackout {

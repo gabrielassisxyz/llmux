@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
@@ -83,7 +84,7 @@ func TestWaitReturnsCanceledPromptly(t *testing.T) {
 // milliseconds of real wall-clock time.
 func TestWaitTimesOutAtTheAccountAcquisitionCeiling(t *testing.T) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	c := NewCoordinator(testKeys(), fake)
+	c := NewCoordinator(testKeys(), fake, clock.RandomPermutationSource{})
 
 	c.mu.Lock()
 	token := c.WaitToken()

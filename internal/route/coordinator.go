@@ -75,6 +75,7 @@ type Coordinator struct {
 	mu       sync.Mutex
 	accounts [3]accountState
 	clk      clock.Clock
+	perm     clock.PermutationSource
 
 	// notify is closed and replaced under mu by every mutation a waiter
 	// might care about. See notifyLocked and WaitToken in wait.go.
@@ -85,9 +86,11 @@ type Coordinator struct {
 // records, all initially enabled. keys is assumed already validated
 // (non-empty, mutually distinct): that is the configuration loader's
 // responsibility, not this constructor's. clk is the injected clock
-// boundary Wait uses for its account-acquisition ceiling.
-func NewCoordinator(keys AccountKeys, clk clock.Clock) *Coordinator {
-	c := &Coordinator{clk: clk, notify: make(chan struct{})}
+// boundary Wait uses for its account-acquisition ceiling. perm is the
+// injected permutation source Select uses to order candidate accounts, so
+// tests can drive a deterministic order.
+func NewCoordinator(keys AccountKeys, clk clock.Clock, perm clock.PermutationSource) *Coordinator {
+	c := &Coordinator{clk: clk, perm: perm, notify: make(chan struct{})}
 	c.accounts[accountIndex(catalog.AccountK1)] = accountState{label: catalog.AccountK1, key: keys.K1, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK2)] = accountState{label: catalog.AccountK2, key: keys.K2, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK3)] = accountState{label: catalog.AccountK3, key: keys.K3, health: HealthEnabled}
@@ -107,6 +110,21 @@ func accountIndex(label catalog.Account) int {
 		return 1
 	default:
 		return 2
+	}
+}
+
+// accountFromIndex maps a permutation index to its fixed account identity.
+// It is the inverse of accountIndex: a permutation source returns indices
+// into the three-account array, and the selection pass translates each back
+// to the catalog.Account it names.
+func accountFromIndex(idx int) catalog.Account {
+	switch idx {
+	case 0:
+		return catalog.AccountK1
+	case 1:
+		return catalog.AccountK2
+	default:
+		return catalog.AccountK3
 	}
 }
 
@@ -199,7 +217,14 @@ func (l *PendingLease) Release() {
 func (c *Coordinator) Reserve(account catalog.Account) (*PendingLease, ReservationOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.reserveLocked(account)
+}
 
+// reserveLocked performs the admission check for account. The caller must
+// hold c.mu. It is the shared core of Reserve and the selection pass, so a
+// selection can consider several accounts under one lock hold without
+// releasing the lock between candidates.
+func (c *Coordinator) reserveLocked(account catalog.Account) (*PendingLease, ReservationOutcome) {
 	now := c.clk.MonotonicNow()
 	if now < policy.PostStartDispatchBlackout {
 		return nil, SkippedBlackout

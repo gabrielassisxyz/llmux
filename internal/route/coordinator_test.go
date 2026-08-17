@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
@@ -13,7 +14,7 @@ func testKeys() AccountKeys {
 }
 
 func testCoordinator() *Coordinator {
-	return NewCoordinator(testKeys(), testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)))
+	return NewCoordinator(testKeys(), testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)), clock.RandomPermutationSource{})
 }
 
 func TestNewCoordinatorCreatesExactlyThreeAccounts(t *testing.T) {

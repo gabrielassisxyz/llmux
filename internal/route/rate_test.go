@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
@@ -18,7 +19,7 @@ import (
 // with a clock still at its zero point.
 func newRateTestCoordinator() (*Coordinator, *testsupport.FakeClock) {
 	fake := testsupport.NewFakeClock(time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC))
-	c := NewCoordinator(testKeys(), fake)
+	c := NewCoordinator(testKeys(), fake, clock.RandomPermutationSource{})
 	fake.AdvanceMonotonic(policy.PostStartDispatchBlackout)
 	return c, fake
 }

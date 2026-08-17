@@ -61,3 +61,11 @@
 # be committed by accident at all.
 /.claude/
 /.codex/
+
+# Agent Mail keeps its store at ~/.local/share/mcp_agent_mail/storage.sqlite3. Something in
+# its tooling creates a second, empty one relative to the working directory, so it lands in
+# the repository root during a swarm run. It is not a store anyone should read: an agent
+# querying reservations from there sees an empty table and concludes every file is free,
+# which is the worst possible failure of an advisory lock. Ignored so it can never be
+# committed; delete it when it appears.
+/storage.sqlite3

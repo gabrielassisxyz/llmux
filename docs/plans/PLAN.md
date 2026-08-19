@@ -1824,8 +1824,10 @@ Before retry:
 - Observe only bounded usage metadata.
 - Drain at most 64 KiB.
 - Close the response body.
-- Release the lease.
 - Update account health.
+- Release the lease.
+
+The health update precedes the lease release, and the order is not cosmetic. §20.1, §20.2 and §12 step 21 are the sections that define it, and a waiter woken by the release must observe the account's post-response health rather than the state it had before this dispatch returned. Reversing the two lets a woken waiter select an account that this very response has just put into cooldown, which is the case a cooldown exists to prevent.
 - Append the attempt row.
 - Back off.
 
@@ -2335,6 +2337,8 @@ Events include:
 - Recovered handler panic.
 - Forced shutdown.
 - Recovery clock skew.
+- Stream-signal disagreement, as defined by §13.4.
+- Pin map at its ceiling, at warn level, as defined by §16.2.
 
 Normal successful attempts need not produce duplicate process-log events because SQLite is the durable attempt record.
 
@@ -3266,14 +3270,12 @@ Deliver:
 - Retry budgets/backoff.
 - Class-specific account-choice behavior.
 - Intermediate response drain.
-- Final response commitment rules.
 - Ambiguous-send accounting.
 - The bounded rate-limit header projection of §14.4, if Phase 0 recorded upstream sending one, together with the migration that adds the two columns it fills. Both are this phase’s, in that order; neither is part of the initial migration Phase 2 delivers.
 
 Gate:
 
 - Scripted upstream matrix passes.
-- No retry occurs after commitment.
 - Each dispatch maps to one record.
 - Either the rate-limit columns exist in §15.5, carry their constraint in §15.8, and are read by a §30.3 recipe that §28.13 executes, or Phase 0 recorded no such header family and none of those three places changed. A column that ships in a migration and in none of the three is the drift §0 rule 8 exists to prevent.
 
@@ -3286,6 +3288,7 @@ Deliver:
 - 8 MiB non-streaming precommit buffer and progressive fallback.
 - SSE flushing.
 - Client cancellation.
+- Final response commitment rules.
 - Committed-response abort handling.
 - First-data-event observation.
 - Selective token extraction.
@@ -3295,6 +3298,7 @@ Deliver:
 Gate:
 
 - Byte-for-byte response tests pass.
+- No retry occurs after commitment.
 - Precommit failures retry and post-commit failures abort.
 - Large/slow/truncated streams remain bounded.
 - Privacy-marker tests pass.

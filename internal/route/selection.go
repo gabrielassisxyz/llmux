@@ -36,6 +36,11 @@ type SelectionResult struct {
 	Skips   []SkipDecision
 	Outcome SelectionOutcome
 
+	// SpillFrom is the account a session was pinned to when the selection
+	// spilled to a different account. It is empty when the selection was
+	// not a spill, including when the pinned account itself won.
+	SpillFrom catalog.Account
+
 	// PinMapFull is true when a new session was refused a pin because the
 	// pin map is at its ceiling. The caller logs it; it is not a failure.
 	PinMapFull bool

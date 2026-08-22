@@ -160,46 +160,35 @@ func (c *Coordinator) RemovePin(key SessionKey) {
 // SelectForSession acquires a lease for a session, trying the live pin
 // first. A live pin that is eligible is reserved without shuffling. A pin
 // whose account is disabled is removed and selection falls through to the
-// unpinned flow. A pin that is temporarily saturated or cooling falls
-// through to the unpinned flow; the reopen-aware stall before spill is a
-// later bead's policy layered on top of this lookup.
+// unpinned flow. A pin that is temporarily saturated or cooling is given a
+// reopen-aware bounded stall before the selection spills to an alternative;
+// the spill is marked on the result so the caller can record its source.
 func (c *Coordinator) SelectForSession(ctx context.Context, key SessionKey) SelectionResult {
 	var skips []SkipDecision
-	if lease, skip, found := c.tryPinnedAccount(key); found {
-		if lease != nil {
-			return SelectionResult{Lease: lease, Skips: skips, Outcome: SelectionReserved}
-		}
+
+	pinAccount, hasPin := c.PinAccount(key)
+	if !hasPin {
+		return c.Select(ctx)
+	}
+
+	lease, skip, outcome := c.stallForPin(ctx, key, pinAccount)
+	switch outcome {
+	case pinStallReserved:
+		return SelectionResult{Lease: lease, Skips: skips, Outcome: SelectionReserved}
+	case pinStallCanceled:
+		return SelectionResult{Skips: append(skips, skip), Outcome: SelectionCanceled}
+	}
+
+	// pinStallSpill: the pin could not be preserved. Select among all
+	// accounts and mark the dispatch as a spill when an alternative wins.
+	// A pin that expired or was re-pinned mid-stall produces no skip row.
+	if skip.Account != "" {
 		skips = append(skips, skip)
 	}
-
 	result := c.Select(ctx)
 	result.Skips = append(skips, result.Skips...)
+	if result.Lease != nil && result.Lease.Account() != pinAccount {
+		result.SpillFrom = pinAccount
+	}
 	return result
-}
-
-// tryPinnedAccount attempts to reserve the live pin's account under one
-// lock hold. It reports whether a live pin existed. A disabled pin is
-// removed and reported as a skip; a saturated or cooling pin is reported as
-// a skip and left in place.
-func (c *Coordinator) tryPinnedAccount(key SessionKey) (lease *PendingLease, skip SkipDecision, found bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	pin, ok := c.pins[key]
-	if !ok || pin.state != PinConfirmed {
-		return nil, SkipDecision{}, false
-	}
-	if !c.clk.WallNow().Before(pin.expiry) {
-		delete(c.pins, key)
-		return nil, SkipDecision{}, false
-	}
-
-	lease, outcome := c.reserveLocked(pin.account)
-	if lease != nil {
-		return lease, SkipDecision{}, true
-	}
-	if outcome == SkippedDisabled {
-		delete(c.pins, key)
-	}
-	return nil, SkipDecision{Account: pin.account, Reason: outcome}, true
 }

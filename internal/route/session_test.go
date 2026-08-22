@@ -213,6 +213,9 @@ func TestSelectForSessionRemovesDisabledPin(t *testing.T) {
 	if got := result.Lease.Account(); got == catalog.AccountK2 {
 		t.Errorf("lease account = %v, want a non-disabled account", got)
 	}
+	if result.SpillFrom != catalog.AccountK2 {
+		t.Errorf("SpillFrom = %v, want k2 (the disabled pin)", result.SpillFrom)
+	}
 	if _, ok := c.PinAccount(key); ok {
 		t.Error("disabled pin was not removed")
 	}
@@ -220,7 +223,7 @@ func TestSelectForSessionRemovesDisabledPin(t *testing.T) {
 
 func TestSelectForSessionFallsThroughWhenSaturated(t *testing.T) {
 	perm := testsupport.FixedPermutationSource{Values: []int{0, 1, 2}}
-	c, _ := newSelectionTestCoordinator(perm)
+	c, fake := newSelectionTestCoordinator(perm)
 	key := testSessionKey('a')
 	c.ConfirmPin(key, catalog.AccountK2, 1)
 
@@ -228,19 +231,37 @@ func TestSelectForSessionFallsThroughWhenSaturated(t *testing.T) {
 	c.accounts[accountIndex(catalog.AccountK2)].inFlight = policy.InFlightAttemptsPerAccount
 	c.mu.Unlock()
 
-	result := c.SelectForSession(context.Background(), key)
-	if result.Outcome != SelectionReserved {
-		t.Fatalf("outcome = %v, want SelectionReserved", result.Outcome)
-	}
-	if result.Lease == nil {
-		t.Fatal("SelectForSession returned a nil lease")
-	}
-	if got := result.Lease.Account(); got == catalog.AccountK2 {
-		t.Errorf("lease account = %v, want a spill to another account", got)
-	}
-	// A saturated pin is not disabled, so it must remain.
-	if account, ok := c.PinAccount(key); !ok || account != catalog.AccountK2 {
-		t.Errorf("PinAccount() = %v, %v; want k2, true (saturated pin stays)", account, ok)
+	resultCh := make(chan SelectionResult, 1)
+	go func() {
+		resultCh <- c.SelectForSession(context.Background(), key)
+	}()
+
+	// The stall waits on notification until the grace elapses. Give the
+	// selection goroutine time to reach the wait, then advance the clock
+	// past the grace so the pin is given up and the selection spills.
+	time.Sleep(50 * time.Millisecond)
+	fake.AdvanceMonotonic(policy.SaturatedPinGrace)
+
+	select {
+	case result := <-resultCh:
+		if result.Outcome != SelectionReserved {
+			t.Fatalf("outcome = %v, want SelectionReserved", result.Outcome)
+		}
+		if result.Lease == nil {
+			t.Fatal("SelectForSession returned a nil lease")
+		}
+		if got := result.Lease.Account(); got == catalog.AccountK2 {
+			t.Errorf("lease account = %v, want a spill to another account", got)
+		}
+		if result.SpillFrom != catalog.AccountK2 {
+			t.Errorf("SpillFrom = %v, want k2 (the saturated pin)", result.SpillFrom)
+		}
+		// A saturated pin is not disabled, so it must remain.
+		if account, ok := c.PinAccount(key); !ok || account != catalog.AccountK2 {
+			t.Errorf("PinAccount() = %v, %v; want k2, true (saturated pin stays)", account, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SelectForSession did not return after the grace elapsed")
 	}
 }
 

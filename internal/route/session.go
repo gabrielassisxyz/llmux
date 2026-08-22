@@ -50,6 +50,18 @@ type sessionPin struct {
 
 	// state is provisional or confirmed.
 	state PinState
+
+	// generation identifies the provisional generation a holder is attached
+	// to. It is per-session and resets when the pin is removed, so it is 1
+	// for every provisional pin a session creates. A global counter that
+	// survives removal is a later refinement for cross-recreation
+	// uniqueness; the release-once discipline of the dispatch path makes
+	// the per-session value sufficient today.
+	generation uint64
+
+	// holders counts the requests currently holding the provisional
+	// generation. It is meaningful only while state is PinProvisional.
+	holders int
 }
 
 // PinAccount returns the live confirmed pin for a session, if one exists.
@@ -78,7 +90,12 @@ func (c *Coordinator) PinAccount(key SessionKey) (catalog.Account, bool) {
 func (c *Coordinator) NextArrivalSequence(key SessionKey) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.nextArrivalLocked(key)
+}
 
+// nextArrivalLocked returns the next arrival sequence for a session and
+// advances the counter. The caller must hold c.mu.
+func (c *Coordinator) nextArrivalLocked(key SessionKey) uint64 {
 	pin, ok := c.pins[key]
 	if !ok {
 		return 1

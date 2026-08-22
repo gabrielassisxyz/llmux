@@ -4,15 +4,35 @@ import (
 	"context"
 	"time"
 
+	"github.com/gabrielassisxyz/llmux/internal/catalog"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	"github.com/gabrielassisxyz/llmux/internal/proxy"
 	"github.com/gabrielassisxyz/llmux/internal/store"
 )
 
 // EarliestReopen returns the earliest wall-clock instant at which any
-// account is next known to become eligible, considering the post-start
-// dispatch blackout, each account's rate gate, and each account's rolling
-// RPM window. It returns ok=false when no account has a known reopening
+// account is next known to become eligible. It is the all-accounts form of
+// EarliestReopenFor, used by the flexible selection path.
+func (c *Coordinator) EarliestReopen() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.earliestReopenLocked([]catalog.Account{catalog.AccountK1, catalog.AccountK2, catalog.AccountK3})
+}
+
+// EarliestReopenFor returns the earliest wall-clock instant at which the
+// named account is next known to become eligible. It is the single-account
+// form of EarliestReopen, used by the explicit -kN path whose Retry-After
+// reads only the named account's reopening.
+func (c *Coordinator) EarliestReopenFor(account catalog.Account) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.earliestReopenLocked([]catalog.Account{account})
+}
+
+// earliestReopenLocked computes the earliest wall-clock reopening among the
+// given accounts, considering the post-start dispatch blackout, each
+// account's rate gate, and each account's rolling RPM window. The caller
+// must hold c.mu. It returns ok=false when no account has a known reopening
 // time, which is the in-flight-only case the error envelope answers with a
 // one-second fallback. Disabled accounts contribute nothing: a disabled
 // account stays disabled for the process lifetime.
@@ -22,10 +42,7 @@ import (
 // between its two reads. A wall-clock step between the reads shifts the
 // answer by the step, which is the same cost a wall-clock Retry-After
 // always pays.
-func (c *Coordinator) EarliestReopen() (time.Time, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+func (c *Coordinator) earliestReopenLocked(accounts []catalog.Account) (time.Time, bool) {
 	nowMono := c.clk.MonotonicNow()
 	nowWall := c.clk.WallNow()
 
@@ -42,8 +59,8 @@ func (c *Coordinator) EarliestReopen() (time.Time, bool) {
 		consider(policy.PostStartDispatchBlackout)
 	}
 
-	for i := range c.accounts {
-		state := &c.accounts[i]
+	for _, account := range accounts {
+		state := &c.accounts[accountIndex(account)]
 		if state.health == HealthDisabled {
 			continue
 		}

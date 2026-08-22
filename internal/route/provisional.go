@@ -24,7 +24,8 @@ type ProvisionalPin struct {
 // The returned ProvisionalPin carries the request's arrival sequence (for
 // ConfirmPin on success) and the provisional generation (for
 // ReleaseProvisionalHolder on failure). Generation is zero when no pin was
-// acquired, which happens only when the selection phase itself failed.
+// acquired, which happens when the selection phase failed or when the pin
+// map was full and the request routed unpinned.
 func (c *Coordinator) SelectForNewSession(ctx context.Context, key SessionKey) (SelectionResult, ProvisionalPin) {
 	var skips []SkipDecision
 	var pin ProvisionalPin
@@ -32,14 +33,14 @@ func (c *Coordinator) SelectForNewSession(ctx context.Context, key SessionKey) (
 
 	for {
 		order := c.perm.Perm(3)
-		lease, newPin, passSkips, allDisabled, token, didAcquire := c.selectNewSessionOnce(key, order, attached)
+		lease, newPin, passSkips, allDisabled, token, didAcquire, pinMapFull := c.selectNewSessionOnce(key, order, attached)
 		if didAcquire {
 			attached = true
 			pin = newPin
 		}
 		skips = append(skips, passSkips...)
 		if lease != nil {
-			return SelectionResult{Lease: lease, Skips: skips, Outcome: SelectionReserved}, pin
+			return SelectionResult{Lease: lease, Skips: skips, Outcome: SelectionReserved, PinMapFull: pinMapFull}, pin
 		}
 		if allDisabled {
 			return SelectionResult{Skips: skips, Outcome: SelectionAllDisabled}, pin
@@ -59,8 +60,10 @@ func (c *Coordinator) SelectForNewSession(ctx context.Context, key SessionKey) (
 // selectNewSessionOnce performs one pass of new-session selection under a
 // single lock hold. If a provisional pin exists, it attaches the request
 // (once) and reserves the pin's account. If not, it reserves an account and
-// installs the pin atomically with the reservation.
-func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached bool) (lease *PendingLease, pin ProvisionalPin, skips []SkipDecision, allDisabled bool, token WaitToken, didAcquire bool) {
+// installs the pin atomically with the reservation, unless the pin map is
+// at its ceiling, in which case the request routes unpinned and no entry is
+// created.
+func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached bool) (lease *PendingLease, pin ProvisionalPin, skips []SkipDecision, allDisabled bool, token WaitToken, didAcquire bool, pinMapFull bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -78,7 +81,7 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 		}
 		lease, outcome := c.reserveLocked(existing.account)
 		if lease != nil {
-			return lease, pin, nil, false, nil, didAcquire
+			return lease, pin, nil, false, nil, didAcquire, false
 		}
 		skips = append(skips, SkipDecision{Account: existing.account, Reason: outcome})
 		if outcome == SkippedDisabled {
@@ -86,7 +89,7 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 			// remove it and fall through to normal selection.
 			delete(c.pins, key)
 		} else {
-			return nil, pin, skips, false, c.WaitToken(), didAcquire
+			return nil, pin, skips, false, c.WaitToken(), didAcquire, false
 		}
 	}
 
@@ -97,6 +100,13 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 		account := accountFromIndex(idx)
 		l, outcome := c.reserveLocked(account)
 		if l != nil {
+			c.noteSessionOpLocked()
+			if c.pinMapFullLocked() {
+				// The map is at its ceiling: route unpinned, create no
+				// entry, and warn. The sweep has already run, so the
+				// ceiling is real rather than a pile of expired pins.
+				return l, ProvisionalPin{}, nil, false, nil, false, true
+			}
 			seq := c.nextArrivalLocked(key)
 			c.pins[key] = sessionPin{
 				account:     account,
@@ -107,7 +117,7 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 				holders:     1,
 			}
 			pin = ProvisionalPin{Account: account, Sequence: seq, Generation: 1}
-			return l, pin, nil, false, nil, true
+			return l, pin, nil, false, nil, true, false
 		}
 		skips = append(skips, SkipDecision{Account: account, Reason: outcome})
 		if outcome != SkippedDisabled {
@@ -116,9 +126,9 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 	}
 
 	if !sawRecoverable {
-		return nil, pin, skips, true, nil, false
+		return nil, pin, skips, true, nil, false, false
 	}
-	return nil, pin, skips, false, c.WaitToken(), false
+	return nil, pin, skips, false, c.WaitToken(), false, false
 }
 
 // ReleaseProvisionalHolder releases a request's hold on a provisional pin.
@@ -128,6 +138,8 @@ func (c *Coordinator) selectNewSessionOnce(key SessionKey, order []int, attached
 func (c *Coordinator) ReleaseProvisionalHolder(key SessionKey, generation uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.noteSessionOpLocked()
 
 	pin, ok := c.pins[key]
 	if !ok || pin.state != PinProvisional || pin.generation != generation {

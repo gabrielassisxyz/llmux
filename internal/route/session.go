@@ -72,6 +72,8 @@ func (c *Coordinator) PinAccount(key SessionKey) (catalog.Account, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.noteSessionOpLocked()
+
 	pin, ok := c.pins[key]
 	if !ok || pin.state != PinConfirmed {
 		return "", false
@@ -119,8 +121,16 @@ func (c *Coordinator) ConfirmPin(key SessionKey, account catalog.Account, sequen
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.noteSessionOpLocked()
+
 	pin, ok := c.pins[key]
 	if ok && sequence < pin.sequence {
+		return
+	}
+	if !ok && c.pinMapFullLocked() {
+		// The map is at its ceiling and this session has no pin: refuse to
+		// create one. The response still succeeded; it just earns no
+		// affinity.
 		return
 	}
 

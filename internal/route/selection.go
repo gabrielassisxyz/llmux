@@ -35,6 +35,10 @@ type SelectionResult struct {
 	Lease   *PendingLease
 	Skips   []SkipDecision
 	Outcome SelectionOutcome
+
+	// PinMapFull is true when a new session was refused a pin because the
+	// pin map is at its ceiling. The caller logs it; it is not a failure.
+	PinMapFull bool
 }
 
 // Select acquires a lease for an unpinned base alias by considering the

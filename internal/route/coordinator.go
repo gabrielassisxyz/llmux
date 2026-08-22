@@ -81,6 +81,11 @@ type Coordinator struct {
 	// session digest. It is guarded by mu like every other field.
 	pins map[SessionKey]sessionPin
 
+	// sessionOps counts session operations since the last foreground
+	// sweep. The sweep runs every sessionSweepInterval operations and
+	// removes expired pins, so the ceiling releases itself.
+	sessionOps int
+
 	// notify is closed and replaced under mu by every mutation a waiter
 	// might care about. See notifyLocked and WaitToken in wait.go.
 	notify chan struct{}

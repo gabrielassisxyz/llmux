@@ -77,6 +77,10 @@ type Coordinator struct {
 	clk      clock.Clock
 	perm     clock.PermutationSource
 
+	// pins holds the live session-affinity map, keyed by the versioned
+	// session digest. It is guarded by mu like every other field.
+	pins map[SessionKey]sessionPin
+
 	// notify is closed and replaced under mu by every mutation a waiter
 	// might care about. See notifyLocked and WaitToken in wait.go.
 	notify chan struct{}
@@ -90,7 +94,7 @@ type Coordinator struct {
 // injected permutation source Select uses to order candidate accounts, so
 // tests can drive a deterministic order.
 func NewCoordinator(keys AccountKeys, clk clock.Clock, perm clock.PermutationSource) *Coordinator {
-	c := &Coordinator{clk: clk, perm: perm, notify: make(chan struct{})}
+	c := &Coordinator{clk: clk, perm: perm, notify: make(chan struct{}), pins: make(map[SessionKey]sessionPin)}
 	c.accounts[accountIndex(catalog.AccountK1)] = accountState{label: catalog.AccountK1, key: keys.K1, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK2)] = accountState{label: catalog.AccountK2, key: keys.K2, health: HealthEnabled}
 	c.accounts[accountIndex(catalog.AccountK3)] = accountState{label: catalog.AccountK3, key: keys.K3, health: HealthEnabled}

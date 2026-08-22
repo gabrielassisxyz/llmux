@@ -108,6 +108,25 @@ else
         ok
     fi
 
+    # The request path must never unmarshal the whole body into a general
+    # structure: a map[string]any, any or whole-body struct target would
+    # re-serialise the request, reordering members, respelling numbers and
+    # collapsing duplicates, and the damage is invisible to a semantic test.
+    # The scanner's decodeString is the single exception: it decodes one
+    # already-bounded string span into a string and never re-serialises the
+    # body. Test files are out of scope because assertions legitimately
+    # unmarshal response bodies.
+    section "no whole-body JSON unmarshal"
+    forbidden_unmarshal="$(rg -n --glob '*.go' --glob '!**/*_test.go' -e 'json\.Unmarshal\(' -e 'json\.NewDecoder\(' -e '\.Decode\(' internal/rewrite internal/proxy internal/app || true)"
+    forbidden_unmarshal="$(printf '%s\n' "$forbidden_unmarshal" | grep -v 'json\.Unmarshal(raw, &s)' || true)"
+    if [ -n "$forbidden_unmarshal" ]; then
+        printf '%s\n' "$forbidden_unmarshal" | sed 's/^/    /'
+        printf '    the request path must not unmarshal the body into a general structure\n'
+        bad
+    else
+        ok
+    fi
+
     section "package dependencies"
     if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./internal/... 2>/dev/null | grep -E ' (github.com/gabrielassisxyz/llmux/internal/app|github.com/gabrielassisxyz/llmux/cmd)' >/dev/null; then
         printf '    lower-level package imports internal/app or cmd/llmux\n'

@@ -1,7 +1,6 @@
 package rewrite
 
 import (
-	"context"
 	"errors"
 	"net/http"
 
@@ -9,13 +8,8 @@ import (
 	"github.com/gabrielassisxyz/llmux/internal/proxy"
 )
 
-// UnroutedRequestWriter records a routing-envelope rejection without retaining request content.
-type UnroutedRequestWriter interface {
-	RecordUnroutedRequest(context.Context, proxy.ErrorCode) error
-}
-
 // RequireScannedEnvelope validates the body attached by RequireBoundedBody before passing a request downstream.
-func RequireScannedEnvelope(writer UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
+func RequireScannedEnvelope(writer proxy.UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, ok := RequestBody(r.Context())
 		code, rejected := envelopeRejection(body, ok)

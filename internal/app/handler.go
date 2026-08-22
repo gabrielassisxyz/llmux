@@ -19,7 +19,7 @@ type HandlerDeps struct {
 	Gate           *resource.Gate
 	Clock          clock.Clock
 	AdmissionStore resource.AdmissionStore
-	UnroutedWriter rewrite.UnroutedRequestWriter
+	UnroutedWriter proxy.UnroutedRequestWriter
 }
 
 // BuildHandler composes the request path in the decided identity order and
@@ -43,5 +43,5 @@ func BuildHandler(deps HandlerDeps, handlers proxy.Handlers) http.Handler {
 func withIdentity(deps HandlerDeps, next http.HandlerFunc) http.HandlerFunc {
 	return proxy.AssignRequestID(deps.Generator,
 		proxy.RequireLogicalDeadline(
-			proxy.RequireBearerAuth(deps.AuthDigest, next)))
+			proxy.RequireBearerAuth(deps.UnroutedWriter, deps.AuthDigest, next)))
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"io"
 	"net/http"
@@ -9,6 +10,18 @@ import (
 	"strings"
 	"testing"
 )
+
+// recordingUnroutedWriter captures the codes a rejected request was answered
+// with, so the auth tests can prove a rejected credential leaves exactly one
+// unrouted_request row and an accepted one leaves none.
+type recordingUnroutedWriter struct {
+	codes []ErrorCode
+}
+
+func (w *recordingUnroutedWriter) RecordUnroutedRequest(_ context.Context, code ErrorCode) error {
+	w.codes = append(w.codes, code)
+	return nil
+}
 
 func TestRequireBearerAuth(t *testing.T) {
 	expectedKey := "12345678901234567890123456789012"
@@ -23,7 +36,8 @@ func TestRequireBearerAuth(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	middleware := RequireBearerAuth(expectedDigest, nextHandler)
+	writer := &recordingUnroutedWriter{}
+	middleware := RequireBearerAuth(writer, expectedDigest, nextHandler)
 
 	tests := []struct {
 		name           string
@@ -98,6 +112,7 @@ func TestRequireBearerAuth(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			handlerCalled = false
 			bodyRead = nil
+			writer.codes = nil
 
 			body := []byte("request body")
 			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
@@ -117,6 +132,9 @@ func TestRequireBearerAuth(t *testing.T) {
 				if string(bodyRead) != string(body) {
 					t.Errorf("expected body %q, got %q", string(body), string(bodyRead))
 				}
+				if len(writer.codes) != 0 {
+					t.Errorf("valid credential recorded %d rejections, want 0", len(writer.codes))
+				}
 			} else {
 				if handlerCalled {
 					t.Error("expected next handler NOT to be called")
@@ -132,6 +150,9 @@ func TestRequireBearerAuth(t *testing.T) {
 				if !strings.Contains(out, "invalid_api_key") || !strings.Contains(out, "authentication_error") {
 					t.Errorf("expected authentication error envelope, got %q", out)
 				}
+				if len(writer.codes) != 1 || writer.codes[0] != ErrInvalidAPIKey {
+					t.Errorf("recorded codes = %v, want exactly [%s]", writer.codes, ErrInvalidAPIKey)
+				}
 			}
 		})
 	}
@@ -144,7 +165,8 @@ func TestRequireBearerAuth_NoBodyRead(t *testing.T) {
 	expectedKey := "12345678901234567890123456789012"
 	expectedDigest := sha256.Sum256([]byte(expectedKey))
 
-	middleware := RequireBearerAuth(expectedDigest, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	writer := &recordingUnroutedWriter{}
+	middleware := RequireBearerAuth(writer, expectedDigest, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler should not be called")
 	}))
 
@@ -158,6 +180,10 @@ func TestRequireBearerAuth_NoBodyRead(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", rec.Code)
+	}
+
+	if len(writer.codes) != 1 || writer.codes[0] != ErrInvalidAPIKey {
+		t.Errorf("recorded codes = %v, want exactly [%s]", writer.codes, ErrInvalidAPIKey)
 	}
 
 	// Assert body was not consumed

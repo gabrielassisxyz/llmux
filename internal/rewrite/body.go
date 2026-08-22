@@ -31,7 +31,7 @@ func RequestBody(ctx context.Context) ([]byte, bool) {
 // capacity before that capacity is allocated, and bounded by
 // policy.MaxRequestBodyBytes. It reads the RequestResources attached to the
 // context by resource.RequireResources, which must run first.
-func RequireBoundedBody(writer UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
+func RequireBoundedBody(writer proxy.UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		res := resource.ContextResources(r.Context())
 		body, err := readBoundedBody(r, res)

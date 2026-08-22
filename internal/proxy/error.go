@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -90,6 +91,14 @@ func ErrorStatus(code ErrorCode) int {
 		return def.Status
 	}
 	return http.StatusInternalServerError
+}
+
+// UnroutedRequestWriter records a local rejection as one unrouted_request
+// row. It names ErrorCode and therefore lives here: a middleware that
+// records a rejection, in this package or in rewrite, holds this type
+// without either package importing the other in a cycle.
+type UnroutedRequestWriter interface {
+	RecordUnroutedRequest(context.Context, ErrorCode) error
 }
 
 // WriteError writes the OpenAI-shaped error envelope to the response.

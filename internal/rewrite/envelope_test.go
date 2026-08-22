@@ -181,7 +181,7 @@ func requestWithBody(body string) *http.Request {
 	return request.WithContext(context.WithValue(request.Context(), requestBodyKey, []byte(body)))
 }
 
-func serveEnvelopeRejection(writer UnroutedRequestWriter) string {
+func serveEnvelopeRejection(writer proxy.UnroutedRequestWriter) string {
 	recorder := httptest.NewRecorder()
 	RequireScannedEnvelope(writer, func(http.ResponseWriter, *http.Request) {})(recorder, requestWithBody(`{}`))
 	response := recorder.Result()

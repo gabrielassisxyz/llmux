@@ -14,7 +14,7 @@ import (
 // request. It sits on the identity side of the boundary: the request ID is
 // already assigned, so the rejection carries it and appends one
 // unrouted_request row.
-func RequireIdentityEncoding(writer UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
+func RequireIdentityEncoding(writer proxy.UnroutedRequestWriter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !identityOrAbsentEncoding(r) {
 			reqID, _ := proxy.RequestID(r.Context())

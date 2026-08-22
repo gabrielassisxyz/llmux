@@ -525,8 +525,11 @@ func TestInFlightNeverExceedsTwelveUnderConcurrency(t *testing.T) {
 					cur := current.Add(1)
 					updateMax(&maxConcurrent, cur)
 					lease.Finalize()
-					lease.Release()
+					// Release the observation before the lease so the counter
+					// never lags the coordinator's in-flight count, which is
+					// the only thing enforcing the ceiling.
 					current.Add(-1)
+					lease.Release()
 				case SkippedRateSaturated:
 					return
 				default:

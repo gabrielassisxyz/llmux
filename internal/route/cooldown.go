@@ -43,11 +43,21 @@ type Apply429Result struct {
 // those steps is one in which every concurrent selection can still hand
 // out a credential or a slot this process has already watched upstream
 // refuse.
+//
+// A disabled account is never mutated: Disable is terminal for the process
+// lifetime, and entering cooldown here would be the one path that could
+// later return a disabled account to enabled through gate expiry. The no-op
+// keeps the no-re-enable invariant structural rather than dependent on the
+// caller never classifying a 429 for an account it has already disabled.
 func (c *Coordinator) Apply429(account catalog.Account, header string, responseDate time.Time, hasResponseDate bool) Apply429Result {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	state := &c.accounts[accountIndex(account)]
+	if state.health == HealthDisabled {
+		return Apply429Result{}
+	}
+
 	now := c.clk.MonotonicNow()
 
 	parsed := parseRetryAfter(header, responseDate, hasResponseDate)

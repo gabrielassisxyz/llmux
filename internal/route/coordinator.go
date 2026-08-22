@@ -151,6 +151,18 @@ type PendingLease struct {
 	coord   *Coordinator
 	account catalog.Account
 
+	// reservedAt is the monotonic instant the reservation was granted.
+	reservedAt time.Duration
+
+	// rateWindowAtReserve is the number of dispatch slots the account's
+	// rolling window held at reservation time, including this lease's
+	// pending slot.
+	rateWindowAtReserve int
+
+	// inFlightAtReserve is the account's in-flight count at reservation
+	// time, including this lease.
+	inFlightAtReserve int
+
 	mu    sync.Mutex
 	state pendingLeaseState
 }
@@ -165,6 +177,18 @@ const (
 
 // Account returns the account this lease reserved.
 func (l *PendingLease) Account() catalog.Account { return l.account }
+
+// ReservedAt returns the monotonic instant the reservation was granted.
+func (l *PendingLease) ReservedAt() time.Duration { return l.reservedAt }
+
+// RateWindowAtReserve returns the number of dispatch slots the account's
+// rolling window held at reservation time, including this lease's pending
+// slot.
+func (l *PendingLease) RateWindowAtReserve() int { return l.rateWindowAtReserve }
+
+// InFlightAtReserve returns the account's in-flight count at reservation
+// time, including this lease.
+func (l *PendingLease) InFlightAtReserve() int { return l.inFlightAtReserve }
 
 // Finalize moves the pending reservation into the rolling window. It is safe
 // to call more than once; only the first call has any effect. Finalizing does
@@ -206,8 +230,11 @@ func (l *PendingLease) Release() {
 		if state.pendingReservations > 0 {
 			state.pendingReservations--
 		}
-		state.inFlight--
-	} else {
+	}
+	// The release-once guard above already makes a second decrement
+	// impossible; the floor here is defense in depth so a release can
+	// never drive the counter negative at any observation point.
+	if state.inFlight > 0 {
 		state.inFlight--
 	}
 	l.coord.notifyLocked()
@@ -251,7 +278,13 @@ func (c *Coordinator) reserveLocked(account catalog.Account) (*PendingLease, Res
 
 	state.pendingReservations++
 	state.inFlight++
-	return &PendingLease{coord: c, account: account}, Reserved
+	return &PendingLease{
+		coord:               c,
+		account:             account,
+		reservedAt:          now,
+		rateWindowAtReserve: len(state.dispatchTimestamps) + state.pendingReservations,
+		inFlightAtReserve:   state.inFlight,
+	}, Reserved
 }
 
 // InFlight returns account's current in-flight dispatch count.

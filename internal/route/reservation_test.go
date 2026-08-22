@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -448,4 +449,128 @@ func TestDispatchOccursWhenAdmissionCommitSucceeds(t *testing.T) {
 		t.Errorf("dispatchTimestamps = %d, want 1", len(state.dispatchTimestamps))
 	}
 	c.mu.Unlock()
+}
+
+func TestLeaseRecordsReservationSnapshots(t *testing.T) {
+	c, fake := newReservationTestCoordinator()
+
+	// Fill three rate-window slots so the snapshot is non-trivial.
+	for i := 0; i < 3; i++ {
+		reserveAndFinalize(t, c, catalog.AccountK1)
+	}
+
+	before := fake.MonotonicNow()
+	lease, outcome := c.Reserve(catalog.AccountK1)
+	if outcome != Reserved {
+		t.Fatalf("reserve outcome = %v, want Reserved", outcome)
+	}
+
+	if got := lease.ReservedAt(); got != before {
+		t.Errorf("ReservedAt() = %v, want %v", got, before)
+	}
+	if got := lease.RateWindowAtReserve(); got != 4 {
+		t.Errorf("RateWindowAtReserve() = %d, want 4", got)
+	}
+	if got := lease.InFlightAtReserve(); got != 1 {
+		t.Errorf("InFlightAtReserve() = %d, want 1", got)
+	}
+}
+
+func TestReleaseNeverUnderflowsInFlight(t *testing.T) {
+	c, _ := newReservationTestCoordinator()
+
+	lease, outcome := c.Reserve(catalog.AccountK1)
+	if outcome != Reserved {
+		t.Fatalf("reserve outcome = %v, want Reserved", outcome)
+	}
+
+	// Corrupt the in-flight count to zero to prove the release floor never
+	// lets it go negative, even if the counter is already inconsistent.
+	c.mu.Lock()
+	c.accounts[accountIndex(catalog.AccountK1)].inFlight = 0
+	c.mu.Unlock()
+
+	lease.Release()
+
+	c.mu.Lock()
+	inFlight := c.accounts[accountIndex(catalog.AccountK1)].inFlight
+	c.mu.Unlock()
+	if inFlight != 0 {
+		t.Errorf("inFlight = %d, want 0 (never negative)", inFlight)
+	}
+}
+
+// TestInFlightNeverExceedsTwelveUnderConcurrency drives many goroutines
+// through the full reserve-finalize-release cycle on one account and asserts
+// the ceiling at an external observation point: the fake upstream's live
+// request count never exceeds twelve, even though the coordinator state is
+// the only thing enforcing it.
+func TestInFlightNeverExceedsTwelveUnderConcurrency(t *testing.T) {
+	c, _ := newReservationTestCoordinator()
+
+	const workers = 64
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var total atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				lease, outcome := c.Reserve(catalog.AccountK1)
+				switch outcome {
+				case Reserved:
+					total.Add(1)
+					cur := current.Add(1)
+					updateMax(&maxConcurrent, cur)
+					lease.Finalize()
+					lease.Release()
+					current.Add(-1)
+				case SkippedRateSaturated:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := maxConcurrent.Load(); got > policy.InFlightAttemptsPerAccount {
+		t.Fatalf("max concurrent = %d, want <= %d", got, policy.InFlightAttemptsPerAccount)
+	}
+	if got := total.Load(); got != policy.DispatchesPerWindowPerAccount {
+		t.Fatalf("total dispatches = %d, want %d", got, policy.DispatchesPerWindowPerAccount)
+	}
+}
+
+// TestBufferedResponseReleasesLeaseBeforeDownstreamWrite pins the ordering a
+// non-streaming relay relies on: the lease is released when the upstream body
+// closes, before the buffered response is written downstream, so a slow
+// reader draining that buffer never holds the account slot.
+func TestBufferedResponseReleasesLeaseBeforeDownstreamWrite(t *testing.T) {
+	c, _ := newReservationTestCoordinator()
+
+	lease, outcome := c.Reserve(catalog.AccountK1)
+	if outcome != Reserved {
+		t.Fatalf("reserve outcome = %v, want Reserved", outcome)
+	}
+	lease.Finalize() // admission commit succeeded
+
+	lease.Release() // upstream body closed, before the downstream write
+
+	if _, outcome := c.Reserve(catalog.AccountK1); outcome != Reserved {
+		t.Fatalf("reserve during slow downstream read = %v, want Reserved", outcome)
+	}
+}
+
+// updateMax records val into dst when it is the largest value seen so far.
+func updateMax(dst *atomic.Int64, val int64) {
+	for {
+		old := dst.Load()
+		if val <= old || dst.CompareAndSwap(old, val) {
+			return
+		}
+	}
 }

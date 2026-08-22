@@ -428,16 +428,53 @@ func TestMinuteBoundaryDispatchCounting(t *testing.T) {
 		return n
 	}
 
+	dump := func() {
+		t.Helper()
+		rows, err := s.Writer.QueryContext(ctx, `SELECT record_id, attempt_id, record_kind, event_at_us, finished_at_us FROM attempt_log ORDER BY record_id`)
+		if err != nil {
+			t.Logf("dump attempt_log: %v", err)
+			return
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var recordID, attemptID, kind string
+			var eventAt, finishedAt int64
+			if err := rows.Scan(&recordID, &attemptID, &kind, &eventAt, &finishedAt); err != nil {
+				t.Logf("scan attempt_log: %v", err)
+				return
+			}
+			t.Logf("attempt_log row: record=%s attempt=%s kind=%s event=%d finished=%d", recordID, attemptID, kind, eventAt, finishedAt)
+		}
+		admRows, err := s.Writer.QueryContext(ctx, `SELECT attempt_id, reserved_at_us FROM dispatch_admission ORDER BY attempt_id`)
+		if err != nil {
+			t.Logf("dump dispatch_admission: %v", err)
+			return
+		}
+		defer func() { _ = admRows.Close() }()
+		for admRows.Next() {
+			var attemptID string
+			var reservedAt int64
+			if err := admRows.Scan(&attemptID, &reservedAt); err != nil {
+				t.Logf("scan dispatch_admission: %v", err)
+				return
+			}
+			t.Logf("admission row: attempt=%s reserved=%d", attemptID, reservedAt)
+		}
+	}
+
 	// The straddling admission is counted in the first minute (reservation).
 	if got := count(`SELECT COUNT(*) FROM dispatch_admission WHERE reserved_at_us >= 0 AND reserved_at_us < 60000000`); got != 2 {
+		dump()
 		t.Errorf("first-minute admissions = %d, want 2 (straddle + killed)", got)
 	}
 	// The straddling dispatch is counted in the second minute (call).
 	if got := count(`SELECT COUNT(*) FROM attempt_log WHERE record_kind = 'dispatch' AND event_at_us >= 60000000 AND event_at_us < 120000000`); got != 1 {
+		dump()
 		t.Errorf("second-minute dispatches = %d, want 1 (straddle only)", got)
 	}
 	// The killed admission contributes to the unmatched-admission figure.
 	if got := count(`SELECT COUNT(*) FROM dispatch_admission d WHERE NOT EXISTS (SELECT 1 FROM attempt_log a WHERE a.attempt_id = d.attempt_id)`); got != 1 {
+		dump()
 		t.Errorf("unmatched admissions = %d, want 1 (killed only)", got)
 	}
 }

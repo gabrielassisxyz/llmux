@@ -26,33 +26,45 @@ func newClientRequest(t *testing.T, headers map[string]string) *http.Request {
 	return req
 }
 
-// buildRequest builds an upstream request from a replayed body and returns
-// the request and the dropped-header count. The body is wrapped in an
-// io.MultiReader so http.NewRequest does not attach a GetBody, matching
+// buildRequest builds an upstream request template from a replayed body and
+// returns the request and the dropped-header count. The body is wrapped in
+// an io.MultiReader so http.NewRequest does not attach a GetBody, matching
 // what rewrite.Plan.Reader returns.
-func buildRequest(t *testing.T, clientReq *http.Request, body string, accountKey string, logger *slog.Logger) (*http.Request, int64) {
+func buildRequest(t *testing.T, clientReq *http.Request, body string, logger *slog.Logger) (*http.Request, int64) {
 	t.Helper()
 	var dropped int64
-	req, err := BuildUpstreamRequest(clientReq, io.MultiReader(strings.NewReader(body)), int64(len(body)), accountKey, logger, &dropped)
+	req, err := BuildUpstreamRequest(clientReq, io.MultiReader(strings.NewReader(body)), int64(len(body)), logger, &dropped)
 	if err != nil {
 		t.Fatalf("BuildUpstreamRequest: %v", err)
 	}
 	return req, dropped
 }
 
-func TestBuildUpstreamRequestAccountAuthorizationReplacesClientAuthorization(t *testing.T) {
+func TestBuildUpstreamRequestDropsClientAuthorization(t *testing.T) {
 	clientReq := newClientRequest(t, map[string]string{
 		"Authorization": "Bearer client-secret",
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
-	if got := req.Header.Get("Authorization"); got != "Bearer account-key" {
-		t.Errorf("Authorization = %q, want %q", got, "Bearer account-key")
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want empty (template carries no credential)", got)
 	}
 	if dropped != 1 {
 		t.Errorf("dropped count = %d, want 1 (client Authorization)", dropped)
+	}
+}
+
+func TestSetAccountAuthorization(t *testing.T) {
+	clientReq := newClientRequest(t, nil)
+	logger, _ := newTestLogger(t)
+
+	req, _ := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
+	SetAccountAuthorization(req, "account-key")
+
+	if got := req.Header.Get("Authorization"); got != "Bearer account-key" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer account-key")
 	}
 }
 
@@ -62,7 +74,7 @@ func TestBuildUpstreamRequestDropsSessionHeader(t *testing.T) {
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	if got := req.Header.Get("X-Session-Id"); got != "" {
 		t.Errorf("X-Session-Id = %q, want empty (dropped)", got)
@@ -81,7 +93,7 @@ func TestBuildUpstreamRequestPreservesAllowlistedHeaders(t *testing.T) {
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	for _, name := range []string{"Content-Type", "Accept", "Accept-Encoding", "User-Agent"} {
 		if got, want := req.Header.Get(name), clientReq.Header.Get(name); got != want {
@@ -97,7 +109,7 @@ func TestBuildUpstreamRequestOmitsAllowlistedHeadersWhenAbsent(t *testing.T) {
 	clientReq := newClientRequest(t, nil)
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	for _, name := range []string{"Content-Type", "Accept", "Accept-Encoding"} {
 		if got := req.Header.Get(name); got != "" {
@@ -118,7 +130,7 @@ func TestBuildUpstreamRequestStripsNonAllowlistedHeaders(t *testing.T) {
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	for _, name := range []string{"Cookie", "X-Forwarded-For", "X-Trace-Id", "X-Custom"} {
 		if got := req.Header.Get(name); got != "" {
@@ -136,7 +148,7 @@ func TestBuildUpstreamRequestCountsAndNamesDroppedHeaders(t *testing.T) {
 	})
 	logger, buf := newTestLogger(t)
 
-	_, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	_, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	if dropped != 1 {
 		t.Errorf("dropped count = %d, want 1", dropped)
@@ -154,7 +166,7 @@ func TestBuildUpstreamRequestEmptyUserAgentWhenClientSendsNone(t *testing.T) {
 	clientReq := newClientRequest(t, nil)
 	logger, _ := newTestLogger(t)
 
-	req, _ := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, _ := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	if got := req.Header.Get("User-Agent"); got != "" {
 		t.Errorf("User-Agent = %q, want empty (no synthesized default)", got)
@@ -167,7 +179,7 @@ func TestBuildUpstreamRequestHasNoGetBodyOrIdempotencyHeader(t *testing.T) {
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	if req.GetBody != nil {
 		t.Error("GetBody must be nil so the transport cannot replay the POST")
@@ -187,7 +199,7 @@ func TestBuildUpstreamRequestSetsContentLengthURLAndBody(t *testing.T) {
 	clientReq := newClientRequest(t, nil)
 	logger, _ := newTestLogger(t)
 
-	req, _ := buildRequest(t, clientReq, body, "account-key", logger)
+	req, _ := buildRequest(t, clientReq, body, logger)
 
 	if req.Method != http.MethodPost {
 		t.Errorf("Method = %q, want %q", req.Method, http.MethodPost)
@@ -214,12 +226,11 @@ func TestBuildUpstreamRequestHeadersAreFullyAccounted(t *testing.T) {
 	})
 	logger, _ := newTestLogger(t)
 
-	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, "account-key", logger)
+	req, dropped := buildRequest(t, clientReq, `{"model":"kimi-k2.7"}`, logger)
 
 	want := map[string]bool{
-		"Content-Type":  true,
-		"Authorization": true,
-		"User-Agent":    true,
+		"Content-Type": true,
+		"User-Agent":   true,
 	}
 	for name := range req.Header {
 		if !want[name] {

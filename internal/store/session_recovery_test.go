@@ -52,8 +52,11 @@ func TestRecoverSessionPinsBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k1" {
-		t.Errorf("pins[s1] = %q, want k1", got)
+	if got := pins["s1"].AccountLabel; got != "k1" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k1", got)
+	}
+	if got := pins["s1"].FinishedAtUS; got != 100 {
+		t.Errorf("pins[s1].FinishedAtUS = %d, want 100", got)
 	}
 }
 
@@ -73,8 +76,11 @@ func TestRecoverSessionPinsOutOfOrderArrival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k2" {
-		t.Errorf("pins[s1] = %q, want k2 (later arrival)", got)
+	if got := pins["s1"].AccountLabel; got != "k2" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k2 (later arrival)", got)
+	}
+	if got := pins["s1"].FinishedAtUS; got != 100 {
+		t.Errorf("pins[s1].FinishedAtUS = %d, want 100 (the winner's finish, not the later finish)", got)
 	}
 }
 
@@ -92,8 +98,8 @@ func TestRecoverSessionPinsTieBreakFinishedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k1" {
-		t.Errorf("pins[s1] = %q, want k1 (later finished_at_us)", got)
+	if got := pins["s1"].AccountLabel; got != "k1" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k1 (later finished_at_us)", got)
 	}
 }
 
@@ -110,8 +116,8 @@ func TestRecoverSessionPinsTieBreakRecordID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k2" {
-		t.Errorf("pins[s1] = %q, want k2 (greater record_id)", got)
+	if got := pins["s1"].AccountLabel; got != "k2" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k2 (greater record_id)", got)
 	}
 }
 
@@ -145,8 +151,8 @@ func TestRecoverSessionPinsFailedSpillIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k2" {
-		t.Errorf("pins[s1] = %q, want k2 (successful account)", got)
+	if got := pins["s1"].AccountLabel; got != "k2" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k2 (successful account)", got)
 	}
 }
 
@@ -173,8 +179,8 @@ func TestRecoverSessionPinsReadsNoRateState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverSessionPins() error = %v", err)
 	}
-	if got := pins["s1"]; got != "k1" {
-		t.Errorf("pins[s1] = %q, want k1", got)
+	if got := pins["s1"].AccountLabel; got != "k1" {
+		t.Errorf("pins[s1].AccountLabel = %q, want k1", got)
 	}
 	if len(pins) != 1 {
 		t.Errorf("len(pins) = %d, want 1", len(pins))

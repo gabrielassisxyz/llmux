@@ -5,10 +5,21 @@ import (
 	"fmt"
 )
 
+// RecoveredSessionPin is the startup-recovery result for one session key:
+// the account that served the request that arrived last, and the wall-clock
+// instant that request finished. FinishedAtUS anchors the recovered pin's
+// expiry, which is completion-based by §16.2 rather than measured from the
+// restart instant.
+type RecoveredSessionPin struct {
+	AccountLabel string
+	FinishedAtUS int64
+}
+
 // RecoverSessionPins returns, for every session key with a successful
 // completion at or after sinceUS, the account served by the request that
-// arrived last. Arrival is derived as finished_at_us - logical_elapsed_us;
-// ties go to the later finished_at_us, then the greater record_id.
+// arrived last, together with that request's finished_at_us. Arrival is
+// derived as finished_at_us - logical_elapsed_us; ties go to the later
+// finished_at_us, then the greater record_id.
 //
 // The derived arrival is the single documented cross-clock exposure in the
 // design: a monotonic duration is subtracted from a wall instant. It is an
@@ -16,7 +27,7 @@ import (
 // finishes moves the derived arrivals against each other. The cost is bounded
 // to starting the next turn on the other of two accounts that both hold a
 // recent prefix.
-func (store *Store) RecoverSessionPins(ctx context.Context, sinceUS int64) (map[string]string, error) {
+func (store *Store) RecoverSessionPins(ctx context.Context, sinceUS int64) (map[string]RecoveredSessionPin, error) {
 	rows, err := store.Writer.QueryContext(ctx, `
 		SELECT session_key, account_label, finished_at_us, logical_elapsed_us, record_id
 		FROM attempt_log INDEXED BY idx_attempt_log_session_recovery
@@ -59,9 +70,12 @@ func (store *Store) RecoverSessionPins(ctx context.Context, sinceUS int64) (map[
 		return nil, fmt.Errorf("iterate session recovery rows: %w", err)
 	}
 
-	pins := make(map[string]string, len(best))
+	pins := make(map[string]RecoveredSessionPin, len(best))
 	for sessionKey, c := range best {
-		pins[sessionKey] = c.accountLabel
+		pins[sessionKey] = RecoveredSessionPin{
+			AccountLabel: c.accountLabel,
+			FinishedAtUS: c.finishedAt,
+		}
 	}
 	return pins, nil
 }

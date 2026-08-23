@@ -333,6 +333,8 @@ file_reservation_paths(
 
 Use the narrowest correct path set. Reserve concrete files when known. Use a package glob only when the bead genuinely needs the package surface.
 
+Within `internal/route`, `coordinator.go` and `reservation.go` are the two hot files: the first holds the core types, the constructor and the index helpers, the second holds the two-phase admission algorithm (`Reserve`, `PendingLease`, `Finalize`, `Release`). A bead that changes the admission algorithm reserves `reservation.go`; a bead that changes the core types reserves `coordinator.go`. Reserve the narrowest file that carries the concern, not the file that carries the type.
+
 Set a TTL long enough for the immediate edit, not for the whole day. Renew a reservation that is still active. Release it after the commit has been pushed.
 
 A successful reservation call can still report conflicts. Inspect the conflict list. Do not edit a path reserved by another agent, even if the API returned a lease. Message the holder in the shared bead thread, narrow the paths, or select another bead.

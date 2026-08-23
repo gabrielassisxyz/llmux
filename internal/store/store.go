@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/gabrielassisxyz/llmux/internal/clock"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
 	_ "modernc.org/sqlite"
 )
@@ -17,6 +18,11 @@ type Store struct {
 	Writer      *sql.DB
 	Maintenance *sql.DB
 
+	// clk is the injected clock the store-operation deadline is measured
+	// on. It defaults to the real clock and is overridden only by tests
+	// that need the deadline to be immune to wall-clock load.
+	clk clock.Clock
+
 	checkpointMu        sync.Mutex
 	checkpointRunner    checkpointRunner
 	walSize             walSizeReader
@@ -24,9 +30,18 @@ type Store struct {
 	lastCheckpointWAL   int64
 }
 
-// Open opens the configured SQLite database with the required per-connection pragmas.
+// Open opens the configured SQLite database with the required per-connection
+// pragmas, using the real clock for the store-operation deadline.
 func Open(path string) (*Store, error) {
-	ctx, cancel := OperationContext(context.Background())
+	return OpenWithClock(path, clock.NewRealClock())
+}
+
+// OpenWithClock opens the configured SQLite database with the required
+// per-connection pragmas, measuring the store-operation deadline on clk. It
+// is the test entry point: a fake clock makes the deadline controllable
+// rather than subject to wall-clock load.
+func OpenWithClock(path string, clk clock.Clock) (*Store, error) {
+	ctx, cancel := operationContext(clk, context.Background())
 	defer cancel()
 
 	if err := ensureSecureDatabaseFile(path); err != nil {
@@ -42,7 +57,7 @@ func Open(path string) (*Store, error) {
 		_ = writer.Close()
 		return nil, err
 	}
-	store := &Store{Writer: writer, Maintenance: maintenance, checkpointRunner: sqliteCheckpointRunner{database: maintenance}, walSize: fileWALSize{path: path}}
+	store := &Store{Writer: writer, Maintenance: maintenance, clk: clk, checkpointRunner: sqliteCheckpointRunner{database: maintenance}, walSize: fileWALSize{path: path}}
 	if err := verifySidecarPermissions(path); err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("verify sidecar permissions: %w", err)

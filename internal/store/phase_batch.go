@@ -117,7 +117,7 @@ func (store *Store) InsertPhaseBatch(forceShutdown context.Context, batch PhaseB
 		return fmt.Errorf("phase batch has no terminal row")
 	}
 
-	ctx, cancel := OperationContext(forceShutdown)
+	ctx, cancel := operationContext(store.clk, forceShutdown)
 	defer cancel()
 
 	tx, err := store.Writer.BeginTx(ctx, nil)

@@ -30,7 +30,7 @@ type DispatchAdmission struct {
 // transaction. It reports success or failure unambiguously: a non-nil error means no row
 // was committed, so the caller must not proceed to dispatch.
 func (store *Store) InsertDispatchAdmission(forceShutdown context.Context, admission DispatchAdmission) error {
-	ctx, cancel := OperationContext(forceShutdown)
+	ctx, cancel := operationContext(store.clk, forceShutdown)
 	defer cancel()
 
 	tx, err := store.Writer.BeginTx(ctx, nil)

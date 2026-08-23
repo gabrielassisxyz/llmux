@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/policy"
+	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
 // TestOperationContextExpiresAtStoreCeiling proves the bounded context
@@ -79,6 +80,22 @@ func TestOperationContextIgnoresClientCancellation(t *testing.T) {
 	}
 }
 
+// TestOperationContextDeadlineExpiresWithFakeClock proves the injected clock
+// is the deadline source rather than decoration: a fake clock whose wall is
+// in the past makes the deadline already elapsed, so the context reports
+// context.DeadlineExceeded immediately. If operationContext ignored the
+// injected clock and used the real one, the deadline would be six seconds
+// away and this test would fail.
+func TestOperationContextDeadlineExpiresWithFakeClock(t *testing.T) {
+	fake := testsupport.NewFakeClock(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+	ctx, cancel := operationContext(fake, context.Background())
+	defer cancel()
+
+	if ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("context error = %v, want %v", ctx.Err(), context.DeadlineExceeded)
+	}
+}
+
 // TestSQLiteBusyTimeoutSurvivesShortLock proves SQLite's busy_timeout lets
 // a contended writer wait briefly rather than returning SQLITE_BUSY
 // immediately. This test would fail if the store DSN did not set
@@ -97,7 +114,10 @@ func TestSQLiteBusyTimeoutSurvivesShortLock(t *testing.T) {
 	defer func() { _ = locker.Close() }()
 	release := holdWriteLock(t, locker)
 
-	// Release the lock before busy_timeout expires.
+	// Release the lock before busy_timeout expires. The 500 ms release
+	// leaves a 4.5 s margin below the 5 s busy timeout, so a loaded host
+	// that delays the release goroutine still cannot push the insert past
+	// the timeout.
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		close(release)

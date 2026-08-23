@@ -4,8 +4,10 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/store"
+	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
 // The tests in this file close the remaining items of the store test suite
@@ -383,7 +385,15 @@ func TestStoreCloseClosesBothPools(t *testing.T) {
 // call's interval, and that an admission with no terminal row contributes to
 // the admission figure but not to the dispatch figure.
 func TestMinuteBoundaryDispatchCounting(t *testing.T) {
-	s := openStore(t)
+	// The fake clock's wall is far in the future, so the store-operation
+	// deadline anchored at that wall instant never fires for a wall-clock
+	// reason: this test's subject is SQL counting, not timing.
+	fake := testsupport.NewFakeClock(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))
+	s, err := store.OpenWithClock(filepath.Join(t.TempDir(), "llmux.db"), fake)
+	if err != nil {
+		t.Fatalf("store.OpenWithClock() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
 	ctx := context.Background()
 
 	// Reservation at 59s, Do at 65s: the two instants straddle the 60s

@@ -3,34 +3,38 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gabrielassisxyz/llmux/internal/errcode"
 )
 
-type ErrorCode string
+// ErrorCode is re-exported from internal/errcode so the error envelope and
+// the packages that answer it keep one vocabulary while internal/route can
+// name the same codes without importing this package.
+type ErrorCode = errcode.ErrorCode
 
 const (
-	ErrInvalidAPIKey              ErrorCode = "invalid_api_key"
-	ErrMethodNotAllowed           ErrorCode = "method_not_allowed"
-	ErrNotFound                   ErrorCode = "not_found"
-	ErrQueryNotSupported          ErrorCode = "query_not_supported"
-	ErrInvalidSessionHeader       ErrorCode = "invalid_session_header"
-	ErrRequestTooLarge            ErrorCode = "request_too_large"
-	ErrUnsupportedContentEncoding ErrorCode = "unsupported_content_encoding"
-	ErrInvalidRequest             ErrorCode = "invalid_request"
-	ErrJSONDepthExceeded          ErrorCode = "json_depth_exceeded"
-	ErrModelNotFound              ErrorCode = "model_not_found"
-	ErrProxyOverloaded            ErrorCode = "proxy_overloaded"
-	ErrAccountCapacityTimeout     ErrorCode = "account_capacity_timeout"
-	ErrAdmissionStoreUnavailable  ErrorCode = "admission_store_unavailable"
-	ErrAccountUnavailable         ErrorCode = "account_unavailable"
-	ErrUpstreamAuthFailure        ErrorCode = "upstream_auth_failure"
-	ErrUpstreamUnavailable        ErrorCode = "upstream_unavailable"
-	ErrInvalidUpstreamResponse    ErrorCode = "invalid_upstream_response"
-	ErrDeadlineExceeded           ErrorCode = "deadline_exceeded"
-	ErrInternalError              ErrorCode = "internal_error"
+	ErrInvalidAPIKey              = errcode.ErrInvalidAPIKey
+	ErrMethodNotAllowed           = errcode.ErrMethodNotAllowed
+	ErrNotFound                   = errcode.ErrNotFound
+	ErrQueryNotSupported          = errcode.ErrQueryNotSupported
+	ErrInvalidSessionHeader       = errcode.ErrInvalidSessionHeader
+	ErrRequestTooLarge            = errcode.ErrRequestTooLarge
+	ErrUnsupportedContentEncoding = errcode.ErrUnsupportedContentEncoding
+	ErrInvalidRequest             = errcode.ErrInvalidRequest
+	ErrJSONDepthExceeded          = errcode.ErrJSONDepthExceeded
+	ErrModelNotFound              = errcode.ErrModelNotFound
+	ErrProxyOverloaded            = errcode.ErrProxyOverloaded
+	ErrAccountCapacityTimeout     = errcode.ErrAccountCapacityTimeout
+	ErrAdmissionStoreUnavailable  = errcode.ErrAdmissionStoreUnavailable
+	ErrAccountUnavailable         = errcode.ErrAccountUnavailable
+	ErrUpstreamAuthFailure        = errcode.ErrUpstreamAuthFailure
+	ErrUpstreamUnavailable        = errcode.ErrUpstreamUnavailable
+	ErrInvalidUpstreamResponse    = errcode.ErrInvalidUpstreamResponse
+	ErrDeadlineExceeded           = errcode.ErrDeadlineExceeded
+	ErrInternalError              = errcode.ErrInternalError
 )
 
 type ErrorType string
@@ -125,20 +129,6 @@ func WriteError(w http.ResponseWriter, reqID string, code ErrorCode) {
 	_ = json.NewEncoder(w).Encode(env)
 }
 
-// CalculateRetryAfter returns the Retry-After header value in whole seconds, rounded up.
-// It is never less than 1.
-func CalculateRetryAfter(reopen time.Time, now time.Time) int {
-	if reopen.IsZero() || reopen.Before(now) {
-		return 1
-	}
-	diff := reopen.Sub(now).Seconds()
-	sec := int(math.Ceil(diff))
-	if sec < 1 {
-		return 1
-	}
-	return sec
-}
-
 // WriteRateLimitError writes a 429 error and includes the Retry-After header.
 func WriteRateLimitError(w http.ResponseWriter, reqID string, code ErrorCode, reopen time.Time, now time.Time) {
 	errDef, ok := errorsByCode[code]
@@ -151,7 +141,7 @@ func WriteRateLimitError(w http.ResponseWriter, reqID string, code ErrorCode, re
 		w.Header().Set("X-LLMux-Request-ID", reqID)
 	}
 
-	retryAfter := CalculateRetryAfter(reopen, now)
+	retryAfter := errcode.CalculateRetryAfter(reopen, now)
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 
 	w.WriteHeader(errDef.Status)

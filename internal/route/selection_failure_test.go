@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/errcode"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
-	"github.com/gabrielassisxyz/llmux/internal/proxy"
 	"github.com/gabrielassisxyz/llmux/internal/store"
 )
 
@@ -118,7 +118,7 @@ func TestRetryAfterFromEarliestReopen(t *testing.T) {
 	if !ok {
 		t.Fatal("EarliestReopen() = false, want true")
 	}
-	if got := proxy.CalculateRetryAfter(reopen, fake.WallNow()); got != 30 {
+	if got := errcode.CalculateRetryAfter(reopen, fake.WallNow()); got != 30 {
 		t.Errorf("Retry-After = %d, want 30", got)
 	}
 }
@@ -136,7 +136,7 @@ func TestRetryAfterInFlightOnlyFallsBackToOne(t *testing.T) {
 	if ok {
 		t.Fatal("EarliestReopen() = true, want false")
 	}
-	if got := proxy.CalculateRetryAfter(reopen, fake.WallNow()); got != 1 {
+	if got := errcode.CalculateRetryAfter(reopen, fake.WallNow()); got != 1 {
 		t.Errorf("Retry-After = %d, want 1 for in-flight-only", got)
 	}
 }
@@ -167,8 +167,8 @@ func TestClassifySelectionFailureCapacityTimeout(t *testing.T) {
 	c.mu.Unlock()
 
 	failure := c.ClassifySelectionFailure(SelectionResult{Outcome: SelectionCapacityTimeout}, nil)
-	if failure.Code != proxy.ErrAccountCapacityTimeout {
-		t.Errorf("Code = %q, want %q", failure.Code, proxy.ErrAccountCapacityTimeout)
+	if failure.Code != errcode.ErrAccountCapacityTimeout {
+		t.Errorf("Code = %q, want %q", failure.Code, errcode.ErrAccountCapacityTimeout)
 	}
 	if failure.Outcome != store.OutcomeCapacityTimeout {
 		t.Errorf("Outcome = %q, want %q", failure.Outcome, store.OutcomeCapacityTimeout)
@@ -182,8 +182,8 @@ func TestClassifySelectionFailureAllDisabled(t *testing.T) {
 	c, _ := newRateTestCoordinator()
 
 	failure := c.ClassifySelectionFailure(SelectionResult{Outcome: SelectionAllDisabled}, nil)
-	if failure.Code != proxy.ErrAccountUnavailable {
-		t.Errorf("Code = %q, want %q", failure.Code, proxy.ErrAccountUnavailable)
+	if failure.Code != errcode.ErrAccountUnavailable {
+		t.Errorf("Code = %q, want %q", failure.Code, errcode.ErrAccountUnavailable)
 	}
 	if failure.Outcome != store.OutcomeNoAccountAvailable {
 		t.Errorf("Outcome = %q, want %q", failure.Outcome, store.OutcomeNoAccountAvailable)
@@ -197,8 +197,8 @@ func TestClassifySelectionFailureDeadline(t *testing.T) {
 	c, _ := newRateTestCoordinator()
 
 	failure := c.ClassifySelectionFailure(SelectionResult{Outcome: SelectionCanceled}, context.DeadlineExceeded)
-	if failure.Code != proxy.ErrDeadlineExceeded {
-		t.Errorf("Code = %q, want %q", failure.Code, proxy.ErrDeadlineExceeded)
+	if failure.Code != errcode.ErrDeadlineExceeded {
+		t.Errorf("Code = %q, want %q", failure.Code, errcode.ErrDeadlineExceeded)
 	}
 	if failure.Outcome != store.OutcomeDeadlineExceeded {
 		t.Errorf("Outcome = %q, want %q", failure.Outcome, store.OutcomeDeadlineExceeded)

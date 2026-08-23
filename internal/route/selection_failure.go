@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/catalog"
+	"github.com/gabrielassisxyz/llmux/internal/errcode"
 	"github.com/gabrielassisxyz/llmux/internal/policy"
-	"github.com/gabrielassisxyz/llmux/internal/proxy"
 	"github.com/gabrielassisxyz/llmux/internal/store"
 )
 
@@ -105,7 +105,7 @@ func SkipReasonFor(outcome ReservationOutcome) store.SkipReason {
 // is a 429 code and zero when the only blockers are in-flight slots; Outcome
 // is the store outcome the phase's terminal row records.
 type SelectionFailure struct {
-	Code       proxy.ErrorCode
+	Code       errcode.ErrorCode
 	RetryAfter time.Time
 	Outcome    store.Outcome
 }
@@ -119,13 +119,13 @@ type SelectionFailure struct {
 func (c *Coordinator) ClassifySelectionFailure(result SelectionResult, ctxErr error) SelectionFailure {
 	switch result.Outcome {
 	case SelectionAllDisabled:
-		return SelectionFailure{Code: proxy.ErrAccountUnavailable, Outcome: store.OutcomeNoAccountAvailable}
+		return SelectionFailure{Code: errcode.ErrAccountUnavailable, Outcome: store.OutcomeNoAccountAvailable}
 	case SelectionCapacityTimeout:
 		reopen, _ := c.EarliestReopen()
-		return SelectionFailure{Code: proxy.ErrAccountCapacityTimeout, RetryAfter: reopen, Outcome: store.OutcomeCapacityTimeout}
+		return SelectionFailure{Code: errcode.ErrAccountCapacityTimeout, RetryAfter: reopen, Outcome: store.OutcomeCapacityTimeout}
 	case SelectionCanceled:
 		if ctxErr == context.DeadlineExceeded {
-			return SelectionFailure{Code: proxy.ErrDeadlineExceeded, Outcome: store.OutcomeDeadlineExceeded}
+			return SelectionFailure{Code: errcode.ErrDeadlineExceeded, Outcome: store.OutcomeDeadlineExceeded}
 		}
 		return SelectionFailure{Outcome: store.OutcomeClientCanceled}
 	default:

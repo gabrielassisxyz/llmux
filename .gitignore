@@ -69,3 +69,10 @@
 # which is the worst possible failure of an advisory lock. Ignored so it can never be
 # committed; delete it when it appears.
 /storage.sqlite3
+
+# Output of the closed-bead compliance audit. Every pass writes evidence packs, raw
+# test logs and scorecards for the whole bead graph, which is maintainer material of
+# the same kind as the tracker itself: it records what was doubted and re-derived, not
+# what the software does. The directory carries its own git repository so the history
+# of passes survives without entering this one.
+/beads_compliance_audit/

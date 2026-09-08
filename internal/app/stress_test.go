@@ -185,7 +185,7 @@ func chatHandler(deps proxy.DispatchDeps) http.HandlerFunc {
 			}
 			return
 		}
-		defer result.Response.Body.Close()
+		defer func() { _ = result.Response.Body.Close() }()
 		defer result.Lease.Release()
 		w.WriteHeader(result.Response.StatusCode)
 		_, _ = io.Copy(w, result.Response.Body)

@@ -8,8 +8,14 @@ import (
 // AdmissionWriter is the narrow store surface a dispatch uses to commit its
 // pre-dispatch evidence row. A real implementation writes to SQLite; a fake can
 // return any error the dispatch path must handle as fail-closed.
+//
+// The caller must pass the application force-shutdown context, never the
+// client request context. The implementation bounds the write from this
+// argument, so passing the request context lets a client that goes away
+// cancel BeginTx, and the dispatch is refused exactly when the client is
+// gone, which invariant 28 forbids.
 type AdmissionWriter interface {
-	InsertDispatchAdmission(ctx context.Context, admission DispatchAdmission) error
+	InsertDispatchAdmission(forceShutdown context.Context, admission DispatchAdmission) error
 }
 
 // DispatchAdmission is the pre-dispatch evidence row written synchronously after the

@@ -17,6 +17,11 @@ type UnroutedRequest struct {
 }
 
 // InsertUnroutedRequest appends one locally rejected request in its own transaction.
+//
+// The caller must pass the application force-shutdown context, never the
+// client request context. The write is bounded from this argument, so passing
+// the request context lets a client that goes away cancel the transaction,
+// and the rejection evidence is lost exactly when the client is gone.
 func (store *Store) InsertUnroutedRequest(forceShutdown context.Context, request UnroutedRequest) error {
 	ctx, cancel := OperationContext(forceShutdown)
 	defer cancel()

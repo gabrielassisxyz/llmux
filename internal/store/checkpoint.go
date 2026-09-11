@@ -45,6 +45,11 @@ func (reader fileWALSize) Size() (int64, error) {
 }
 
 // AfterTerminalCommit attempts a passive maintenance checkpoint when the interval or WAL threshold requires it.
+//
+// The caller must pass the application force-shutdown context, never the
+// client request context. The checkpoint is bounded from this argument, so
+// passing the request context lets a client that goes away abandon
+// maintenance the shutdown sequence still owes.
 func (store *Store) AfterTerminalCommit(forceShutdown context.Context) (bool, error) {
 	store.checkpointMu.Lock()
 	defer store.checkpointMu.Unlock()
@@ -68,6 +73,11 @@ func (store *Store) AfterTerminalCommit(forceShutdown context.Context) (bool, er
 }
 
 // CheckpointOnShutdown attempts the final passive maintenance checkpoint after the stop row.
+//
+// The caller must pass the application force-shutdown context, never a
+// request context. The checkpoint is bounded from this argument, so an
+// already cancelled context abandons the final checkpoint and shutdown
+// completes without it.
 func (store *Store) CheckpointOnShutdown(forceShutdown context.Context) error {
 	ctx, cancel := OperationContext(forceShutdown)
 	defer cancel()

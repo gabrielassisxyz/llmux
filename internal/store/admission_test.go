@@ -5,8 +5,10 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gabrielassisxyz/llmux/internal/store"
+	"github.com/gabrielassisxyz/llmux/internal/testsupport"
 )
 
 func TestInsertDispatchAdmissionWritesRow(t *testing.T) {
@@ -207,6 +209,53 @@ func TestInsertDispatchAdmissionCanceledContextReturnsError(t *testing.T) {
 
 	if countAdmissions(t, s, "request-cancel") != 0 {
 		t.Fatal("canceled insert left a row behind")
+	}
+}
+
+// TestInsertDispatchAdmissionCommitsOnForceShutdownAfterClientCancel proves the
+// admission write is bounded from the force-shutdown context rather than the
+// client request context. The client context is already cancelled when the
+// write runs through the AdmissionWriter interface, yet the row commits
+// because the store only sees forceShutdown. Passing the cancelled client
+// context in its place fails the write, which is the mistake a handler makes
+// when it forwards the request context.
+func TestInsertDispatchAdmissionCommitsOnForceShutdownAfterClientCancel(t *testing.T) {
+	// The fake wall is far in the future, so the store-operation deadline
+	// anchored at that instant never fires for a wall-clock reason: this
+	// test's subject is context parentage, not timing.
+	fake := testsupport.NewFakeClock(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))
+	s, err := store.OpenWithClock(filepath.Join(t.TempDir(), "llmux.db"), fake)
+	if err != nil {
+		t.Fatalf("store.OpenWithClock() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	cancelClient()
+	if err := clientCtx.Err(); err != context.Canceled {
+		t.Fatalf("client context error = %v, want %v", err, context.Canceled)
+	}
+
+	forceShutdown, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	var writer store.AdmissionWriter = s
+	if err := writer.InsertDispatchAdmission(forceShutdown, store.DispatchAdmission{
+		AttemptID:        "attempt-force-shutdown",
+		LogicalRequestID: "request-force-shutdown",
+		AttemptNo:        1,
+		AccountLabel:     "k1",
+		RequestedAlias:   "a",
+		UpstreamModel:    "b",
+		ReservedAtUS:     1,
+		LimiterRPMUsed:   0,
+		LimiterInFlight:  0,
+	}); err != nil {
+		t.Fatalf("InsertDispatchAdmission() error = %v", err)
+	}
+
+	if row := readAdmission(t, s, "attempt-force-shutdown"); row.logicalRequestID != "request-force-shutdown" {
+		t.Fatalf("logical_request_id = %q, want request-force-shutdown", row.logicalRequestID)
 	}
 }
 

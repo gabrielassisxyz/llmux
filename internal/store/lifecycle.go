@@ -25,11 +25,19 @@ type ProcessStopEvent struct {
 }
 
 // InsertProcessStart appends one process_start event.
+//
+// The caller must pass the application force-shutdown context. The write is
+// bounded from this argument, so an already cancelled context aborts the
+// transaction and the start event is lost.
 func (store *Store) InsertProcessStart(forceShutdown context.Context, event ProcessStartEvent) error {
 	return store.insertProcessEvent(forceShutdown, event.RecordID, event.ProcessInstanceID, "process_start", "process start", event.AtUS, nil, event.Version, event.Revision)
 }
 
 // InsertProcessStop appends one process_stop event.
+//
+// The caller must pass the application force-shutdown context. The write is
+// bounded from this argument, so an already cancelled context aborts the
+// transaction and the stop event is lost.
 func (store *Store) InsertProcessStop(forceShutdown context.Context, event ProcessStopEvent) error {
 	elapsed := event.ProcessElapsedUS
 	return store.insertProcessEvent(forceShutdown, event.RecordID, event.ProcessInstanceID, "process_stop", "process stop", event.AtUS, &elapsed, event.Version, event.Revision)

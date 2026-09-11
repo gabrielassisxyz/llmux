@@ -104,8 +104,14 @@ func (PhaseFailure) phaseTerminal()  {}
 
 // PhaseBatchWriter is the narrow store surface a dispatch handler uses to
 // commit the terminal evidence for one selection phase.
+//
+// The caller must pass the application force-shutdown context, never the
+// client request context. The implementation bounds the write from this
+// argument, so passing the request context lets a client that goes away
+// cancel the transaction, and terminal persistence is lost exactly when the
+// client is gone, which invariant 28 forbids.
 type PhaseBatchWriter interface {
-	InsertPhaseBatch(ctx context.Context, batch PhaseBatch) error
+	InsertPhaseBatch(forceShutdown context.Context, batch PhaseBatch) error
 }
 
 // InsertPhaseBatch writes all rows for one terminal selection phase in a single

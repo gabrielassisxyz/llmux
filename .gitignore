@@ -76,3 +76,14 @@
 # what the software does. The directory carries its own git repository so the history
 # of passes survives without entering this one.
 /beads_compliance_audit/
+
+# Reproduction artifacts of the model-based coordinator suite. A failing
+# sequence writes its recorded draws here so the failure can be replayed while
+# the defect is open, and the seed is printed alongside, which is the part
+# worth sharing. The file itself is not a regression fixture: a recorded
+# failing prefix is shorter than a passing sequence, so the moment the defect
+# is fixed the recording runs out of draws partway through and is reported as
+# no longer valid on every run afterwards. What survives a fix is the shrunk
+# sequence transcribed into a named example test, so these files are local
+# scratch and never belong in the tree.
+/internal/route/testdata/rapid/

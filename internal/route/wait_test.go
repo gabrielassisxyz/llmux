@@ -46,35 +46,40 @@ func TestWaitReturnsNotifiedWhenTokenFires(t *testing.T) {
 }
 
 // TestWaitReturnsCanceledPromptly proves a canceled waiter exits without
-// waiting for the account-acquisition ceiling.
+// waiting for the account-acquisition ceiling. The timeout-guarded join
+// proves promptness, which is a different property from leak freedom, so
+// the body is also wrapped in AssertNoGoroutineLeak: a waiter that returns
+// from Wait but leaves a goroutine behind would pass the join alone.
 func TestWaitReturnsCanceledPromptly(t *testing.T) {
-	c := testCoordinator()
+	testsupport.AssertNoGoroutineLeak(t, func() {
+		c := testCoordinator()
 
-	c.mu.Lock()
-	token := c.WaitToken()
-	c.mu.Unlock()
+		c.mu.Lock()
+		token := c.WaitToken()
+		c.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	outcomeCh := make(chan WaitOutcome, 1)
-	start := time.Now()
-	go func() {
-		outcomeCh <- c.Wait(ctx, token)
-	}()
+		ctx, cancel := context.WithCancel(context.Background())
+		outcomeCh := make(chan WaitOutcome, 1)
+		start := time.Now()
+		go func() {
+			outcomeCh <- c.Wait(ctx, token)
+		}()
 
-	time.Sleep(20 * time.Millisecond)
-	cancel()
+		time.Sleep(20 * time.Millisecond)
+		cancel()
 
-	select {
-	case outcome := <-outcomeCh:
-		if outcome != WaitCanceled {
-			t.Fatalf("outcome = %v, want WaitCanceled", outcome)
+		select {
+		case outcome := <-outcomeCh:
+			if outcome != WaitCanceled {
+				t.Fatalf("outcome = %v, want WaitCanceled", outcome)
+			}
+			if elapsed := time.Since(start); elapsed >= time.Second {
+				t.Fatalf("canceled wait took %v, want well under the account-acquisition ceiling", elapsed)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Wait did not return after cancellation")
 		}
-		if elapsed := time.Since(start); elapsed >= time.Second {
-			t.Fatalf("canceled wait took %v, want well under the account-acquisition ceiling", elapsed)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Wait did not return after cancellation")
-	}
+	})
 }
 
 // TestWaitTimesOutAtTheAccountAcquisitionCeiling proves the 60-second
@@ -201,47 +206,50 @@ func TestNoLostWakeupOnTokenReplacement(t *testing.T) {
 }
 
 // TestManyCanceledWaitersExitWithoutLeaking drives many concurrent waiters,
-// cancels them all, and joins every one through a WaitGroup: a goroutine
-// leak here would leave the WaitGroup permanently un-Done and the test
-// would hang past its own deadline instead of passing.
+// cancels them all, and joins every one through a WaitGroup. The join
+// proves every waiter returned promptly; it cannot catch a waiter that
+// exits Wait but leaves a goroutine behind, so the goroutine count is
+// asserted back at its baseline before the test passes.
 func TestManyCanceledWaitersExitWithoutLeaking(t *testing.T) {
-	c := testCoordinator()
-	const waiters = 200
+	testsupport.AssertNoGoroutineLeak(t, func() {
+		c := testCoordinator()
+		const waiters = 200
 
-	c.mu.Lock()
-	token := c.WaitToken()
-	c.mu.Unlock()
+		c.mu.Lock()
+		token := c.WaitToken()
+		c.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	results := make(chan WaitOutcome, waiters)
-	for i := 0; i < waiters; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results <- c.Wait(ctx, token)
-		}()
-	}
-
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("not every waiter exited after cancellation; possible goroutine leak")
-	}
-	close(results)
-
-	for outcome := range results {
-		if outcome != WaitCanceled {
-			t.Errorf("outcome = %v, want WaitCanceled", outcome)
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		results := make(chan WaitOutcome, waiters)
+		for i := 0; i < waiters; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results <- c.Wait(ctx, token)
+			}()
 		}
-	}
+
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("not every waiter exited after cancellation; possible goroutine leak")
+		}
+		close(results)
+
+		for outcome := range results {
+			if outcome != WaitCanceled {
+				t.Errorf("outcome = %v, want WaitCanceled", outcome)
+			}
+		}
+	})
 }

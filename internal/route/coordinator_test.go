@@ -72,9 +72,6 @@ func TestNewCoordinatorInitializesAllAccountFields(t *testing.T) {
 		if len(state.recent429s) != 0 {
 			t.Errorf("%s recent429s = %v, want empty", state.label, state.recent429s)
 		}
-		if state.notifyGeneration != 0 {
-			t.Errorf("%s notifyGeneration = %d, want zero", state.label, state.notifyGeneration)
-		}
 		if state.inFlight != 0 {
 			t.Errorf("%s inFlight = %d, want zero", state.label, state.inFlight)
 		}

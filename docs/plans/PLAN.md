@@ -1397,7 +1397,8 @@ Each contains:
 - Health state.
 - Rate gate deadline, advanced by any 429 and floored by the cooldown circuit.
 - Recent 429 timestamps.
-- Notification generation.
+
+There is no per-account notification generation. Waiters are woken by the coordinator-level replace-on-notify channel of §17.3, which closes and replaces one channel for every state change any waiter could care about, so a counter per account would be a second mechanism for the same wake and nothing would read it.
 
 Health states:
 

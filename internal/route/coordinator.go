@@ -50,10 +50,6 @@ type accountState struct {
 	// recent429s holds the monotonic instant of each 429 the cooldown
 	// circuit has not yet consumed.
 	recent429s []time.Duration
-
-	// notifyGeneration increments on any state change a waiter cares
-	// about, so a replace-on-notify channel knows to wake.
-	notifyGeneration uint64
 }
 
 // AccountKeys holds the three upstream account credentials a Coordinator is

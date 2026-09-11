@@ -577,3 +577,38 @@ func updateMax(dst *atomic.Int64, val int64) {
 		}
 	}
 }
+
+// TestLeaseFinalizeAnchorsTheWindowAtFinalizeNotReservation is the lease-path
+// counterpart of TestDispatchTimestampAnchoredAtFinalizeNotReservation, which
+// covers only the rate-only ReserveRateSlot/FinalizeDispatch pair. Both paths
+// append to the same deque, so invariant 31 was asserted for one of them and
+// not for the other: dating this one at the reservation passed every test in
+// this package. The model-based suite found it, and this is the sequence it
+// shrank to, transcribed so that it runs on its own.
+func TestLeaseFinalizeAnchorsTheWindowAtFinalizeNotReservation(t *testing.T) {
+	c, fake := newReservationTestCoordinator()
+
+	lease, outcome := c.Reserve(catalog.AccountK1)
+	if outcome != Reserved {
+		t.Fatalf("outcome = %v, want Reserved", outcome)
+	}
+	reservedAt := fake.MonotonicNow()
+
+	// A slow admission commit: time passes with the reservation open,
+	// before the dispatch it authorizes ever happens.
+	fake.AdvanceMonotonic(time.Second)
+	lease.Finalize()
+	finalizedAt := fake.MonotonicNow()
+
+	c.mu.Lock()
+	stored := c.accounts[accountIndex(catalog.AccountK1)].dispatchTimestamps
+	c.mu.Unlock()
+
+	if len(stored) != 1 {
+		t.Fatalf("dispatch timestamps = %v, want exactly one", stored)
+	}
+	if stored[0] != finalizedAt {
+		t.Fatalf("stored timestamp = %v, want the finalize instant %v (reserved at %v)",
+			stored[0], finalizedAt, reservedAt)
+	}
+}

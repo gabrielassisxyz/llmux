@@ -77,7 +77,9 @@
 //     live. TestReleaseProvisionalHolderRemovesPinOnLastHolder.
 //  31. The rolling window is measured over http.Client.Do invocation instants,
 //     and a pending reservation occupies a slot from grant until finalize or
-//     cancel. TestDispatchTimestampAnchoredAtFinalizeNotReservation.
+//     cancel. Both commit paths append to the same deque, so each needs its
+//     own assertion. TestDispatchTimestampAnchoredAtFinalizeNotReservation,
+//     TestLeaseFinalizeAnchorsTheWindowAtFinalizeNotReservation.
 //  32. No dispatch occurs during the first full rolling window of a process's
 //     life. TestNoDispatchAdmittedDuringTheBlackout,
 //     TestFirstAdmissionAfterTheBlackoutSucceeds.

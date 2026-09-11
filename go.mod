@@ -4,7 +4,10 @@ go 1.26
 
 toolchain go1.26.6
 
-require modernc.org/sqlite v1.56.0
+require (
+	modernc.org/sqlite v1.56.0
+	pgregory.net/rapid v1.3.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

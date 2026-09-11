@@ -5,9 +5,12 @@
 //
 // The concurrency invariants below are the properties the coordinator and
 // its callers must hold jointly. Each is documented near the code that
-// constrains it, and each has at least one test that can fail. Invariants
-// owned by a later phase are listed with their owner so none is left
-// without one.
+// constrains it. Every invariant this phase owns names at least one test
+// that can fail; the six this phase does not own name the phase that owes
+// the test instead, so a property with no assertion behind it is visible as
+// such rather than indistinguishable from one that has passed. Those six are
+// 13, which the lifecycle phase owes, and 14, 15, 19, 23 and 24, which the
+// relay phase owes.
 //
 //  1. Account and session state has one owner, the coordinator.
 //     TestNewCoordinatorCreatesExactlyThreeAccounts.
@@ -35,16 +38,19 @@
 //  12. Database insertion order does not define request sequence; sequence_no
 //     does. Store schema_attempt_log tests.
 //  13. Shutdown cannot close SQLite while active handlers may still append.
-//     Owned by the shutdown phase.
-//  14. Downstream commitment is a monotonic state transition. Owned by relay.
-//  15. A committed response can never return to the retry state. Owned by relay.
+//     No test yet: owed by the lifecycle phase.
+//  14. Downstream commitment is a monotonic state transition. No test yet:
+//     owed by the relay phase.
+//  15. A committed response can never return to the retry state. No test yet:
+//     owed by the relay phase.
 //  16. Account health mutation and limiter admission use the same account
 //     identity. TestSingle429GatesOnlyThatAccountForTheStatedDelay.
 //  17. Pinned variants never create new account state.
 //     TestBaseAndPinnedAliasesShareTheSameAccountCount.
 //  18. Process logs and SQLite writes occur after coordinator unlock.
 //     TestPackagePerformsNoIO.
-//  19. Observer errors cannot affect response relay. Owned by relay.
+//  19. Observer errors cannot affect response relay. No test yet: owed by
+//     the relay phase.
 //  20. Client cancellation propagates through waiting, backoff, upstream I/O
 //     and database calls. TestWaitReturnsCanceledPromptly,
 //     TestManyCanceledWaitersExitWithoutLeaking.
@@ -56,9 +62,10 @@
 //     accounts under concurrent arrival.
 //     TestSelectForNewSessionConcurrentRequestsSharePin.
 //  23. No response header reaches the downstream writer until the
-//     final-response state machine commits. Owned by relay.
+//     final-response state machine commits. No test yet: owed by the relay
+//     phase.
 //  24. A post-commit upstream read failure cannot return normally through the
-//     HTTP handler. Owned by relay.
+//     HTTP handler. No test yet: owed by the relay phase.
 //  25. Pending skip facts are bounded by the fixed account/reason vocabulary.
 //     TestSkipReasonFor, selection_failure tests.
 //  26. No admission path grants an account an exception to disabled health
@@ -72,7 +79,8 @@
 //     or terminal persistence before its own bounded store timeout.
 //     Store admission cancellation tests.
 //  29. Aggregate request-owned memory never exceeds the configured budget.
-//     Owned by the resource gate.
+//     Held by the resource gate, which carries the assertion:
+//     TestGate_MemoryBudget.
 //  30. An unconfirmed provisional pin with no remaining holders cannot stay
 //     live. TestReleaseProvisionalHolderRemovesPinOnLastHolder.
 //  31. The rolling window is measured over http.Client.Do invocation instants,
@@ -84,5 +92,7 @@
 //     life. TestNoDispatchAdmittedDuringTheBlackout,
 //     TestFirstAdmissionAfterTheBlackoutSucceeds.
 //  33. Live accepted client connections never exceed the configured ceiling.
-//     Owned by the resource gate.
+//     Held by the resource gate, which carries the assertions:
+//     TestGate_HandlerCeiling, TestGate_ConcurrentWaiters,
+//     TestConnectionLimitedListenerWaitsForConnectionClose.
 package route

@@ -77,7 +77,7 @@
 //     TestDispatchOccursWhenAdmissionCommitSucceeds.
 //  28. Client cancellation and logical-deadline expiry cannot cancel admission
 //     or terminal persistence before its own bounded store timeout.
-//     Store admission cancellation tests.
+//     TestInsertDispatchAdmissionCommitsOnForceShutdownAfterClientCancel.
 //  29. Aggregate request-owned memory never exceeds the configured budget.
 //     Held by the resource gate, which carries the assertion:
 //     TestGate_MemoryBudget.

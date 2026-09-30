@@ -67,7 +67,7 @@ Beads carry implementation context. Read `docs/plans/PLAN.md` only when a bead e
 ## First-minute protocol
 
 1. Confirm the repository root and inspect `git status --short --branch`.
-2. Confirm the checked-out branch is `main`. Do not create or switch to a feature branch or worktree.
+2. Confirm the branch the brief names. In shared-tree mode that is `main`, and you create or switch to nothing else; with no brief, create a worktree per the universal rule below and never edit the primary checkout.
 3. Read this file, `ROADMAP.md`, and the bead selected for inspection.
 4. Register through MCP Agent Mail with `macro_start_session`.
 5. Export the returned Agent Mail identity as `AGENT_NAME`.
@@ -378,6 +378,8 @@ Agent Mail is not a task tracker. Do not create tasks only in Mail. Beads remain
 ## File reservation guard
 
 The Agent Mail pre-commit guard turns reservations into a commit boundary. It refuses a commit that touches a file reserved exclusively by another agent.
+
+Reservations and the guard coordinate the shared tree. In the default mode (see *Git: the delivery mode comes from the brief*) the branch is the isolation and no reservation is taken; `bin/ci` still runs before every commit, and `--no-verify` stays forbidden in both modes, because it also skips gitleaks, the authorship guard and the prose guard.
 
 Install repository hooks first, then install the Agent Mail guard:
 
@@ -711,11 +713,14 @@ A skill is an operational instruction pack. When a listed skill is available and
 
 Skills do not override this file, bead acceptance criteria, or project invariants. An optional tool described by a skill does not become a gate merely because the skill exists.
 
-## Git: one shared `main`
+## Git: the delivery mode comes from the brief
 
-All agents work directly on `main` in the same working tree.
+How work reaches `main` is decided by the brief of the task, never by this section alone. Two modes exist, and an agent is in exactly one of them:
 
-Do not create:
+- **Default mode: worktree, own branch, pull request.** With no brief, or a brief that says nothing about delivery, create a worktree with `bin/worktree new <type>/<kebab-desc>`, commit on that branch, run `bin/ci` before every commit as everywhere in this file, push the branch, open a pull request, and let CI be the gate; the pull request merges when green and the worktree is removed afterwards. Nothing else in this section applies.
+- **Shared-tree mode: one shared `main`.** Selected only by a swarm brief that says so. All agents then work directly on `main` in the same working tree, and the rest of this section is their contract.
+
+In shared-tree mode, do not create:
 
 - Feature branches
 - Agent branches
@@ -726,7 +731,7 @@ Do not create:
 
 The single-branch model removes delayed merge reconciliation. It does not remove coordination obligations.
 
-This section overrides the worktree instruction in the stamped `universal-principles` block below: create no worktree, and do every edit in this one shared tree. The block's physical isolation is replaced here by three coupled protections, Agent Mail file reservations, the pre-commit reservation guard, and DCG, and all three assume a single tree; following the block's worktree instead removes an agent's edits from the surface those protections watch, and mixing the two models gives neither the isolation of separate trees nor the coordination the reservation system provides.
+In shared-tree mode this section overrides the worktree instruction in the stamped `universal-principles` block below: create no worktree, and do every edit in this one shared tree. The block's physical isolation is replaced here by three coupled protections, Agent Mail file reservations, the pre-commit reservation guard, and DCG, and all three assume a single tree; following the block's worktree instead removes an agent's edits from the surface those protections watch, and mixing the two models gives neither the isolation of separate trees nor the coordination the reservation system provides. In the default mode the block's worktree rule applies as written, and the branch is the isolation.
 
 ### Before editing
 
@@ -751,7 +756,7 @@ This section overrides the worktree instruction in the stamped `universal-princi
 
 ### Shared index safety
 
-The Git index is shared by every agent.
+Shared-tree mode only; a worktree has an index of its own. The Git index is shared by every agent.
 
 Before staging, inspect:
 
@@ -806,7 +811,7 @@ Git author name and email remain the configured human identity. Do not alter aut
 
 ### Push after every commit
 
-Push immediately after each commit. Unpushed commits are invisible to agents on other machines and are not durable swarm state.
+Shared-tree mode only; in the default mode the branch is pushed once and the pull request carries it. Push immediately after each commit. Unpushed commits are invisible to agents on other machines and are not durable swarm state.
 
 ```bash
 git push origin main

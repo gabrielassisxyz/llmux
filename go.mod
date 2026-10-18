@@ -2,7 +2,7 @@ module github.com/gabrielassisxyz/llmux
 
 go 1.26
 
-toolchain go1.26.6
+toolchain go1.26.9
 
 require (
 	modernc.org/sqlite v1.56.0

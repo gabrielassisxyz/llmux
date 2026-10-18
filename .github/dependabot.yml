@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # The workflows pin actions to a major tag (actions/checkout@v7), which already
+  # follows every release below the next major. A minor or patch bump would replace
+  # a reference that keeps working with an exact pin that stops, every week; only
+  # the major is worth a pull request.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for minor and patch bumps. A major arrives as its own PR
+      # and waits for a human; the weekly landing job never merges one.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
